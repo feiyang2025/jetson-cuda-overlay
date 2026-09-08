@@ -62,6 +62,22 @@ fi
 echo "Patching modeld.py..."
 python3 "$OVERLAY_DIR/patch_modeld.py" "$MODELD_PY"
 
+echo "Installing CH347 (USB-I2C IMU) daemon..."
+install "openpilot/system/sensord/ch347t.cc"
+install "openpilot/system/sensord/ch347t.py"
+install "openpilot/system/sensord/build_ch347t.sh"
+install "openpilot/system/sensord/run_ch347t.sh"
+install "openpilot/third_party/ch347"
+chmod +x "$REPO_ROOT/openpilot/system/sensord/build_ch347t.sh" "$REPO_ROOT/openpilot/system/sensord/run_ch347t.sh" 2>/dev/null || true
+
+# Patch process_config to register sensord_ch347 as an optional daemon
+# (auto-exits if no CH347 device is present).
+PCONFIG="$REPO_ROOT/openpilot/system/manager/process_config.py"
+if [ -f "$PCONFIG" ] && ! grep -q "sensord_ch347" "$PCONFIG"; then
+  python3 "$OVERLAY_DIR/patch_ch347_manager.py" "$PCONFIG" || \
+    echo "[apply_cuda] WARN ch347 manager patch skipped"
+fi
+
 echo "[apply_cuda] done."
 echo
 echo "Next on-device steps:"

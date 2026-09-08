@@ -6,15 +6,33 @@ CUDA inference backend and GMSL camera path on AGX Orin.
 
 ## What it installs
 
-| Component | Path | Purpose |
+| component | path | purpose |
 |---|---|---|
 | gpu_backend | `openpilot/sunnypilot/modeld_v2/gpu_backend/` | CUDA transform + TRT runner + model profiles |
 | gpu_model_state | `openpilot/sunnypilot/modeld_v2/gpu_model_state.py` | CUDA-first ModelState (tinygrad fallback) |
 | cuda_transform | `openpilot/selfdrive/modeld/transforms/cuda_transform.*` | NV12 -> 12-channel GPU warp kernels |
 | tensorrt_runner | `openpilot/selfdrive/modeld/runners/tensorrt_runner.py` | TRT .plan loader (zero-copy) |
-| V4L2/VIC camera | `openpilot/system/camerad/webcam/v4l2_dmabuf_camera.py` + `v4l2_camera.py` | GMSL IMX390 UYVY -> VIC -> NV12 |
+| v4l2/vic camera | `openpilot/system/camerad/webcam/v4l2_dmabuf_camera.py` + `v4l2_camera.py` | GMSL IMX390 UYVY -> VIC -> NV12 |
+| ch347 imu | `openpilot/system/sensord/ch347t.cc` + `third_party/ch347/` | USB-I2C LSM6DS3 IMU daemon w/ auto zero-bias calib |
 
-## Usage (any project)
+## CH347 IMU (optional, auto-exits if absent)
+
+The overlay registers `sensord_ch347` as an optional daemon. It:
+- talks to an external CH347 USB-I2C (LSM6DS3) break-out board — useful on AGX
+  Orin / PCs that have no on-board IMU;
+- publishes `accelerometer` / `gyroscope` / `temperatureSensor` cereal messages,
+  so the project's own `imu_calibrationd` / `calibrationd` can consume them;
+- runs a **boot-time auto zero-rate bias calibration**: skips the first second,
+  collects ~5 s, and if the gyro magnitude 1-sigma is < 0.015 rad/s (stationary)
+  it writes the bias to `imu_calibration.json` (or `IMU_CALIB_JSON`);
+- if no CH347 device (`/dev/ch34x_pis*` / `/dev/ttyACM*`) is present it exits
+  cleanly and does not affect the system.
+
+`run_ch347t.sh` builds `ch347t` on first run (needs `g++` + `libzmq` + `capnp`
+dev packages), then execs it. On-board sensors (comma-style I2C LSM6DS3) keep
+working via the project's stock `sensord`.
+
+## usage (any project)
 
 ```bash
 # first time or after upstream update:
@@ -25,8 +43,9 @@ bash /path/to/jetson-cuda-overlay/apply_cuda.sh .
 ```
 
 `apply_cuda.sh` is **idempotent** and version-independent: it copies the overlay
-files and runs `patch_modeld.py` + `patch_camerad.py` to wire in `_make_model()`
-(CUDA-first, tinygrad fallback) and prefer the V4L2 camera on Linux.
+files and runs `patch_modeld.py` + `patch_camerad.py` + `patch_ch347_manager.py`
+to wire in `_make_model()` (CUDA-first, tinygrad fallback), prefer the V4L2/VIC
+camera on Linux, and register the optional CH347 daemon.
 
 ## Models
 
