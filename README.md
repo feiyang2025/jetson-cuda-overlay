@@ -77,3 +77,70 @@ USE_V4L2_CAMERA=1   # default on Linux
 - CUDA toolkit (nvcc) + TensorRT
 - V4L2 GMSL driver (`tegra-camrtc`) + `libnvbufsurface.so` / `libnvbufsurftransform.so`
 - optional: `tw_camera_cfg` for SG2/IMX390 serdes init
+
+## AGX Orin validation checklist
+
+Run the following in order on the device after applying the overlay:
+
+1. Confirm the target project starts normally with the original backend:
+   `DISABLE_CUDA_BACKEND=1`.
+2. Build `libcuda_transform.so` and verify it loads without CUDA errors.
+3. Build `ch347t` and confirm `accelerometer`, `gyroscope`, and
+   `temperatureSensor` messages when the CH347 device is connected.
+4. Confirm the boot gyro calibration either updates or safely retains
+   `imu_calibration.json` when the device is moving.
+5. Confirm both cameras open through V4L2 and report the expected active image
+   size, pixel format, stride, and NV12 output.
+6. Confirm road/wide frame timestamps, frame IDs, pair delta, and stable 20 Hz.
+7. Test FiletOFish split engines and BigCombo merged engine separately.
+8. Confirm TensorRT inputs use GPU pointers for image tensors and that output is
+   finite and physically reasonable.
+9. Confirm modelV2, cameraOdometry, radard, controlsd, Panda/CAN, and UI remain
+   healthy for a stationary test before any driving test.
+10. Run a short controlled drive and inspect frame drops, model execution time,
+    camera quality, IMU values, radar lead data, and disengagement events.
+
+Expected steady-state targets:
+
+```text
+road camera: 20 Hz
+wide camera: 20 Hz
+modelV2: 20 Hz
+frame drops: 0 during steady state
+CUDA transform: no illegal access or non-finite output
+TensorRT: target Orin engine, no silent CPU model fallback
+```
+
+## Update and repair workflow
+
+The overlay is maintained separately from each target project. The normal loop is:
+
+```bash
+# On the device: update the target project
+cd <target-project-root>
+git fetch upstream
+git merge upstream/<target-branch>
+
+# Reapply the shared hardware layer
+bash /path/to/jetson-cuda-overlay/apply_cuda.sh .
+
+# Rebuild device-specific artifacts and run the validation checklist
+bash openpilot/sunnypilot/modeld_v2/gpu_backend/deploy.sh
+```
+
+When a device test exposes a problem:
+
+```text
+1. Save the exact project commit, overlay commit, command, and complete log.
+2. Report the failing stage and error without deleting the working tree.
+3. Fix the corresponding file in jetson-cuda-overlay, not by editing every fork.
+4. Run the offline syntax/logic checks and review the diff.
+5. Commit and push a new overlay commit.
+6. On the device, pull the new overlay and rerun apply_cuda.sh.
+7. Rebuild affected .so/engine artifacts and repeat the checklist.
+```
+
+Device-specific `.plan`, `.so`, calibration files, logs, and generated metadata
+must not be committed to the overlay. Keep them on the AGX Orin or in a separate
+artifact store. If an upstream update changes a model interface, update the
+profile/metadata handling and regenerate the engine on the target Orin.
