@@ -1,31 +1,141 @@
+"""
+GpuModelState — CUDA/TensorRT model state for openpilot.
+
+Supports both new (sunnypilot) and old (openpilot) directory layouts.
+All heavy imports are deferred to __init__ to avoid import-time failures.
+"""
 import os
+import sys
 
 import numpy as np
-from openpilot.cereal import log
-from openpilot.common.params import Params
-from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, get_curvature_from_plan, smooth_value, should_stop
-from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
-
-from openpilot.sunnypilot.modeld_v2.gpu_backend.backend import create_gpu_backend
-from openpilot.sunnypilot.modeld_v2.gpu_backend.models.registry import resolve_profile
-from openpilot.sunnypilot.modeld_v2.constants import ModelConstants, Plan
-from openpilot.sunnypilot.modeld_v2.parse_model_outputs import Parser as CombinedParser
-from openpilot.sunnypilot.modeld_v2.parse_model_outputs_split import Parser as SplitParser
 
 
-class GpuModelState(ModelStateBase):
+def _lazy_import(module_path, fallback_path=None):
+  """Import a module lazily, trying new path first, then fallback."""
+  try:
+    return __import__(module_path, fromlist=[''])
+  except ImportError:
+    if fallback_path:
+      return __import__(fallback_path, fromlist=[''])
+    raise
+
+
+def _import_attr(mod_path, attr, fallback_mod_path=None, fallback_attr=None):
+  """Import an attribute from a module, with fallback path."""
+  try:
+    mod = __import__(mod_path, fromlist=[''])
+    return getattr(mod, attr)
+  except (ImportError, AttributeError):
+    if fallback_mod_path:
+      mod = __import__(fallback_mod_path, fromlist=[''])
+      return getattr(mod, fallback_attr or attr)
+    raise
+
+
+class GpuModelState:
+  """CUDA-first ModelState with tinygrad fallback."""
+
   def __init__(self, cam_w: int, cam_h: int, chestnut: bool = False):
-    ModelStateBase.__init__(self)
+    # Lazy imports — only happen when GpuModelState is actually instantiated
+    log = _import_attr("openpilot.cereal", "log", "cereal", "log")
+    self._log = log
+
+    Params = _import_attr("openpilot.common.params", "Params", "common.params", "Params")
+    cloudlog = _import_attr("openpilot.common.swaglog", "cloudlog", "common.swaglog", "cloudlog")
+    self._cloudlog = cloudlog
+
+    drive_helpers = _lazy_import(
+      "openpilot.selfdrive.controls.lib.drive_helpers",
+      "selfdrive.controls.lib.drive_helpers",
+    )
+    self._get_accel_from_plan = drive_helpers.get_accel_from_plan
+    self._get_curvature_from_plan = drive_helpers.get_curvature_from_plan
+    self._smooth_value = drive_helpers.smooth_value
+    self._should_stop = drive_helpers.should_stop
+
+    ModelStateBase = _import_attr(
+      "openpilot.sunnypilot.modeld_v2.modeld_base", "ModelStateBase",
+      "openpilot.sunnypilot.modeld_v2.compat.modeld_base", "ModelStateBase",
+    )
+
+    # Import GPU backend (may be None if not on Orin)
+    try:
+      backend_mod = _lazy_import(
+        "openpilot.sunnypilot.modeld_v2.gpu_backend.backend",
+      )
+      self._create_gpu_backend = backend_mod.create_gpu_backend
+    except ImportError:
+      self._create_gpu_backend = None
+
+    # Import profile resolver
+    try:
+      registry = _lazy_import(
+        "openpilot.sunnypilot.modeld_v2.gpu_backend.models.registry",
+      )
+      self._resolve_profile = registry.resolve_profile
+    except ImportError:
+      try:
+        compat_registry = _lazy_import(
+          "openpilot.sunnypilot.modeld_v2.compat.registry",
+        )
+        self._resolve_profile = compat_registry.resolve_profile
+      except ImportError:
+        self._resolve_profile = None
+
+    # Import constants
+    try:
+      constants_mod = _lazy_import(
+        "openpilot.sunnypilot.modeld_v2.constants",
+      )
+      self._ModelConstants = constants_mod.ModelConstants
+      self._Plan = constants_mod.Plan
+    except ImportError:
+      compat_constants = _lazy_import(
+        "openpilot.sunnypilot.modeld_v2.compat.constants",
+      )
+      self._ModelConstants = compat_constants.ModelConstants
+      self._Plan = compat_constants.Plan
+
+    # Import parsers
+    try:
+      parse_mod = _lazy_import(
+        "openpilot.sunnypilot.modeld_v2.parse_model_outputs",
+      )
+      self._CombinedParser = parse_mod.Parser
+    except ImportError:
+      compat_parse = _lazy_import(
+        "openpilot.sunnypilot.modeld_v2.compat.parse_model_outputs",
+      )
+      self._CombinedParser = compat_parse.Parser
+
+    try:
+      parse_split_mod = _lazy_import(
+        "openpilot.sunnypilot.modeld_v2.parse_model_outputs_split",
+      )
+      self._SplitParser = parse_split_mod.Parser
+    except ImportError:
+      compat_parse_split = _lazy_import(
+        "openpilot.sunnypilot.modeld_v2.compat.parse_model_outputs_split",
+      )
+      self._SplitParser = compat_parse_split.Parser
+
+    # --- Initialization ---
     self.chestnut = chestnut
     model_name = os.getenv("MODEL_NAME") or Params().get("Model", encoding="utf-8")
-    self.profile = resolve_profile(model_name)
+
+    if self._resolve_profile is None:
+      raise RuntimeError("No profile resolver available")
+    self.profile = self._resolve_profile(model_name)
     if self.profile is None:
       raise RuntimeError(f"No usable CUDA model profile for {model_name or 'default'}")
-    self.backend = create_gpu_backend(self.profile)
+
+    if self._create_gpu_backend is None:
+      raise RuntimeError("CUDA backend module not available")
+    self.backend = self._create_gpu_backend(self.profile)
     if self.backend is None:
-      raise RuntimeError("CUDA backend unavailable")
-    self.constants = ModelConstants
+      raise RuntimeError("CUDA backend unavailable (not AGX Orin or TensorRT missing)")
+
+    self.constants = self._ModelConstants
     self.vision_input_names = list(self.profile.vision_input_names)
     self.road_key = next(k for k in self.vision_input_names if "big" not in k)
     self.wide_key = next(k for k in self.vision_input_names if "big" in k)
@@ -43,7 +153,7 @@ class GpuModelState(ModelStateBase):
     self.MIN_LAT_CONTROL_SPEED = 0.3
     self.PLANPLUS_CONTROL = 1.0
     self.full_features_buffer: np.ndarray | None = None
-    self.parser = SplitParser() if self.profile.mode == "split" else CombinedParser()
+    self.parser = self._SplitParser() if self.profile.mode == "split" else self._CombinedParser()
     cloudlog.warning(f"GpuModelState initialized: {model_name} mode={self.profile.mode}")
 
   @property
@@ -104,33 +214,33 @@ class GpuModelState(ModelStateBase):
     self._update_temporal(raw)
 
     if self.chestnut and not np.all(np.isfinite(outputs.get("plan", np.array([0.0])))):
-      cloudlog.error("model output not finite, dropping frame")
+      self._cloudlog.error("model output not finite, dropping frame")
       return None
     return outputs
 
   def _split_vision_size(self) -> int:
     return sum(s.stop - s.start for s in self.profile.vision_slices.values())
 
-  def get_action_from_model(self, model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
-                            lat_action_t: float, long_action_t: float, v_ego: float) -> log.ModelDataV2.Action:
+  def get_action_from_model(self, model_output, prev_action, lat_action_t, long_action_t, v_ego):
+    Plan = self._Plan
     if "action" not in model_output:
       plan = model_output["plan"][0]
-      desired_accel = get_accel_from_plan(plan[:, Plan.VELOCITY][:, 0], plan[:, Plan.ACCELERATION][:, 0],
+      desired_accel = self._get_accel_from_plan(plan[:, Plan.VELOCITY][:, 0], plan[:, Plan.ACCELERATION][:, 0],
                                           self.constants.T_IDXS, action_t=long_action_t)
-      desired_curvature = get_curvature_from_plan(plan[:, Plan.T_FROM_CURRENT_EULER][:, 2],
+      desired_curvature = self._get_curvature_from_plan(plan[:, Plan.T_FROM_CURRENT_EULER][:, 2],
                                                   plan[:, Plan.ORIENTATION_RATE][:, 2],
                                                   self.constants.T_IDXS, v_ego, action_t=lat_action_t)
     else:
       desired_accel = model_output["action"][0, 1]
       desired_curvature = model_output["action"][0, 0] / (max(1.0, v_ego)) ** 2
 
-    stop = should_stop(v_ego, desired_accel)
-    desired_accel = smooth_value(desired_accel, prev_action.desiredAcceleration, self.LONG_SMOOTH_SECONDS)
+    stop = self._should_stop(v_ego, desired_accel)
+    desired_accel = self._smooth_value(desired_accel, prev_action.desiredAcceleration, self.LONG_SMOOTH_SECONDS)
     if v_ego > self.MIN_LAT_CONTROL_SPEED:
-      desired_curvature = smooth_value(desired_curvature, prev_action.desiredCurvature, self.LAT_SMOOTH_SECONDS)
+      desired_curvature = self._smooth_value(desired_curvature, prev_action.desiredCurvature, self.LAT_SMOOTH_SECONDS)
     else:
       desired_curvature = prev_action.desiredCurvature
-    return log.ModelDataV2.Action(
+    return self._log.ModelDataV2.Action(
       desiredCurvature=float(desired_curvature),
       desiredAcceleration=float(desired_accel),
       shouldStop=bool(stop),
