@@ -16,15 +16,22 @@ class ModelProfile:
     # Vision inputs
     self.vision_input_names = ["biginput", "input"]
     
-    # Engine files
+    # Engine files (try _fp16 first, then plain name)
+    engine_dir_path = Path(engine_dir)
     if mode == "merged":
-      self.merged_engine = "driving_supercombo_fp16.plan"
+      self.merged_engine = self._find_engine(engine_dir_path, ["driving_supercombo_fp16.plan", "driving_supercombo.plan"])
       self.vision_engine = None
       self.policy_engine = None
     else:
       self.merged_engine = None
-      self.vision_engine = "driving_vision_fp16.plan"
-      self.policy_engine = "driving_policy_fp16.plan"
+      self.vision_engine = self._find_engine(engine_dir_path, ["driving_vision_fp16.plan", "driving_vision.plan"])
+      self.policy_engine = self._find_engine(engine_dir_path, ["driving_policy_fp16.plan", "driving_policy.plan"])
+    
+  def _find_engine(self, engine_dir: Path, candidates: list[str]) -> str | None:
+    for name in candidates:
+      if (engine_dir / name).exists():
+        return name
+    return candidates[0]  # Return first candidate as default
     
     # Vision shape
     self.vision_shape = (1, 12, self.model_h, self.model_w)
