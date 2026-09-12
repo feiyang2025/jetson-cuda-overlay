@@ -6,8 +6,12 @@ set -euo pipefail
 #
 # Launched by the manager as a NativeProcess with cwd = <repo>/openpilot/system/sensord
 
-SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SELF_DIR/../../.." && pwd)"
+# Resolve symlinks so REPO_ROOT lands in the real repo, not a symlink parent.
+# Physical path from sensord/ to repo root is 2 levels up (system → ajouatom),
+# but the logical path openpilot/system/sensord/ is 3 levels. Using pwd -P
+# resolves symlinks, so we need ../.. not ../../..
+SELF_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+REPO_ROOT="$(cd "$SELF_DIR/../.." && pwd -P)"
 
 BIN="$SELF_DIR/ch347t"
 

@@ -14,6 +14,51 @@ CUDA inference backend and GMSL camera path on AGX Orin.
 | tensorrt_runner | `openpilot/selfdrive/modeld/runners/tensorrt_runner.py` | TRT .plan loader (zero-copy) |
 | v4l2/vic camera | `openpilot/system/camerad/webcam/v4l2_dmabuf_camera.py` + `v4l2_camera.py` | GMSL IMX390 UYVY -> VIC -> NV12 |
 | ch347 imu | `openpilot/system/sensord/ch347t.cc` + `third_party/ch347/` | USB-I2C LSM6DS3 IMU daemon w/ auto zero-bias calib |
+| camera calib | `tools/calib/*` + `patch_calib.py` | FCAM/ECAM intrinsic + ECAM extrinsic calibration toolkit and its Param plumbing |
+
+## Camera calibration toolkit (ported from the primary tree)
+
+`apply_cuda.sh` copies `tools/calib/` (log-based, no hardcoded paths) and runs
+`patch_calib.py`, which wires in the plumbing those tools need:
+
+- `common/transformations/camera.py`: parameterised intrinsics
+  (`_read_calib_from_params` / `_camera_config_from_params`) and the AGX Orin GMSL
+  entry for `("pc", "unknown")` — road fl 961.76 / wide fl 1740.0 @1920x1080 as the
+  first-run default, live values live in the `FcamIntrinsics` / `EcamIntrinsics`
+  Params (resolution-keyed JSON). Override size with
+  `ROAD_CAM_WIDTH/HEIGHT` / `WIDE_CAM_WIDTH/HEIGHT`.
+- `common/params_keys.h`: adds `FcamIntrinsics`, `EcamIntrinsics`, `FcamCalibResult`,
+  `WideCalibResult`, `PendingCalibReset`, `WideCalibActive`, `WideCalibMode`,
+  `FcamLiveActive`, `WideCalibIntrinsics{Fcam,Ecam}Backup`, in whatever syntax the
+  fork uses (`{"K", FLAGS}` or `{"K", {FLAGS, TYPE}}`). `Params.check_key()` rejects
+  unknown keys, so this has to be compiled in.
+- `tools/calib/*.py`: the originals hardcoded the author's log directory; the patcher
+  rewrites the `--base-dir` default to `Paths.log_root()` (this device's realdata).
+
+Because `params_keys.h` is compiled, rebuild the params module **in the target tree**:
+
+```bash
+source .venv/bin/activate && scons -j8 common/
+```
+
+Tools — run with the project venv (only `wide_calibrator.py` needs `cv2`, which the
+system python3 has while some fork venvs do not):
+
+| tool | what | needs |
+|---|---|---|
+| `self_calibrator.py --scan` | FCAM intrinsics from drive logs | logs |
+| `self_calibrator.py --live` / `--ecam` | same, live collection | running stack |
+| `ecam_analyze.py` | split FCAM/ECAM frames, estimate ECAM fl | logs |
+| `estimate_extrinsics.py` | ECAM extrinsics (pitch/height) from radar-vision mismatch | logs |
+| `plot_calib.py` | three-method comparison plot (+ lane-width correction) | logs, matplotlib |
+| `wide_calibrator.py` | ECAM intrinsics via live stereo matching | live stack + cv2 |
+
+Verified on this rig 2026-09-12 (installed into the `ajouatom` tree): Param plumbing OK
+(`FcamIntrinsics` = 961.76 / `EcamIntrinsics` = 1740.0 as 1920x1080 JSON, readable via
+`Params().get`) and `estimate_extrinsics.py` ran over 150 real segments
+(pitch 5.2° down, RMSE 4.98 m). Note `estimate_extrinsics.py` / `ecam_analyze.py` only
+scan `--dir` (or `--route` together with `--base-dir`), so point them at a directory
+whose subdirs each contain `rlog.zst`.
 
 ## CH347 IMU (optional, auto-exits if absent)
 
@@ -44,8 +89,19 @@ bash /path/to/jetson-cuda-overlay/apply_cuda.sh .
 
 `apply_cuda.sh` is **idempotent** and version-independent: it copies the overlay
 files and runs `patch_modeld.py` + `patch_camerad.py` + `patch_ch347_manager.py`
-to wire in `_make_model()` (CUDA-first, tinygrad fallback), prefer the V4L2/VIC
-camera on Linux, and register the optional CH347 daemon.
++ `patch_calib.py` to wire in `_make_model()` (CUDA-first, tinygrad fallback),
+prefer the V4L2/VIC camera on Linux, register the optional CH347 daemon, and set
+up the camera-calibration toolkit (tools + intrinsics plumbing + Param keys).
+
+After apply, rebuild the compiled Param key list once:
+
+```bash
+source .venv/bin/activate && scons -j8 common/
+```
+
+**See [USAGE.md](USAGE.md)** for what each component can do, the exact commands,
+the on-device steps, the Panda firmware/protocol unification workflow, and the
+honest list of what is NOT included.
 
 ## Models
 

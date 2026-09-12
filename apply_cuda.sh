@@ -18,7 +18,7 @@ set -euo pipefail
 
 OVERLAY_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="${1:-$(pwd)}"
-REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
+REPO_ROOT="$(cd "$REPO_ROOT" && pwd -P)"
 
 # Detect directory layout (new sunnypilot vs old openpilot)
 if [ -f "$REPO_ROOT/openpilot/sunnypilot/modeld_v2/modeld.py" ]; then
@@ -121,6 +121,24 @@ PCONFIG="$MANAGER_DIR/process_config.py"
 if [ -f "$PCONFIG" ] && ! grep -q "sensord_ch347" "$PCONFIG"; then
   python3 "$OVERLAY_DIR/patch_ch347_manager.py" "$PCONFIG" || \
     echo "[apply_cuda] WARN ch347 manager patch skipped"
+fi
+
+echo "Installing camera-calibration toolkit..."
+# tools/calib/*: FCAM/ECAM intrinsic + ECAM extrinsic calibration (log-based,
+# no hardcoded paths, layout-agnostic). Run with the *system* python3 for the
+# scripts that need cv2 (wide_calibrator).
+mkdir -p "$REPO_ROOT/tools/calib"
+cp -rf "$OVERLAY_DIR/openpilot/tools/calib/." "$REPO_ROOT/tools/calib/"
+echo "  + tools/calib/ ($(ls -1 "$OVERLAY_DIR/openpilot/tools/calib" | wc -l) files)"
+
+# Patch calendar intrinsics plumbing (camera.py) + the Param keys it needs.
+python3 "$OVERLAY_DIR/patch_calib.py" "$REPO_ROOT"
+CALIB_RC=$?
+if [ "$CALIB_RC" = "1" ]; then
+  echo "[apply_cuda] WARN calibration patch reported anchors that need manual merge (see above)"
+elif [ "$CALIB_RC" = "2" ]; then
+  echo "[apply_cuda] NOTE camera.py / params_keys.h changed -> rebuild the params module:"
+  echo "[apply_cuda]        cd $REPO_ROOT && source .venv/bin/activate && scons -j8 common/"
 fi
 
 echo "[apply_cuda] done."

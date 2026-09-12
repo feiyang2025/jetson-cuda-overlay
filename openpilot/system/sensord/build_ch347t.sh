@@ -10,7 +10,7 @@ set -euo pipefail
 # (dlopen), so it does NOT need json11 or a full openpilot build.
 
 REPO_ROOT="${1:-$(pwd)}"
-REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
+REPO_ROOT="$(cd "$REPO_ROOT" && pwd -P)"
 SRC="$REPO_ROOT/openpilot/system/sensord/ch347t.cc"
 OUT="$REPO_ROOT/openpilot/system/sensord/ch347t"
 MSGQ="$REPO_ROOT/openpilot/cereal/messaging"
@@ -36,25 +36,24 @@ else
   exit 1
 fi
 
-MSGQ_SRC=""
-for f in impl_msgq impl_zmq impl_fake ipc event; do
-  for base in "$CEREAL_ROOT/../msgq_repo/msgq" "$REPO_ROOT/msgq_repo/msgq"; do
-    if [ -f "$base/$f.cc" ]; then MSGQ_SRC="$MSGQ_SRC $base/$f.cc"; break; fi
-  done
-done
+# Link against pre-built libraries instead of compiling from source.
+# This avoids complex dependency chains (json11, msgq internal deps).
+MSGQ_LIB="$REPO_ROOT/msgq_repo/libmsgq.a"
+COMMON_LIB="$REPO_ROOT/common/libcommon.a"
+JSON11_O="$REPO_ROOT/third_party/json11/json11.o"
 
-COMMON_SRC=""
-for f in util.cc swaglog.cc ratekeeper.cc; do
-  for base in "$CEREAL_ROOT/common"; do
-    if [ -f "$base/$f" ]; then COMMON_SRC="$COMMON_SRC $base/$f"; break; fi
-  done
+# Verify required libs exist
+for lib in "$MSGQ_LIB" "$COMMON_LIB" "$JSON11_O"; do
+  if [ ! -f "$lib" ]; then
+    echo "ERROR: required library not found: $lib" >&2
+    exit 1
+  fi
 done
 
 g++ -O2 -std=c++17 -o "$OUT" "$SRC" \
   "$CEREAL_ROOT/cereal/messaging/socketmaster.cc" \
-  $MSGQ_SRC \
-  $COMMON_SRC \
-  -I"$CEREAL_ROOT" -I"$REPO_ROOT/msgq_repo" \
+  "$MSGQ_LIB" "$COMMON_LIB" "$JSON11_O" \
+  -I"$CEREAL_ROOT" -I"$REPO_ROOT/msgq_repo" -I"$REPO_ROOT" \
   -pthread -ldl -lzmq -lcapnp -lkj
 
 echo "[build_ch347t] done: $OUT"
