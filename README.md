@@ -4,6 +4,19 @@ AGX Orin CUDA/TensorRT + V4L2/VIC camera overlay for **sunnypilot / openpilot**
 forks (old and new layout). Lets CP / SP / DP / FP / master-c3 reuse the same
 CUDA inference backend and GMSL camera path on AGX Orin.
 
+> **New here?** Read **[FEATURES.md](FEATURES.md)** — what each component can do,
+> what it can NOT do, and the exact command for every task (apply / calibrate /
+> models / IMU / Panda unification / health check).
+> **[USAGE.md](USAGE.md)** is the longer manual.
+
+## One-command entry points
+
+```bash
+bash apply_cuda.sh <fork-root>          # apply everything (idempotent)
+bash panda/install.sh                   # install the cross-fork Panda tooling + start-up hooks
+python3 doctor.py                       # health-check the whole chain
+```
+
 ## What it installs
 
 | component | path | purpose |
@@ -15,6 +28,7 @@ CUDA inference backend and GMSL camera path on AGX Orin.
 | v4l2/vic camera | `openpilot/system/camerad/webcam/v4l2_dmabuf_camera.py` + `v4l2_camera.py` | GMSL IMX390 UYVY -> VIC -> NV12 |
 | ch347 imu | `openpilot/system/sensord/ch347t.cc` + `third_party/ch347/` | USB-I2C LSM6DS3 IMU daemon w/ auto zero-bias calib |
 | camera calib | `tools/calib/*` + `patch_calib.py` | FCAM/ECAM intrinsic + ECAM extrinsic calibration toolkit and its Param plumbing |
+| panda unify | `panda/*` (installed to `/data/openpilot/panda_版本核对/`) | keep every fork on one Panda firmware/protocol -> no reflashing |
 
 ## Camera calibration toolkit (ported from the primary tree)
 
