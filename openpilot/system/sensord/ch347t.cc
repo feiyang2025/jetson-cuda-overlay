@@ -54,6 +54,16 @@ static constexpr int CALIB_COLLECT_SECONDS = 5;          // ~500 samples at 104 
 static constexpr int CALIB_SAMPLE_RATE_HZ = 104;
 static constexpr int CALIB_MIN_SAMPLES = 200;            // require at least this many accepted
 
+// Units follow the sunnypilot-cuda imu_calibration.json schema:
+//   "imuBiasGyro"    : [gx, gy, gz]  (deg/s, dps)
+//   "imuBiasAccel"   : [ax, ay, az]  (g)
+//   "imuCalibMatrix" : [m0..m8]      (row-major 3x3: axis coupling + scale)
+//   "gravity"        : 9.81
+// Apply: gyro_rad = raw_rad - imuBiasGyro * pi/180
+//        accel_ms2 = imuCalibMatrix @ (raw_mps2 - 9.81 * imuBiasAccel)
+static constexpr float DEG_TO_RAD = static_cast<float>(M_PI / 180.0);
+static constexpr float RAD_TO_DEG = static_cast<float>(180.0 / M_PI);
+
 
 static inline int16_t parse_16bit(uint8_t lsb, uint8_t msb) {
   return static_cast<int16_t>(static_cast<uint16_t>(msb) << 8 | lsb);
@@ -524,57 +534,102 @@ static std::string calib_json_path() {
     ? std::string(pwd) + "/imu_calibration.json" : "imu_calibration.json";
 }
 
-static std::pair<bool, float> find_float(const std::string &json, const std::string &key) {
-  std::string pat1 = "\"" + key + "\":";
-  auto i = json.find(pat1);
-  if (i == std::string::npos) return {false, 0.f};
-  i += pat1.size();
-  auto j = json.find_first_of(",}]", i);
-  if (j == std::string::npos) return {false, 0.f};
-  try { return {true, std::stof(json.substr(i, j - i))}; } catch (...) { return {false, 0.f}; }
+// Full calibration record loaded from / persisted to imu_calibration.json.
+// Missing fields default to no-op (identity matrix / zero bias) so the daemon
+// keeps working with a partial file or none at all.
+struct ImuCalibration {
+  float gyro_bias_dps[3] = {0.f, 0.f, 0.f};   // deg/s
+  float accel_bias_g[3] = {0.f, 0.f, 0.f};    // g
+  float matrix[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};  // row-major 3x3
+};
+
+// Locate '"<key>"' (whitespace tolerant) and return the index just past ':'.
+static size_t find_json_key(const std::string &json, const std::string &key) {
+  std::string pat = "\"" + key + "\"";
+  size_t i = 0;
+  while ((i = json.find(pat, i)) != std::string::npos) {
+    size_t j = i + pat.size();
+    while (j < json.size() && (json[j] == ' ' || json[j] == '\t' || json[j] == '\r' || json[j] == '\n')) j++;
+    if (j < json.size() && json[j] == ':') return j + 1;
+    i += pat.size();
+  }
+  return std::string::npos;
 }
 
-static void load_gyro_bias(float bias[3]) {
-  bias[0] = bias[1] = bias[2] = 0.f;
+// Parse a JSON float array "[a, b, c, ...]" starting at 'start' (must point at '[').
+static void parse_json_float_array(const std::string &json, size_t start, std::vector<float> &out, int max_count) {
+  size_t i = start;
+  while (i < json.size() && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n')) i++;
+  if (i >= json.size() || json[i] != '[') return;
+  i++;
+  while (out.size() < static_cast<size_t>(max_count) && i < json.size()) {
+    while (i < json.size() && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n' || json[i] == ',')) i++;
+    if (i >= json.size() || json[i] == ']') break;
+    size_t j = i;
+    while (j < json.size() && json[j] != ',' && json[j] != ']' && json[j] != '\n' && json[j] != '\r') j++;
+    try { out.push_back(std::stof(json.substr(i, j - i))); }
+    catch (...) { out.push_back(0.f); }
+    i = j;
+  }
+}
+
+static void load_calibration(ImuCalibration &calib) {
   std::ifstream f(calib_json_path());
   if (!f) return;
   std::stringstream ss; ss << f.rdbuf(); std::string json = ss.str();
-  // imuBiasGyro array: [x, y, z]
-  std::string pat = "\"imuBiasGyro\":[";
-  auto i = json.find(pat);
-  if (i == std::string::npos) return;
-  i += pat.size();
-  std::vector<float> vals;
-  while (vals.size() < 3 && i < json.size()) {
-    auto j = json.find_first_of(",]", i);
-    if (j == std::string::npos) break;
-    try { vals.push_back(std::stof(json.substr(i, j - i))); } catch (...) { vals.push_back(0.f); }
-    i = j + 1;
+
+  size_t pos = find_json_key(json, "imuBiasGyro");
+  if (pos != std::string::npos) {
+    std::vector<float> v;
+    parse_json_float_array(json, pos, v, 3);
+    for (size_t k = 0; k < v.size() && k < 3; k++) calib.gyro_bias_dps[k] = v[k];
   }
-  for (size_t k = 0; k < vals.size() && k < 3; k++) bias[k] = vals[k];
+  pos = find_json_key(json, "imuBiasAccel");
+  if (pos != std::string::npos) {
+    std::vector<float> v;
+    parse_json_float_array(json, pos, v, 3);
+    for (size_t k = 0; k < v.size() && k < 3; k++) calib.accel_bias_g[k] = v[k];
+  }
+  pos = find_json_key(json, "imuCalibMatrix");
+  if (pos != std::string::npos) {
+    std::vector<float> v;
+    parse_json_float_array(json, pos, v, 9);
+    for (size_t k = 0; k < v.size() && k < 9; k++) calib.matrix[k] = v[k];
+  }
 }
 
-static void save_gyro_bias(const float bias[3]) {
-  std::string json = "{\n"
-    "  \"imuCalibMatrix\": [1,0,0, 0,1,0, 0,0,1],\n"
-    "  \"imuBiasAccel\": [0.0, 0.0, 0.0],\n"
-    "  \"imuBiasGyro\": [" +
-    std::to_string((double)bias[0]) + ", " + std::to_string((double)bias[1]) + ", " +
-    std::to_string((double)bias[2]) + "]\n}\n";
+static void save_calibration(const ImuCalibration &calib) {
+  std::string json = "{\n  \"imuCalibMatrix\": [";
+  for (int k = 0; k < 9; k++) {
+    json += std::to_string((double)calib.matrix[k]);
+    json += (k == 8) ? "],\n" : ", ";
+  }
+  json += "  \"imuBiasAccel\": [";
+  for (int k = 0; k < 3; k++) {
+    json += std::to_string((double)calib.accel_bias_g[k]);
+    json += (k == 2) ? "],\n" : ", ";
+  }
+  json += "  \"imuBiasGyro\": [";
+  for (int k = 0; k < 3; k++) {
+    json += std::to_string((double)calib.gyro_bias_dps[k]);
+    json += (k == 2) ? "]\n}\n" : ", ";
+  }
   std::ofstream f(calib_json_path());
   if (!f) { LOGW("IMU: could not write %s", calib_json_path().c_str()); return; }
   f << json;
-  LOG("IMU: saved gyro bias (%s)", calib_json_path().c_str());
+  LOG("IMU: saved calibration (%s)", calib_json_path().c_str());
 }
 
 // Called right after open()+init_sensor(). Collects ~5s of data; if the device
 // is stationary (gyro magnitude 1-sigma below threshold), updates the gyro
 // zero-rate bias in imu_calibration.json. If moving, keeps the existing bias.
+// The accel bias and calib matrix are never touched here — a multi-pose
+// ellipsoid calibration (tools/imu_calib) stays intact.
 static void auto_calibrate_gyro_bias(LSM6DS3 &sensor, const std::string &backend) {
-  float existing[3];
-  load_gyro_bias(existing);
-  LOG("IMU: boot auto-calibrate (%s), existing bias=[%+.4f %+.4f %+.4f]",
-      backend.c_str(), existing[0], existing[1], existing[2]);
+  ImuCalibration calib;
+  load_calibration(calib);
+  LOG("IMU: boot auto-calibrate (%s), existing gyro bias=[%+.4f %+.4f %+.4f] dps",
+      backend.c_str(), calib.gyro_bias_dps[0], calib.gyro_bias_dps[1], calib.gyro_bias_dps[2]);
 
   // Skip the first second for sensor stabilization.
   util::sleep_for(CALIB_SKIP_SECONDS * 1000);
@@ -611,13 +666,17 @@ static void auto_calibrate_gyro_bias(LSM6DS3 &sensor, const std::string &backend
   float mag_std = std::sqrt((sx * sx + sy * sy + sz * sz) / 3.0f);
   LOG("IMU: samples=%d stds=[%+.5f %+.5f %+.5f] mag_std=%+.5f", n, sx, sy, sz, mag_std);
   if (mag_std >= CALIB_STATIC_GYRO_STD) {
-    LOGW("IMU: not stationary (mag_std=%.5f >= 0.015), keeping existing bias [%+.4f %+.4f %+.4f]",
-         mag_std, existing[0], existing[1], existing[2]);
+    LOGW("IMU: not stationary (mag_std=%.5f >= 0.015), keeping existing bias [%+.4f %+.4f %+.4f] dps",
+         mag_std, calib.gyro_bias_dps[0], calib.gyro_bias_dps[1], calib.gyro_bias_dps[2]);
     return;
   }
-  float new_bias[3] = {mx, my, mz};
-  LOG("IMU: stationary, bias %+.4f -> %+.4f %+.4f %+.4f", existing[0], new_bias[0], new_bias[1], new_bias[2]);
-  save_gyro_bias(new_bias);
+  // Computed bias is rad/s; the file stores deg/s (sunnypilot-cuda schema).
+  calib.gyro_bias_dps[0] = mx * RAD_TO_DEG;
+  calib.gyro_bias_dps[1] = my * RAD_TO_DEG;
+  calib.gyro_bias_dps[2] = mz * RAD_TO_DEG;
+  LOG("IMU: stationary, gyro bias -> [%+.4f %+.4f %+.4f] dps",
+      calib.gyro_bias_dps[0], calib.gyro_bias_dps[1], calib.gyro_bias_dps[2]);
+  save_calibration(calib);
 }
 
 // -------------------------------------------------------------------
@@ -664,7 +723,6 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
   int consecutive_errors = 0;
   int reinit_attempts = 0;
   SensorCache cache;
-  float gyro_bias[3] = {0.f, 0.f, 0.f};
 
   try {
     sensor.open();
@@ -676,10 +734,24 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
   }
 
   // Boot-time auto zero-bias calibration (only once when the backend starts).
+  // It updates gyro bias only; any existing accel bias / calib matrix is kept.
   auto_calibrate_gyro_bias(sensor, backend_name);
-  load_gyro_bias(gyro_bias);
-  if (gyro_bias[0] != 0.f || gyro_bias[1] != 0.f || gyro_bias[2] != 0.f)
-    LOG("IMU: applying gyro bias [-%+.4f -%+.4f -%+.4f]", gyro_bias[0], gyro_bias[1], gyro_bias[2]);
+
+  // Load the full calibration (gyro bias in dps, accel bias in g, row-major 3x3).
+  ImuCalibration calib;
+  load_calibration(calib);
+  float gyro_bias_rad[3];
+  for (int k = 0; k < 3; k++) gyro_bias_rad[k] = calib.gyro_bias_dps[k] * DEG_TO_RAD;
+  bool calib_active = (calib.gyro_bias_dps[0] != 0.f || calib.gyro_bias_dps[1] != 0.f ||
+                       calib.gyro_bias_dps[2] != 0.f) ||
+                      (calib.accel_bias_g[0] != 0.f || calib.accel_bias_g[1] != 0.f ||
+                       calib.accel_bias_g[2] != 0.f) ||
+                      calib.matrix[0] != 1.f || calib.matrix[4] != 1.f || calib.matrix[8] != 1.f ||
+                      calib.matrix[1] != 0.f || calib.matrix[2] != 0.f || calib.matrix[3] != 0.f ||
+                      calib.matrix[5] != 0.f || calib.matrix[6] != 0.f || calib.matrix[7] != 0.f;
+  LOG("IMU calibration loaded: gyro_bias_dps=[%+.4f %+.4f %+.4f] accel_bias_g=[%+.4f %+.4f %+.4f] calib_active=%d",
+      calib.gyro_bias_dps[0], calib.gyro_bias_dps[1], calib.gyro_bias_dps[2],
+      calib.accel_bias_g[0], calib.accel_bias_g[1], calib.accel_bias_g[2], calib_active ? 1 : 0);
 
   while (!do_exit && !switch_backend) {
     bool i2c_error = false;
@@ -695,10 +767,14 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
         float x = parse_16bit(b[0], b[1]);
         float y = parse_16bit(b[2], b[3]);
         float z = parse_16bit(b[4], b[5]);
-        // Axis mapping: [y, -x, z]
-        cache.acc_v[0] = y * ACCEL_SCALE;
-        cache.acc_v[1] = -x * ACCEL_SCALE;
-        cache.acc_v[2] = z * ACCEL_SCALE;
+        // Axis mapping: [y, -x, z].
+        // accel_ms2 = imuCalibMatrix @ (raw_mps2 - 9.81 * imuBiasAccel)
+        float raw_mps2[3] = {y * ACCEL_SCALE, -x * ACCEL_SCALE, z * ACCEL_SCALE};
+        float centered[3];
+        for (int k = 0; k < 3; k++) centered[k] = raw_mps2[k] - 9.81f * calib.accel_bias_g[k];
+        cache.acc_v[0] = calib.matrix[0] * centered[0] + calib.matrix[1] * centered[1] + calib.matrix[2] * centered[2];
+        cache.acc_v[1] = calib.matrix[3] * centered[0] + calib.matrix[4] * centered[1] + calib.matrix[5] * centered[2];
+        cache.acc_v[2] = calib.matrix[6] * centered[0] + calib.matrix[7] * centered[1] + calib.matrix[8] * centered[2];
         cache.valid = true;
         fresh_acc = true;
       } catch (...) { i2c_error = true; }
@@ -710,9 +786,10 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
         float x = parse_16bit(b[0], b[1]);
         float y = parse_16bit(b[2], b[3]);
         float z = parse_16bit(b[4], b[5]);
-        cache.gyro_v[0] = y * GYRO_SCALE - gyro_bias[0];
-        cache.gyro_v[1] = -x * GYRO_SCALE - gyro_bias[1];
-        cache.gyro_v[2] = z * GYRO_SCALE - gyro_bias[2];
+        // gyro_rad = raw_rad - imuBiasGyro * pi/180
+        cache.gyro_v[0] = y * GYRO_SCALE - gyro_bias_rad[0];
+        cache.gyro_v[1] = -x * GYRO_SCALE - gyro_bias_rad[1];
+        cache.gyro_v[2] = z * GYRO_SCALE - gyro_bias_rad[2];
         fresh_gyro = true;
       } catch (...) { i2c_error = true; }
     }
