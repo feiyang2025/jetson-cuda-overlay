@@ -107,6 +107,11 @@ public:
     i2c_set_stretch_ = (CH347I2C_SetStretch_t)dlsym(lib_handle_, "CH347I2C_SetStretch");
     stream_i2c_ = (CH347StreamI2C_t)dlsym(lib_handle_, "CH347StreamI2C");
     stream_i2c_ret_ack_ = (CH347StreamI2C_RetAck_t)dlsym(lib_handle_, "CH347StreamI2C_RetAck");
+    if (!open_dev_ || !close_dev_ || !set_timeout_ || !i2c_set_ || !i2c_set_ignore_nack_ ||
+        !i2c_set_stretch_ || !stream_i2c_ || !stream_i2c_ret_ack_) {
+      LOGE("CH347 library missing required symbols: %s", dlerror());
+      throw std::runtime_error("CH347 library symbol resolution failed");
+    }
   }
 
   void open() override {
@@ -937,14 +942,16 @@ int main(int argc, char **argv) {
     ch347_found = true;  // signal checker to stop
     if (ch347_checker.joinable()) ch347_checker.join();
 
-    if (ok) { LOG("I2C: clean exit"); break; }
-
-    // If switch_backend was set (CH347 detected), restart outer loop to use CH347
+    // If CH347 was detected while running on the I2C fallback, restart the
+    // outer loop to switch to CH347 — this takes priority over the clean-exit
+    // path below, otherwise the daemon would just exit on hot-plug.
     if (switch_backend) {
       LOGW("Switching from I2C to CH347...");
       switch_backend = false;
       continue;
     }
+
+    if (ok) { LOG("I2C: clean exit"); break; }
 
     // I2C failed fatally, wait before retry
     LOGW("I2C backend failed, retrying in 2s...");

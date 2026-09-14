@@ -199,13 +199,33 @@ uint8_t* cuda_transform_execute(CUDATransformState *s,
     int frame_size = s->frame_size;
 
     // Upload projection matrix
-    // Build half-resolution projection for UV
+    // Build half-resolution projection for UV with the same center-preserving
+    // semantics as openpilot's transform_scale_buffer(P, 0.5):
+    //   in_pt = ( P(out_pt/0.5 + 0.5) - 0.5 ) * 0.5
+    // => proj_uv = Tin @ (P @ Tout), with
+    //    Tout = [[2,0,0.5],[0,2,0.5],[0,0,1]], Tin = [[0.5,0,-0.25],[0,0.5,-0.25],[0,0,1]]
+    // (linear part preserved, only translation is scaled — NOT a plain *0.5)
+    static const float Tin[9] = {0.5f,  0.0f, -0.25f,
+                                 0.0f,  0.5f, -0.25f,
+                                 0.0f,  0.0f,  1.0f};
+    static const float Tout[9] = {2.0f,  0.0f,  0.5f,
+                                  0.0f,  2.0f,  0.5f,
+                                  0.0f,  0.0f,  1.0f};
     float proj_uv[9];
-    float scale = 0.5f;
-    for (int i = 0; i < 3; i++) {
-        proj_uv[i*3+0] = projection[i*3+0] * scale;
-        proj_uv[i*3+1] = projection[i*3+1] * scale;
-        proj_uv[i*3+2] = projection[i*3+2] * scale;
+    float p_tout[9];
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) {
+            p_tout[r * 3 + c] = projection[r * 3 + 0] * Tout[0 * 3 + c] +
+                                projection[r * 3 + 1] * Tout[1 * 3 + c] +
+                                projection[r * 3 + 2] * Tout[2 * 3 + c];
+        }
+    }
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) {
+            proj_uv[r * 3 + c] = Tin[r * 3 + 0] * p_tout[0 * 3 + c] +
+                                 Tin[r * 3 + 1] * p_tout[1 * 3 + c] +
+                                 Tin[r * 3 + 2] * p_tout[2 * 3 + c];
+        }
     }
     cudaMemcpy(s->d_proj_y, projection, 9 * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(s->d_proj_uv, proj_uv, 9 * sizeof(float), cudaMemcpyHostToDevice);
@@ -271,8 +291,12 @@ uint8_t* cuda_transform_execute(CUDATransformState *s,
     }
 
     // ---- Step 4: Shift temporal ring buffer ----
-    // Copy d_img_buffer[1..temporal_skip] → d_img_buffer[0..temporal_skip-1]
-    for (int i = s->temporal_skip - 1; i >= 0; i--) {
+    // Copy d_img_buffer[1..temporal_skip] → d_img_buffer[0..temporal_skip-1].
+    // Increasing order: source slots (i+1) are still intact when copied, so the
+    // time history [slot0 .. slot_(skip-1)] is preserved and slot[skip] holds the
+    // previous current frame. (Decreasing order would clobber every slot with
+    // the old slot[skip].)
+    for (int i = 0; i < s->temporal_skip; i++) {
         int total_work = frame_size;
         int block_size = 256;
         int grid_size = (total_work + block_size - 1) / block_size;

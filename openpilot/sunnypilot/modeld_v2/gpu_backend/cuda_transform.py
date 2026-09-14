@@ -25,6 +25,8 @@ class CudaTransform:
     self._library.cuda_transform_destroy.restype = None
     self._cuda.cuMemHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
     self._cuda.cuMemHostRegister.restype = ctypes.c_int
+    self._cuda.cuMemHostUnregister.argtypes = [ctypes.c_void_p]
+    self._cuda.cuMemHostUnregister.restype = ctypes.c_int
     self._states: dict[str, ctypes.Array] = {}
     self._registered: set[tuple[str, int]] = set()
     self._model_w = model_w
@@ -60,6 +62,11 @@ class CudaTransform:
     return Tensor.from_blob(output, shape, dtype=dtypes.uint8, device="CUDA")
 
   def close(self) -> None:
+    # Release pinned-memory registrations before tearing down the transform
+    # states (CUDA_MEMHOSTREGISTER_DEVICEMAP pins the pages until unregistered).
+    for _, ptr in list(self._registered):
+      self._cuda.cuMemHostUnregister(ctypes.c_void_p(ptr))
+    self._registered.clear()
     for state in self._states.values():
       self._library.cuda_transform_destroy(ctypes.byref(state))
     self._states.clear()

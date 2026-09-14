@@ -146,7 +146,11 @@ class GpuModelState:
       self.numpy_inputs[k] = np.zeros(shape, dtype=np.float32)
     desire_candidates = [k for k in self.numpy_inputs if k.startswith("desire")]
     self.desire_key = desire_candidates[0] if desire_candidates else "desire"
-    self.prev_desire = np.zeros(self.constants.DESIRE_LEN, dtype=np.float32)
+    # Size prev_desire from the profile's desire feature dim (8 for BigCombo/
+    # FiletOFish), not the fork's ModelConstants.DESIRE_LEN (may differ).
+    desire_shape = self.numpy_inputs.get(self.desire_key)
+    desire_last = desire_shape.shape[-1] if desire_shape is not None else self.constants.DESIRE_LEN
+    self.prev_desire = np.zeros(desire_last, dtype=np.float32)
     self.lat_delay = 0.0
     self.LAT_SMOOTH_SECONDS = 0.0
     self.LONG_SMOOTH_SECONDS = 0.0
@@ -164,7 +168,12 @@ class GpuModelState:
     return {k: model_output[np.newaxis, v] for k, v in slices.items()}
 
   def _update_temporal(self, raw_output: np.ndarray) -> None:
-    hidden = raw_output[self.profile.policy_slices["hidden_state"]]
+    # Only the merged engine path carries hidden_state inside policy_slices;
+    # split engines update features_buffer inside backend.infer_split() instead.
+    hs = self.profile.policy_slices.get("hidden_state")
+    if hs is None:
+      return
+    hidden = raw_output[hs]
     feats = self.numpy_inputs.get("features_buffer")
     if feats is None:
       return
@@ -176,9 +185,17 @@ class GpuModelState:
     frames = {k: bufs[k] for k in self.vision_input_names if k in bufs}
     self.backend.preprocess(frames, transforms)
 
-    if self.desire_key in inputs:
-      cur = np.asarray(inputs[self.desire_key]).reshape(-1)
-      current = cur[-self.constants.DESIRE_LEN:]
+    # Dropped-frame tick: update image transform/temporal state but skip inference.
+    if prepare_only:
+      return None
+
+    # modeld always publishes the canonical "desire" key; the profile may name
+    # it differently (e.g. BigCombo uses "desire_pulse"). Map it explicitly so
+    # the desire input is never silently zeroed.
+    src_desire = "desire" if "desire" in inputs else self.desire_key
+    if self.desire_key in self.numpy_inputs and src_desire in inputs:
+      cur = np.asarray(inputs[src_desire]).reshape(-1)
+      current = cur[-self.prev_desire.shape[0]:]
       pulse = np.where(current - self.prev_desire > 0.99, current, 0)
       target = self.numpy_inputs[self.desire_key]
       if target.ndim >= 2:
@@ -196,9 +213,14 @@ class GpuModelState:
 
     if self.profile.mode == "merged":
       raw = self.backend.infer_merged(scalar_inputs)
+      # Merged engine: features_buffer is NOT updated inside the backend, so we
+      # shift it here from the output hidden_state.
+      self._update_temporal(raw)
     else:
       v_out, p_out = self.backend.infer_split(scalar_inputs)
       raw = np.concatenate([v_out, p_out])
+      # Split path: infer_split() already shifted + wrote features_buffer from
+      # the vision hidden_state — do NOT update again (would double-shift).
 
     if self.profile.mode == "merged":
       sliced = self.slice_outputs(raw, {**self.profile.vision_slices, **self.profile.policy_slices})
@@ -210,8 +232,6 @@ class GpuModelState:
       policy_sliced = self.slice_outputs(policy_output, self.profile.policy_slices)
       outputs = self.parser.parse_vision_outputs(vision_sliced)
       outputs.update(self.parser.parse_policy_outputs(policy_sliced))
-
-    self._update_temporal(raw)
 
     if self.chestnut and not np.all(np.isfinite(outputs.get("plan", np.array([0.0])))):
       self._cloudlog.error("model output not finite, dropping frame")

@@ -45,24 +45,44 @@ from typing import Dict, List, Tuple
 
 ECAM_FL_CURRENT = 605
 FCAM_FL = 2690
+R_F2E = np.eye(3, dtype=np.float64)
+t_F2E = np.zeros(3, dtype=np.float64)
+
+# (Re)built from the current fl globals; module-level F/K1/K2 are refreshed by
+# _load_intrinsics() so a Params-provided calibration is actually honored.
+K1 = None
+K2 = None
+F = None
+
+
+def _rebuild_intrinsics():
+    global K1, K2, F
+    K1 = np.array([[FCAM_FL, 0, 960], [0, FCAM_FL, 540], [0, 0, 1]], dtype=np.float64)
+    K2 = np.array([[ECAM_FL_CURRENT, 0, 960], [0, ECAM_FL_CURRENT, 540], [0, 0, 1]], dtype=np.float64)
+    K1_inv = np.linalg.inv(K1)
+    K2_inv_T = np.linalg.inv(K2).T
+    t_skew = np.array([
+        [0, -t_F2E[2], t_F2E[1]],
+        [t_F2E[2], 0, -t_F2E[0]],
+        [-t_F2E[1], t_F2E[0], 0]
+    ], dtype=np.float64)
+    F = K2_inv_T @ t_skew @ R_F2E @ K1_inv
+
 
 def _load_intrinsics():
     global ECAM_FL_CURRENT, FCAM_FL
     try:
         from common.params import Params
-        import json
         _f = json.loads(Params().get("FcamIntrinsics") or "{}").get("fl")
         if _f: FCAM_FL = int(_f)
         _e = json.loads(Params().get("EcamIntrinsics") or "{}").get("fl")
         if _e: ECAM_FL_CURRENT = int(_e)
     except Exception:
         pass
+    _rebuild_intrinsics()
 
-R_F2E = np.eye(3, dtype=np.float64)
-t_F2E = np.zeros(3, dtype=np.float64)
 
-K1 = np.array([[FCAM_FL, 0, 960], [0, FCAM_FL, 540], [0, 0, 1]], dtype=np.float64)
-K2 = np.array([[ECAM_FL_CURRENT, 0, 960], [0, ECAM_FL_CURRENT, 540], [0, 0, 1]], dtype=np.float64)
+_rebuild_intrinsics()
 
 OUTPUT_DIR = "."  # set at runtime; use ./ for current working dir
 MATCHES_PATH = "wide_calib_matches.npz"
@@ -75,14 +95,6 @@ class StereoMatcher:
         import cv2
         self.orb = cv2.ORB_create(nfeatures=2000)
         self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        K1_inv = np.linalg.inv(K1)
-        K2_inv_T = np.linalg.inv(K2).T
-        t_skew = np.array([
-            [0, -t_F2E[2], t_F2E[1]],
-            [t_F2E[2], 0, -t_F2E[0]],
-            [-t_F2E[1], t_F2E[0], 0]
-        ], dtype=np.float64)
-        self.F = K2_inv_T @ t_skew @ R_F2E @ K1_inv
 
     def match(self, img1: np.ndarray, img2: np.ndarray) -> List[Tuple[float, float, float, float]]:
         import cv2
@@ -99,8 +111,8 @@ class StereoMatcher:
         pts2 = np.array([kp2[m.trainIdx].pt for m in matches], dtype=np.float32)
         h1 = np.hstack([pts1, np.ones((len(pts1), 1))])
         h2 = np.hstack([pts2, np.ones((len(pts2), 1))])
-        Fx1 = (self.F @ h1.T).T
-        Ftx2 = (h2 @ self.F).T
+        Fx1 = (F @ h1.T).T
+        Ftx2 = (h2 @ F).T
         d = np.sum(h2 * Fx1.T, axis=1)
         sampson = d ** 2 / np.maximum(Fx1[:, 0] ** 2 + Fx1[:, 1] ** 2 + Ftx2[0, :] ** 2 + Ftx2[1, :] ** 2, 1e-10)
         mask = sampson < 3.0

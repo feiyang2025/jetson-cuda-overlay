@@ -45,8 +45,9 @@ LANE_MARKING_WIDTH = 0.15     # m; standard Chinese lane marking width (inner-ed
 
 
 class RadarVisionCalibrator:
-    def __init__(self):
+    def __init__(self, fl_current: float = 2520):
         self.pairs = []
+        self._fl = fl_current
 
     def add(self, d_radar: float, d_vision: float, v_ego: float):
         if d_radar > 3 and d_vision > 3:
@@ -105,15 +106,16 @@ class RadarVisionCalibrator:
             "slope_k": float(k), "intercept_b": float(b),
             "mean_delta": float(np.mean(delta)),
             "fl_factor": float(fl_factor),
-            "fl_suggested": FL_CURRENT * fl_factor,
+            "fl_suggested": self._fl * fl_factor,
             "stratified": strata,
         }
 
 
 class LaneWidthCalibrator:
-    def __init__(self, lane_marking_width: float = LANE_MARKING_WIDTH):
+    def __init__(self, fl_current: float = 2520, lane_marking_width: float = LANE_MARKING_WIDTH):
         self.obs = []
         self._marking_w = lane_marking_width  # single-side marking → inner-edge offset
+        self._fl = fl_current
 
     def add(self, width: float, v_ego: float):
         if v_ego < 15 or not (2.0 < width < 6.0):
@@ -172,7 +174,7 @@ class LaneWidthCalibrator:
             "by_type": results,
             "combined_ratio": float(combined_ratio),
             "fl_factor": float(1.0 / combined_ratio),
-            "fl_suggested": FL_CURRENT / combined_ratio,
+            "fl_suggested": self._fl / combined_ratio,
         }
 
 
@@ -210,8 +212,11 @@ class CurvatureCalibrator:
 
 class SelfCalibrator:
     def __init__(self, ecam: bool = False, fcam_fl: int = 2520):
-        self.rv = RadarVisionCalibrator()
-        self.lw = LaneWidthCalibrator()
+        # ECAM mode uses a different reference fl; both fallback algorithms must
+        # base their fl_suggested on it (module-global FL_CURRENT is unreliable).
+        ref_fl = 605 if ecam else fcam_fl
+        self.rv = RadarVisionCalibrator(fl_current=ref_fl)
+        self.lw = LaneWidthCalibrator(fl_current=ref_fl)
         self.cv = CurvatureCalibrator()
         self._ecam = ecam
         self._fcam_fl = fcam_fl
