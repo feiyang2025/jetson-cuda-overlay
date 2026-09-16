@@ -16,9 +16,16 @@ def is_agx_orin() -> bool:
   try:
     with open("/etc/nv_tegra_release") as f:
       content = f.read()
-    return "ORIN" in content.upper() or "40.1" in content or "35." in content
   except Exception:
-    return False
+    content = ""
+  if any(tok in content.upper() for tok in ("ORIN", "AGX", "ORING", "T234")):
+    return True
+  try:
+    with open("/proc/device-tree/model") as f:
+      model = f.read().rstrip("\0")
+  except Exception:
+    model = ""
+  return "Orin" in model or "T234" in model or "AGX" in model.upper()
 
 
 def trt_available() -> bool:

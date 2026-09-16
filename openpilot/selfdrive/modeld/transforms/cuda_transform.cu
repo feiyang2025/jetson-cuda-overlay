@@ -168,6 +168,9 @@ void cuda_transform_init(CUDATransformState *s, int width, int height, int tempo
     // Output: 2 frames concatenated
     cudaMalloc(&s->d_output, s->buf_size);
 
+    // Input staging: full source NV12 frame (1920x1080x3/2)
+    cudaMalloc(&s->d_input, 1920 * 1080 * 3 / 2);
+
     // Projection matrices
     cudaMalloc(&s->d_proj_y, 9 * sizeof(float));
     cudaMalloc(&s->d_proj_uv, 9 * sizeof(float));
@@ -183,6 +186,7 @@ void cuda_transform_destroy(CUDATransformState *s)
     cudaFree(s->d_v);
     cudaFree(s->d_img_buffer);
     cudaFree(s->d_output);
+    cudaFree(s->d_input);
     cudaFree(s->d_proj_y);
     cudaFree(s->d_proj_uv);
     s->initialized = 0;
@@ -207,6 +211,8 @@ uint8_t* cuda_transform_execute(CUDATransformState *s,
         proj_uv[i*3+1] = projection[i*3+1] * scale;
         proj_uv[i*3+2] = projection[i*3+2] * scale;
     }
+    // Copy full NV12 frame into device staging (1280*960*3/2 = frame_max)
+    cudaMemcpy(s->d_input, input_nv12, 1920 * 1080 * 3 / 2, cudaMemcpyHostToDevice);
     cudaMemcpy(s->d_proj_y, projection, 9 * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(s->d_proj_uv, proj_uv, 9 * sizeof(float), cudaMemcpyHostToDevice);
 
@@ -215,7 +221,7 @@ uint8_t* cuda_transform_execute(CUDATransformState *s,
         dim3 block(16, 16);
         dim3 grid((w + 15) / 16, (h + 15) / 16);
         warp_perspective_kernel<<<grid, block>>>(
-            input_nv12,
+            s->d_input,
             frame_stride,        // src_row_stride
             1,                   // src_px_stride (Y: stride=1)
             0,                   // src_offset
@@ -235,7 +241,7 @@ uint8_t* cuda_transform_execute(CUDATransformState *s,
         dim3 block(16, 16);
         dim3 grid(((w/2) + 15) / 16, ((h/2) + 15) / 16);
         warp_perspective_kernel<<<grid, block>>>(
-            input_nv12,
+            s->d_input,
             frame_stride,        // src_row_stride
             2,                   // src_px_stride (UV: stride=2)
             frame_uv_offset,     // src_offset (U offset)
@@ -255,7 +261,7 @@ uint8_t* cuda_transform_execute(CUDATransformState *s,
         dim3 block(16, 16);
         dim3 grid(((w/2) + 15) / 16, ((h/2) + 15) / 16);
         warp_perspective_kernel<<<grid, block>>>(
-            input_nv12,
+            s->d_input,
             frame_stride,        // src_row_stride
             2,                   // src_px_stride
             frame_uv_offset + 1, // src_offset (V offset = U offset + 1)

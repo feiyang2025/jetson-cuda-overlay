@@ -25,10 +25,10 @@ if "def always_run" not in s:
 
 append = (
   '\n'
-  '  # CH347 USB-I2C IMU (AGX Orin). Builds on first run; exits cleanly if no device.\n'
-  '  procs += [NativeProcess("sensord_ch347", "openpilot/system/sensord",\n'
-  '                ["bash", "run_ch347t.sh"],\n'
-  '                always_run, enabled=PC, sigkill=False)]\n'
+  '# CH347 USB-I2C IMU (AGX Orin). Builds on first run; exits cleanly if no device.\n'
+  'procs += [NativeProcess("sensord_ch347", "openpilot/system/sensord",\n'
+  '              ["bash", "run_ch347t.sh"],\n'
+  '              always_run, enabled=PC, sigkill=False)]\n'
 )
 
 idx = s.find(marker)

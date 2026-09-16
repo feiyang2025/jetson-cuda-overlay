@@ -1,6 +1,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <glob.h>
+#include <linux/hidraw.h>
 #include <linux/i2c.h>
 #include <linux/i2c-dev.h>
 #include <sys/ioctl.h>
@@ -10,13 +11,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -27,6 +29,7 @@
 #include "common/swaglog.h"
 #include "common/timing.h"
 #include "common/util.h"
+#include "third_party/json11/json11.hpp"
 
 ExitHandler do_exit;
 
@@ -36,24 +39,93 @@ ExitHandler do_exit;
 static constexpr uint8_t WHO_AM_I_REG = 0x0F;
 static constexpr uint8_t LSM6_ADDRS[] = {0x6B, 0x6A};
 static constexpr uint8_t WHO_AM_I_IDS[] = {0x69, 0x6A};
-static constexpr int DEFAULT_I2C_BUS_IMU = 1;
 static constexpr int MAX_STALE_FRAMES = 3;
 static constexpr int MAX_CONSECUTIVE_ERRORS = 10;
 static constexpr int MAX_REINIT_ATTEMPTS = 3;
 static constexpr int CH347_WAIT_SECONDS = 30;
 static constexpr int CH347_RECHECK_INTERVAL_MS = 5000;
+// ---------------------------------------------------------------------------
+// AGX Orin 本地 I2C 总线安全限制（2026-08-26 安全修复）
+// 事故：旧逻辑 glob 扫描全部 /dev/i2c-* 并裸写探测，戳中设备树里没有任何子设备的
+// 空总线 3190000(i2c-3)，触发 tegra-i2c transfer timed out + tegra-bpmp-i2c 失败，
+// 随后整机硬件级断电（无 panic/OOM/关机日志）。详见 openpilot/IMU/ch347t_安全修复说明.md
+// 实测补充：本机所有未接设备的外部总线（含 i2c-5/31b0000、i2c-6/31c0000）裸写
+// 同样会触发超时风暴 —— 因此【默认完全不探测】本地 I2C；
+// 仅当操作者显式设置 SENSORD_I2C_BUS 时才探测该单条总线，
+// 且系统关键总线永远拒绝：
+//   0(3160000) 1(c240000,HDMI/DDC) 3(3190000,事故总线) 4(BPMP 电源管理)
+//   9~12(i2c-2-mux 复用通道) 13(SOC adapter)
+static constexpr int FORBIDDEN_I2C_BUSES[] = {0, 1, 3, 4, 9, 10, 11, 12, 13};
 static constexpr float ACCEL_SCALE = 9.81f * 2.0f / (1 << 15);
 static constexpr float GYRO_SCALE = (8.75f / 1000.0f) * (M_PI / 180.0f);
 
-// ---- Auto gyro zero-rate bias calibration (boot-time) ----
-// Static detection: variance of gyro magnitude over the window must stay below
-// this threshold (rad/s) for the samples to be accepted as "still".
-static constexpr float CALIB_STATIC_GYRO_STD = 0.015f;   // 1-sigma rad/s
-static constexpr int CALIB_SKIP_SECONDS = 1;             // skip first second after open
-static constexpr int CALIB_COLLECT_SECONDS = 5;          // ~500 samples at 104 Hz
-static constexpr int CALIB_SAMPLE_RATE_HZ = 104;
-static constexpr int CALIB_MIN_SAMPLES = 200;            // require at least this many accepted
+// -------------------------------------------------------------------
+// IMU 校准参数（可选，imu_calibration.json）
+// 生成工具: tools/imu_calib/imu_calibration.py（多静止姿态椭球拟合）
+// 应用: gyro_rad = (raw_dps - imuBiasGyro) * pi/180
+//       accel_ms2 = imuCalibMatrix @ (raw_mps2 - 9.81*imuBiasAccel)
+// 无此文件/解析失败时发原始值，行为与旧版完全一致。
+// -------------------------------------------------------------------
+struct ImuCalib {
+  bool valid = false;
+  float gyro_bias_dps[3] = {0.f, 0.f, 0.f};  // imuBiasGyro, °/s
+  float accel_bias_g[3] = {0.f, 0.f, 0.f};   // imuBiasAccel, g
+  float matrix[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};  // imuCalibMatrix 3x3 行主序
+};
+static ImuCalib g_imu_calib;
+// 运行时陀螺零偏(rad/s)：初始=json imuBiasGyro(或 0)，启动自动零偏校准完成后覆盖。
+// 理由：LSM6DS3 零偏随温度漂移明显，一次 json 校准会"过期"，每次开机静置几秒自测更准。
+static float g_runtime_gyro_bias_rad[3] = {0.f, 0.f, 0.f};
 
+static std::string get_project_root() {
+  char exe_path[PATH_MAX];
+  ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+  if (len <= 0) return ".";
+  exe_path[len] = '\0';
+  std::string exe(exe_path);
+  for (int i = 0; i < 3; i++) {
+    auto pos = exe.rfind('/');
+    if (pos == std::string::npos) return ".";
+    exe = exe.substr(0, pos);
+  }
+  return exe.empty() ? "." : exe;
+}
+
+static void load_imu_calibration(const std::string &path) {
+  std::string content = util::read_file(path);
+  if (content.empty()) {
+    LOGW("imu_calibration.json not found (%s), using raw sensor values", path.c_str());
+    return;
+  }
+  std::string err;
+  json11::Json json = json11::Json::parse(content, err);
+  if (!err.empty() || !json.is_object()) {
+    LOGE("imu_calibration.json parse failed: %s", err.c_str());
+    return;
+  }
+  auto gb = json["imuBiasGyro"];
+  auto ab = json["imuBiasAccel"];
+  auto m = json["imuCalibMatrix"];
+  if (!gb.is_array() || gb.array_items().size() != 3 ||
+      !ab.is_array() || ab.array_items().size() != 3 ||
+      !m.is_array() || m.array_items().size() != 9) {
+    LOGE("imu_calibration.json bad schema (need imuBiasGyro[3], imuBiasAccel[3], imuCalibMatrix[9])");
+    return;
+  }
+  for (int i = 0; i < 3; i++) {
+    g_imu_calib.gyro_bias_dps[i] = (float)gb.array_items()[i].number_value();
+    g_imu_calib.accel_bias_g[i] = (float)ab.array_items()[i].number_value();
+  }
+  for (int i = 0; i < 9; i++)
+    g_imu_calib.matrix[i] = (float)m.array_items()[i].number_value();
+  g_imu_calib.valid = true;
+  // json 零偏仅作启动初值，之后会被"启动自动零偏校准"覆盖（零偏随温度漂移）
+  for (int i = 0; i < 3; i++)
+    g_runtime_gyro_bias_rad[i] = g_imu_calib.gyro_bias_dps[i] * (float)(M_PI / 180.0);
+  LOG("IMU calibration loaded: gyro_bias_dps=[%.4f,%.4f,%.4f] accel_bias_g=[%.4f,%.4f,%.4f]",
+      g_imu_calib.gyro_bias_dps[0], g_imu_calib.gyro_bias_dps[1], g_imu_calib.gyro_bias_dps[2],
+      g_imu_calib.accel_bias_g[0], g_imu_calib.accel_bias_g[1], g_imu_calib.accel_bias_g[2]);
+}
 
 static inline int16_t parse_16bit(uint8_t lsb, uint8_t msb) {
   return static_cast<int16_t>(static_cast<uint16_t>(msb) << 8 | lsb);
@@ -91,21 +163,57 @@ public:
       source_(cereal::SensorEventData::SensorSource::LSM6DS3) {
     open_dev_ = (CH347OpenDevice_t)dlsym(lib_handle_, "CH347OpenDevice");
     close_dev_ = (CH347CloseDevice_t)dlsym(lib_handle_, "CH347CloseDevice");
+    // 不同批次厂商库符号名不同：老库导出 CH34xSetTimeout，新库（IMU 部署包 2026-08）
+    // 导出 CH347SetTimeout，两个都试
     set_timeout_ = (CH34xSetTimeout_t)dlsym(lib_handle_, "CH34xSetTimeout");
+    if (!set_timeout_) set_timeout_ = (CH34xSetTimeout_t)dlsym(lib_handle_, "CH347SetTimeout");
     i2c_set_ = (CH347I2C_Set_t)dlsym(lib_handle_, "CH347I2C_Set");
-    i2c_set_ignore_nack_ = (CH347I2C_SetIgnoreNack_t)dlsym(lib_handle_, "CH347I2C_SetIgnoreNack");
-    i2c_set_stretch_ = (CH347I2C_SetStretch_t)dlsym(lib_handle_, "CH347I2C_SetStretch");
     stream_i2c_ = (CH347StreamI2C_t)dlsym(lib_handle_, "CH347StreamI2C");
-    stream_i2c_ret_ack_ = (CH347StreamI2C_RetAck_t)dlsym(lib_handle_, "CH347StreamI2C_RetAck");
+    // Optional symbols: absent in older libch347 builds (e.g. the aarch64 lib).
+    // Fall back to plain CH347StreamI2C when missing instead of calling NULL.
+    void *sym = dlsym(lib_handle_, "CH347StreamI2C_RetAck");
+    if (sym) stream_i2c_ret_ack_ = (CH347StreamI2C_RetAck_t)sym;
+    sym = dlsym(lib_handle_, "CH347I2C_SetIgnoreNack");
+    if (sym) i2c_set_ignore_nack_ = (CH347I2C_SetIgnoreNack_t)sym;
+    sym = dlsym(lib_handle_, "CH347I2C_SetStretch");
+    if (sym) i2c_set_stretch_ = (CH347I2C_SetStretch_t)sym;
+
+    if (!open_dev_ || !close_dev_ || !set_timeout_ || !i2c_set_ || !stream_i2c_)
+      throw std::runtime_error("libch347 missing required symbols");
   }
 
   void open() override {
+    // ---- 兼容两种厂商库调用约定 ----
+    // 新库（IMU 部署包 2026-08）：CH347OpenDevice(ULONG idx)，内部拼 "/dev/hidraw<idx+2>"
+    //   （参考 IMU/scripts/imu_lsm6ds3.py: idx = hidrawN - 2）
+    // 旧库：CH347OpenDevice(const char *path)，直接传完整路径
+    // 用 WHO_AM_I 实测成功与否决定采用哪种约定
+    int hidraw_n = -1;
+    std::sscanf(dev_path_.c_str(), "/dev/hidraw%d", &hidraw_n);
+    if (hidraw_n >= 0) {
+      typedef int (*OpenIdxT)(unsigned long);
+      fd_ = ((OpenIdxT)(void *)open_dev_)((unsigned long)(long)(hidraw_n - 2));
+      LOG("CH347 open(index convention): fd=%d", fd_);
+      if (fd_ >= 0 && setup_and_detect()) return;
+      if (fd_ >= 0) { close_dev_(fd_); fd_ = -1; }
+    }
+    // ---- 回退旧库约定（路径）----
     fd_ = open_dev_(dev_path_.c_str());
     if (fd_ < 0) throw std::runtime_error("failed to open " + dev_path_);
-    if (!set_timeout_(fd_, 2000, 2000)) throw std::runtime_error("CH34xSetTimeout failed");
-    if (!i2c_set_(fd_, 0x01)) throw std::runtime_error("CH347I2C_Set failed");
-    i2c_set_ignore_nack_(fd_, 1);
-    i2c_set_stretch_(fd_, true);
+    if (!setup_and_detect())
+      throw std::runtime_error("CH347 LSM6DS3 not detected on 0x6A/0x6B");
+  }
+
+private:
+  // 打开后的统一配置 + IMU 探测；成功返回 true（addr_ 已就绪）
+  bool setup_and_detect() {
+    if (fd_ < 0) return false;
+    // 超时设置在新库上可能签名不同或缺符号：失败仅告警不致命
+    if (!set_timeout_(fd_, 2000, 2000))
+      LOGW("CH34xSetTimeout failed (tolerated; some lib builds don't need it)");
+    if (!i2c_set_(fd_, 0x01)) return false;  // 0x01 = 400kHz I2C
+    if (i2c_set_ignore_nack_) i2c_set_ignore_nack_(fd_, 1);
+    if (i2c_set_stretch_) i2c_set_stretch_(fd_, true);
     util::sleep_for(20);
 
     for (int attempt = 0; attempt < 8; attempt++) {
@@ -121,15 +229,17 @@ public:
                 ? cereal::SensorEventData::SensorSource::LSM6DS3TRC
                 : cereal::SensorEventData::SensorSource::LSM6DS3;
               LOG("CH347 LSM6DS3 detected at addr=0x%02X, who=0x%02X", addr, who);
-              return;
+              return true;
             }
           }
         } catch (...) { continue; }
       }
       util::sleep_for(20);
     }
-    throw std::runtime_error("CH347 LSM6DS3 not detected on 0x6A/0x6B");
+    return false;
   }
+
+public:
 
   void init_sensor() override {
     write_u8(0x12, 0x01);
@@ -160,14 +270,21 @@ public:
   }
 
   std::vector<uint8_t> read_block(uint8_t start_reg, int length) override {
-    uint8_t addr_write[] = {static_cast<uint8_t>(addr_ << 1 | 0x00), start_reg};
-    int ack = 0;
-    if (!stream_i2c_ret_ack_(fd_, 2, addr_write, 0, nullptr, &ack))
-      throw std::runtime_error("CH347 I2C block write address failed");
-    uint8_t addr_read[] = {static_cast<uint8_t>(addr_ << 1 | 0x01)};
     std::vector<uint8_t> rbuf(length);
-    if (!stream_i2c_ret_ack_(fd_, 1, addr_read, length, rbuf.data(), &ack))
-      throw std::runtime_error("CH347 I2C block read data failed");
+    if (stream_i2c_ret_ack_) {
+      uint8_t addr_write[] = {static_cast<uint8_t>(addr_ << 1 | 0x00), start_reg};
+      int ack = 0;
+      if (!stream_i2c_ret_ack_(fd_, 2, addr_write, 0, nullptr, &ack))
+        throw std::runtime_error("CH347 I2C block write address failed");
+      uint8_t addr_read[] = {static_cast<uint8_t>(addr_ << 1 | 0x01)};
+      if (!stream_i2c_ret_ack_(fd_, 1, addr_read, length, rbuf.data(), &ack))
+        throw std::runtime_error("CH347 I2C block read data failed");
+    } else {
+      // Older lib without RetAck: combined write+read in one stream call.
+      uint8_t buf[2] = {static_cast<uint8_t>(addr_ << 1), start_reg};
+      if (!stream_i2c_(fd_, 2, buf, length, rbuf.data()))
+        throw std::runtime_error("CH347 I2C block read failed");
+    }
     return rbuf;
   }
 
@@ -176,10 +293,16 @@ public:
 private:
   std::vector<uint8_t> stream_read(const uint8_t *write_bytes, int write_len, int read_len) {
     std::vector<uint8_t> rbuf(read_len);
-    int ack = 0;
-    if (!stream_i2c_ret_ack_(fd_, write_len, const_cast<uint8_t *>(write_bytes),
-                             read_len, rbuf.data(), &ack))
-      throw std::runtime_error("CH347 I2C read failed");
+    if (stream_i2c_ret_ack_) {
+      int ack = 0;
+      if (!stream_i2c_ret_ack_(fd_, write_len, const_cast<uint8_t *>(write_bytes),
+                               read_len, rbuf.data(), &ack))
+        throw std::runtime_error("CH347 I2C read failed");
+    } else {
+      if (!stream_i2c_(fd_, write_len, const_cast<uint8_t *>(write_bytes),
+                       read_len, rbuf.data()))
+        throw std::runtime_error("CH347 I2C read failed");
+    }
     return rbuf;
   }
 
@@ -300,25 +423,7 @@ private:
 // CH347 library path resolution
 // -------------------------------------------------------------------
 static std::string get_ch347_lib_path() {
-  char exe_path[PATH_MAX];
-  ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-  std::string project_root;
-  if (len > 0) {
-    exe_path[len] = '\0';
-    std::string exe(exe_path);
-    auto pos = exe.rfind('/');
-    if (pos != std::string::npos) {
-      std::string dir = exe.substr(0, pos);
-      pos = dir.rfind('/');
-      if (pos != std::string::npos) {
-        dir = dir.substr(0, pos);
-        pos = dir.rfind('/');
-        if (pos != std::string::npos)
-          project_root = dir.substr(0, pos);
-      }
-    }
-  }
-  if (project_root.empty()) project_root = ".";
+  std::string project_root = get_project_root();
 
   std::string arch_dir;
   struct utsname uts;
@@ -346,6 +451,47 @@ static std::string get_ch347_lib_path() {
 // -------------------------------------------------------------------
 // CH347 backend detection
 // -------------------------------------------------------------------
+
+// Check whether a /dev/hidrawN node belongs to a WCH chip in multi-function
+// (SPI/I2C) mode: HID ID must be 1a86:55db or 1a86:55dc. Optionally skips the
+// HID-UART interface so we land on the SPI+I2C+GPIO one.
+static bool hidraw_is_ch347_i2c(const char *dev_path, bool allow_uart_iface) {
+  const char *slash = std::strrchr(dev_path, '/');
+  if (!slash) return false;
+  std::string base(slash + 1);
+
+  // Resolve HID ID via sysfs: /sys/class/hidraw/<base>/device/uevent
+  std::ifstream f("/sys/class/hidraw/" + base + "/device/uevent");
+  if (!f.is_open()) return false;
+  std::string line;
+  unsigned int vid = 0, pid = 0;
+  bool have_id = false;
+  while (std::getline(f, line)) {
+    if (line.rfind("HID_ID=", 0) == 0) {
+      unsigned int bus = 0;
+      if (std::sscanf(line.c_str(), "HID_ID=%x:%x:%x", &bus, &vid, &pid) == 3)
+        have_id = true;
+      break;
+    }
+  }
+  if (!have_id) return false;
+  if (vid != 0x1A86 || (pid != 0x55DB && pid != 0x55DC)) return false;
+
+  // Distinguish the two HID interfaces when possible: the USB interface
+  // name of the UART one usually mentions UART/Serial/COM.
+  std::ifstream iface_file("/sys/class/hidraw/" + base + "/device/../interface");
+  if (iface_file.is_open()) {
+    std::string iface((std::istreambuf_iterator<char>(iface_file)),
+                       std::istreambuf_iterator<char>());
+    for (char &c : iface) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    bool looks_uart = iface.find("UART") != std::string::npos ||
+                      iface.find("SERIAL") != std::string::npos ||
+                      iface.find("COM") != std::string::npos;
+    if (looks_uart && !allow_uart_iface) return false;
+  }
+  return true;
+}
+
 static bool detect_ch347_backend(std::string &dev_path, std::string &lib_path) {
   const char *env_dev = std::getenv("SENSORD_CH347_DEV");
   if (env_dev && env_dev[0] != '\0') {
@@ -353,13 +499,33 @@ static bool detect_ch347_backend(std::string &dev_path, std::string &lib_path) {
   } else {
     glob_t globbuf;
     bool found = false;
+    // 1) Vendor kernel driver node (ch34x_pis.ko loaded)
     if (glob("/dev/ch34x_pis*", 0, nullptr, &globbuf) == 0 && globbuf.gl_pathc > 0) {
       dev_path = globbuf.gl_pathv[0];
       found = true;
     }
     globfree(&globbuf);
+    // 2) Stock HID driver: CH347T in mode 2 exposes SPI+I2C as /dev/hidrawN
+    if (!found && glob("/dev/hidraw*", GLOB_NOSORT, nullptr, &globbuf) == 0) {
+      for (size_t i = 0; i < globbuf.gl_pathc && !found; i++) {
+        if (hidraw_is_ch347_i2c(globbuf.gl_pathv[i], /*allow_uart_iface=*/false)) {
+          dev_path = globbuf.gl_pathv[i];
+          found = true;
+        }
+      }
+      // Fall back to any 1a86:55db hidraw if none matched the name filter
+      for (size_t i = 0; i < globbuf.gl_pathc && !found; i++) {
+        if (hidraw_is_ch347_i2c(globbuf.gl_pathv[i], /*allow_uart_iface=*/true)) {
+          dev_path = globbuf.gl_pathv[i];
+          found = true;
+        }
+      }
+      globfree(&globbuf);
+      if (found) LOG("Using CH347 in HID multi-function mode (%s), no kernel module needed", dev_path.c_str());
+    }
+    // 3) Last resort: CDC ACM (dual-serial mode 0 - cannot reach the IMU,
+    //    kept only so existing setups keep working)
     if (!found) {
-      // Also try /dev/ttyACM* (some CH347 appear as ACM)
       if (glob("/dev/ttyACM*", 0, nullptr, &globbuf) == 0 && globbuf.gl_pathc > 0) {
         dev_path = globbuf.gl_pathv[0];
         found = true;
@@ -384,10 +550,27 @@ static bool detect_ch347_backend(std::string &dev_path, std::string &lib_path) {
 // -------------------------------------------------------------------
 // Direct I2C bus detection
 // -------------------------------------------------------------------
+static bool bus_forbidden(int bus) {
+  for (int b : FORBIDDEN_I2C_BUSES) {
+    if (b == bus) return true;
+  }
+  return false;
+}
+
 static int detect_imu_i2c_bus(uint8_t &addr) {
+  // 仅当显式设置 SENSORD_I2C_BUS 时才探测该总线（默认完全不探测本地 I2C，
+  // 本机实测：任何未接设备的空总线裸写都会触发超时风暴，见文件头注释）
   const char *env_bus = std::getenv("SENSORD_I2C_BUS");
-  if (env_bus) {
+  if (!env_bus || env_bus[0] == '\0') {
+    LOG("SENSORD_I2C_BUS not set: direct-I2C probing disabled by safety policy (CH347 USB only)");
+    return -1;
+  }
+  {
     int bus = atoi(env_bus);
+    if (bus < 0 || bus_forbidden(bus)) {
+      LOGW("SENSORD_I2C_BUS=%d rejected: system-critical bus (safety, see IMU/ch347t_安全修复说明.md)", bus);
+      return -1;
+    }
     LOG("Probing IMU on env bus %d", bus);
     for (uint8_t a : LSM6_ADDRS) {
       char path[32];
@@ -408,52 +591,8 @@ static int detect_imu_i2c_bus(uint8_t &addr) {
       }
     }
     LOGW("LSM6DS3 not found on bus %d", bus);
+    return -1;
   }
-
-  // Scan all /dev/i2c-*
-  glob_t globbuf;
-  std::vector<int> buses;
-  if (glob("/dev/i2c-*", 0, nullptr, &globbuf) == 0) {
-    for (size_t i = 0; i < globbuf.gl_pathc; i++) {
-      std::string p = globbuf.gl_pathv[i];
-      auto pos = p.rfind('-');
-      if (pos != std::string::npos) {
-        try { buses.push_back(std::stoi(p.substr(pos + 1))); } catch (...) {}
-      }
-    }
-    globfree(&globbuf);
-  }
-
-  // Prioritize DEFAULT bus, then probe all
-  std::vector<int> ordered;
-  for (int b : buses) { if (b == DEFAULT_I2C_BUS_IMU) { ordered.push_back(b); break; } }
-  for (int b : buses) { if (b != DEFAULT_I2C_BUS_IMU) ordered.push_back(b); }
-  if (ordered.empty()) ordered.push_back(DEFAULT_I2C_BUS_IMU);
-
-  for (int bus : ordered) {
-    for (uint8_t a : LSM6_ADDRS) {
-      char path[32];
-      snprintf(path, sizeof(path), "/dev/i2c-%d", bus);
-      int fd = ::open(path, O_RDWR);
-      if (fd < 0) continue;
-      if (ioctl(fd, I2C_SLAVE, a) < 0) { ::close(fd); continue; }
-      uint8_t reg = WHO_AM_I_REG;
-      ::write(fd, &reg, 1);
-      uint8_t who;
-      if (::read(fd, &who, 1) == 1) {
-        ::close(fd);
-        for (uint8_t id : WHO_AM_I_IDS) {
-          if (who == id) { addr = a; LOG("LSM6DS3 on /dev/i2c-%d, addr=0x%02X", bus, a); return bus; }
-        }
-      } else {
-        ::close(fd);
-      }
-    }
-  }
-
-  LOGW("LSM6DS3 not found, defaulting to bus %d addr 0x%02X", DEFAULT_I2C_BUS_IMU, LSM6_ADDRS[0]);
-  addr = LSM6_ADDRS[0];
-  return DEFAULT_I2C_BUS_IMU;
 }
 
 // -------------------------------------------------------------------
@@ -514,113 +653,6 @@ static void publish_temperature(PubMaster &pm,
 }
 
 // -------------------------------------------------------------------
-// Boot-time gyro zero-rate bias auto-calibration
-// -------------------------------------------------------------------
-static std::string calib_json_path() {
-  const char *env = std::getenv("IMU_CALIB_JSON");
-  if (env && env[0] != '\0') return env;
-  char pwd[PATH_MAX];
-  return (getcwd(pwd, sizeof(pwd)) != nullptr)
-    ? std::string(pwd) + "/imu_calibration.json" : "imu_calibration.json";
-}
-
-static std::pair<bool, float> find_float(const std::string &json, const std::string &key) {
-  std::string pat1 = "\"" + key + "\":";
-  auto i = json.find(pat1);
-  if (i == std::string::npos) return {false, 0.f};
-  i += pat1.size();
-  auto j = json.find_first_of(",}]", i);
-  if (j == std::string::npos) return {false, 0.f};
-  try { return {true, std::stof(json.substr(i, j - i))}; } catch (...) { return {false, 0.f}; }
-}
-
-static void load_gyro_bias(float bias[3]) {
-  bias[0] = bias[1] = bias[2] = 0.f;
-  std::ifstream f(calib_json_path());
-  if (!f) return;
-  std::stringstream ss; ss << f.rdbuf(); std::string json = ss.str();
-  // imuBiasGyro array: [x, y, z]
-  std::string pat = "\"imuBiasGyro\":[";
-  auto i = json.find(pat);
-  if (i == std::string::npos) return;
-  i += pat.size();
-  std::vector<float> vals;
-  while (vals.size() < 3 && i < json.size()) {
-    auto j = json.find_first_of(",]", i);
-    if (j == std::string::npos) break;
-    try { vals.push_back(std::stof(json.substr(i, j - i))); } catch (...) { vals.push_back(0.f); }
-    i = j + 1;
-  }
-  for (size_t k = 0; k < vals.size() && k < 3; k++) bias[k] = vals[k];
-}
-
-static void save_gyro_bias(const float bias[3]) {
-  std::string json = "{\n"
-    "  \"imuCalibMatrix\": [1,0,0, 0,1,0, 0,0,1],\n"
-    "  \"imuBiasAccel\": [0.0, 0.0, 0.0],\n"
-    "  \"imuBiasGyro\": [" +
-    std::to_string((double)bias[0]) + ", " + std::to_string((double)bias[1]) + ", " +
-    std::to_string((double)bias[2]) + "]\n}\n";
-  std::ofstream f(calib_json_path());
-  if (!f) { LOGW("IMU: could not write %s", calib_json_path().c_str()); return; }
-  f << json;
-  LOG("IMU: saved gyro bias (%s)", calib_json_path().c_str());
-}
-
-// Called right after open()+init_sensor(). Collects ~5s of data; if the device
-// is stationary (gyro magnitude 1-sigma below threshold), updates the gyro
-// zero-rate bias in imu_calibration.json. If moving, keeps the existing bias.
-static void auto_calibrate_gyro_bias(LSM6DS3 &sensor, const std::string &backend) {
-  float existing[3];
-  load_gyro_bias(existing);
-  LOG("IMU: boot auto-calibrate (%s), existing bias=[%+.4f %+.4f %+.4f]",
-      backend.c_str(), existing[0], existing[1], existing[2]);
-
-  // Skip the first second for sensor stabilization.
-  util::sleep_for(CALIB_SKIP_SECONDS * 1000);
-
-  std::vector<float> gx, gy, gz;
-  int samples = CALIB_COLLECT_SECONDS * CALIB_SAMPLE_RATE_HZ;
-  for (int i = 0; i < samples && !do_exit; i++) {
-    bool ok = false;
-    try {
-      auto b = sensor.read_block(0x22, 6);
-      float x = parse_16bit(b[0], b[1]);
-      float y = parse_16bit(b[2], b[3]);
-      float z = parse_16bit(b[4], b[5]);
-      gx.push_back(y * GYRO_SCALE);
-      gy.push_back(-x * GYRO_SCALE);
-      gz.push_back(z * GYRO_SCALE);
-      ok = true;
-    } catch (...) {}
-    if (!ok) util::sleep_for(10);
-    else util::sleep_for(1000 / CALIB_SAMPLE_RATE_HZ);
-  }
-  int n = (int)gx.size();
-  if (n < CALIB_MIN_SAMPLES) {
-    LOGW("IMU: insufficient samples (%d < %d), keeping existing bias", n, CALIB_MIN_SAMPLES);
-    return;
-  }
-  auto mean = [&](const std::vector<float> &v) { float s = 0; for (float x : v) s += x; return s / v.size(); };
-  auto sd = [&](const std::vector<float> &v, float m) {
-    float s = 0; for (float x : v) s += (x - m) * (x - m); return std::sqrt(s / v.size());
-  };
-  float mx = mean(gx), my = mean(gy), mz = mean(gz);
-  float sx = sd(gx, mx), sy = sd(gy, my), sz = sd(gz, mz);
-  // Combined 1-sigma of gyro magnitude vector ~ sqrt(mean of per-axis variance).
-  float mag_std = std::sqrt((sx * sx + sy * sy + sz * sz) / 3.0f);
-  LOG("IMU: samples=%d stds=[%+.5f %+.5f %+.5f] mag_std=%+.5f", n, sx, sy, sz, mag_std);
-  if (mag_std >= CALIB_STATIC_GYRO_STD) {
-    LOGW("IMU: not stationary (mag_std=%.5f >= 0.015), keeping existing bias [%+.4f %+.4f %+.4f]",
-         mag_std, existing[0], existing[1], existing[2]);
-    return;
-  }
-  float new_bias[3] = {mx, my, mz};
-  LOG("IMU: stationary, bias %+.4f -> %+.4f %+.4f %+.4f", existing[0], new_bias[0], new_bias[1], new_bias[2]);
-  save_gyro_bias(new_bias);
-}
-
-// -------------------------------------------------------------------
 // Reinitialize sensor with retry
 // -------------------------------------------------------------------
 static bool reinit_sensor(LSM6DS3 &sensor, const std::string &name) {
@@ -664,7 +696,11 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
   int consecutive_errors = 0;
   int reinit_attempts = 0;
   SensorCache cache;
-  float gyro_bias[3] = {0.f, 0.f, 0.f};
+  bool gyro_bias_done = false;
+  uint64_t auto_bias_t0 = 0;
+  double bias_sum[3] = {0.0, 0.0, 0.0};
+  double bias_sumsq[3] = {0.0, 0.0, 0.0};
+  int bias_n = 0;
 
   try {
     sensor.open();
@@ -674,12 +710,6 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
     LOGE("%s: open/init failed: %s", backend_name.c_str(), e.what());
     return false;
   }
-
-  // Boot-time auto zero-bias calibration (only once when the backend starts).
-  auto_calibrate_gyro_bias(sensor, backend_name);
-  load_gyro_bias(gyro_bias);
-  if (gyro_bias[0] != 0.f || gyro_bias[1] != 0.f || gyro_bias[2] != 0.f)
-    LOG("IMU: applying gyro bias [-%+.4f -%+.4f -%+.4f]", gyro_bias[0], gyro_bias[1], gyro_bias[2]);
 
   while (!do_exit && !switch_backend) {
     bool i2c_error = false;
@@ -710,11 +740,61 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
         float x = parse_16bit(b[0], b[1]);
         float y = parse_16bit(b[2], b[3]);
         float z = parse_16bit(b[4], b[5]);
-        cache.gyro_v[0] = y * GYRO_SCALE - gyro_bias[0];
-        cache.gyro_v[1] = -x * GYRO_SCALE - gyro_bias[1];
-        cache.gyro_v[2] = z * GYRO_SCALE - gyro_bias[2];
+        cache.gyro_v[0] = y * GYRO_SCALE;
+        cache.gyro_v[1] = -x * GYRO_SCALE;
+        cache.gyro_v[2] = z * GYRO_SCALE;
         fresh_gyro = true;
       } catch (...) { i2c_error = true; }
+    }
+
+    // 校准应用：gyro 减零偏(自动零偏优先，json 作初值)；accel 减偏置乘矩阵(json)
+    if (!i2c_error && (fresh_acc || fresh_gyro)) {
+      // --- 启动自动零偏校准：累积 ~5s 求均值/标准差，1σ 小 = 静止（零偏本身再大也不影响） ---
+      // 前 1s 跳过(传感器配置稳定期)；std>0.015 rad/s 视为运动/振动，拒绝并沿用 json/零偏。
+      // 零偏随温度漂移，每次开机重测。注意不可用"瞬时模长<阈值"判静止——零偏会撑爆阈值。
+      if (!gyro_bias_done && fresh_gyro) {
+        if (auto_bias_t0 == 0) auto_bias_t0 = nanos_since_boot();
+        if (nanos_since_boot() - auto_bias_t0 >= 1e9) {  // 跳过开头 1s
+          for (int i = 0; i < 3; i++) {
+            bias_sum[i] += cache.gyro_v[i];
+            bias_sumsq[i] += cache.gyro_v[i] * cache.gyro_v[i];
+          }
+          bias_n++;
+        }
+        if (bias_n >= 500) {  // ~5s @104Hz
+          gyro_bias_done = true;
+          float max_std = 0.f;
+          for (int i = 0; i < 3; i++) {
+            float mean = (float)(bias_sum[i] / bias_n);
+            float var = (float)(bias_sumsq[i] / bias_n) - mean * mean;
+            if (var < 0.f) var = 0.f;
+            max_std = std::max(max_std, std::sqrt(var));
+          }
+          if (max_std < 0.015f) {  // 1σ < ~0.86°/s = 静止
+            for (int i = 0; i < 3; i++)
+              g_runtime_gyro_bias_rad[i] = (float)(bias_sum[i] / bias_n);
+            LOGW("gyro auto zero-bias calibrated: [%.5f, %.5f, %.5f] rad/s (1sigma=%.5f, %d samples)",
+                 g_runtime_gyro_bias_rad[0], g_runtime_gyro_bias_rad[1], g_runtime_gyro_bias_rad[2], max_std, bias_n);
+          } else {
+            LOGW("gyro auto zero-bias rejected: not stationary (1sigma=%.5f rad/s), using json/zero bias", max_std);
+          }
+        } else if (nanos_since_boot() - auto_bias_t0 > 12e9) {
+          gyro_bias_done = true;
+          LOGW("gyro auto zero-bias skipped: insufficient samples within 12s (using json/zero bias)");
+        }
+      }
+      for (int i = 0; i < 3; i++)
+        cache.gyro_v[i] -= g_runtime_gyro_bias_rad[i];
+      if (g_imu_calib.valid) {
+        float acc_raw[3] = {
+          cache.acc_v[0] - 9.81f * g_imu_calib.accel_bias_g[0],
+          cache.acc_v[1] - 9.81f * g_imu_calib.accel_bias_g[1],
+          cache.acc_v[2] - 9.81f * g_imu_calib.accel_bias_g[2]};
+        for (int i = 0; i < 3; i++)
+          cache.acc_v[i] = g_imu_calib.matrix[i * 3] * acc_raw[0]
+                         + g_imu_calib.matrix[i * 3 + 1] * acc_raw[1]
+                         + g_imu_calib.matrix[i * 3 + 2] * acc_raw[2];
+      }
     }
 
     if (i2c_error) {
@@ -801,8 +881,20 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
 // -------------------------------------------------------------------
 int main(int argc, char **argv) {
   setpriority(PRIO_PROCESS, 0, -15);
+  // libch347.so 每个 I2C 事务都往 stdout printf 调试行（mLength: .. iReadLength: .. AckBitCnt: ..），
+  // 日志量巨大且无信息量 → 重定向到 /dev/null（2026-08-30；auto_calibrate.py 早已用同款手法，见交接文档 §七）
+  if (!std::getenv("CH347_LIB_DEBUG")) {
+    FILE *devnull = std::fopen("/dev/null", "w");
+    if (devnull) { std::freopen("/dev/null", "w", stdout); std::fclose(devnull); }
+  }
   PubMaster publisher({"accelerometer", "gyroscope", "temperatureSensor"});
   std::atomic<bool> switch_backend{false};
+
+  // 可选 IMU 校准参数：IMU_CALIB_JSON 环境变量优先，默认仓库根 imu_calibration.json
+  const char *env_calib = std::getenv("IMU_CALIB_JSON");
+  std::string calib_path = (env_calib && env_calib[0] != '\0')
+      ? std::string(env_calib) : get_project_root() + "/imu_calibration.json";
+  load_imu_calibration(calib_path);
 
   while (!do_exit) {
     // Reduce priority after watchdog restart
@@ -833,6 +925,12 @@ int main(int argc, char **argv) {
     // ---- Phase 2: Fallback to direct I2C with auto-upgrade ----
     uint8_t i2c_addr = LSM6_ADDRS[0];
     int i2c_bus = detect_imu_i2c_bus(i2c_addr);
+    if (i2c_bus < 0) {
+      // 没有任何安全总线可探测：不碰系统总线，等 CH347 插入（manager watchdog 会拉起）
+      LOGW("No safe direct-I2C bus available; waiting for CH347 USB device...");
+      util::sleep_for(CH347_RECHECK_INTERVAL_MS);
+      continue;
+    }
     LOG("Starting direct I2C backend (bus=%d, addr=0x%02X)", i2c_bus, i2c_addr);
 
     // Background thread: periodically check if CH347 becomes available

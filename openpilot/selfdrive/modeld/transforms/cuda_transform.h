@@ -13,6 +13,8 @@ typedef struct {
   uint8_t *d_y, *d_u, *d_v;
   // Temporal ring buffer (holds previous frames)
   uint8_t *d_img_buffer;
+  // Input staging buffer (full NV12 frame copied from host)
+  uint8_t *d_input;
   // Output buffer (2 frames concatenated, same layout as OpenCL input_frames_cl)
   uint8_t *d_output;
   // Device copy of projection matrix

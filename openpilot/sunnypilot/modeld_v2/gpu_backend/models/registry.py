@@ -100,9 +100,76 @@ def _big_combo() -> ModelProfile:
   )
 
 
+def _classic() -> ModelProfile:
+  """Classic openpilot split model (driving_vision.plan + driving_policy.plan).
+
+  Used by Carrot / dp / pre-FiletOFish forks that keep the standard
+  `models/` layout with `driving_vision_metadata.pkl` /
+  `driving_policy_metadata.pkl`.  Input/output shapes are read from the
+  metadata pkls so slice math always matches the fork's own parser.
+  """
+  engine_dir = MODELS_ROOT
+  vision_metadata_path = engine_dir / "driving_vision_metadata.pkl"
+  policy_metadata_path = engine_dir / "driving_policy_metadata.pkl"
+  vision_slices = _load_slices(vision_metadata_path)
+  policy_slices = _load_slices(policy_metadata_path)
+
+  vision_engine = None
+  policy_engine = None
+  for name in ("driving_vision_fp16.plan", "driving_vision.plan"):
+    if (engine_dir / name).is_file():
+      vision_engine = name
+      break
+  for name in ("driving_policy_fp16.plan", "driving_policy.plan"):
+    if (engine_dir / name).is_file():
+      policy_engine = name
+      break
+
+  vision_input_shapes = {}
+  if vision_metadata_path.exists():
+    try:
+      with open(vision_metadata_path, "rb") as f:
+        vision_input_shapes = pickle.load(f).get("input_shapes", {})
+    except Exception:
+      pass
+  policy_input_shapes = {}
+  if policy_metadata_path.exists():
+    try:
+      with open(policy_metadata_path, "rb") as f:
+        policy_input_shapes = pickle.load(f).get("input_shapes", {})
+    except Exception:
+      pass
+
+  # Policy temporal windows for the classic model are 25 (not 100).
+  feats_shape = policy_input_shapes.get("features_buffer", (1, 25, 512))
+  desire_shape = policy_input_shapes.get("desire_pulse", (1, 25, 8))
+  temporal = TemporalMeta(
+    features_len=feats_shape[-1] if len(feats_shape) >= 2 else 512,
+    features_windows=feats_shape[-2] if len(feats_shape) >= 2 else 25,
+    desire_len=desire_shape[-1] if len(desire_shape) >= 1 else 8,
+    desire_windows=desire_shape[-2] if len(desire_shape) >= 2 else 25,
+    features_includes_current=False,
+    desire_includes_current=True,
+  )
+
+  return ModelProfile(
+    name="Classic",
+    mode="split",
+    engine_dir=str(engine_dir),
+    vision_engine=vision_engine,
+    policy_engine=policy_engine,
+    vision_input_names=list(vision_input_shapes.keys()),
+    input_shapes={**vision_input_shapes, **policy_input_shapes},
+    vision_slices=vision_slices or {},
+    policy_slices=policy_slices or {},
+    temporal=temporal,
+  )
+
+
 REGISTRY: dict[str, ModelProfile] = {
   "FiletOFish": _filet_ofish(),
   "BigCombo": _big_combo(),
+  "Classic": _classic(),
 }
 
 

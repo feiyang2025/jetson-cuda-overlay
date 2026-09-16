@@ -55,8 +55,18 @@ class TrtRunner:
     ctx = ctypes.c_ulonglong()
     ret = self._cuda.cuCtxGetCurrent(ctypes.byref(ctx))
     if ret != 0 or ctx.value == 0:
-      raise RuntimeError("No active CUDA context; initialize tinygrad Device['CUDA'] first")
+      # No current context yet: bring up the tinygrad CUDA device so its
+      # primary context is current on this thread.
+      try:
+        from tinygrad import Device
+        Device["CUDA"]
+      except Exception:
+        pass
+      ret = self._cuda.cuCtxGetCurrent(ctypes.byref(ctx))
+      if ret != 0 or ctx.value == 0:
+        raise RuntimeError("No active CUDA context; initialize tinygrad Device['CUDA'] first")
     self._ctx = ctx.value
+    self._set_current = self._cuda.cuCtxSetCurrent
     self._lib = ctypes.CDLL(str(api))
     self._lib.trt_engine_create.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     self._lib.trt_engine_create.restype = ctypes.c_void_p
@@ -85,6 +95,9 @@ class TrtRunner:
     with open(engine_path, "rb") as f:
       data = f.read()
     buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
+    # Make sure the tinygrad primary context is current before TRT loads,
+    # since a previous engine's teardown may have left a destroyed context.
+    self._set_current(ctypes.c_ulonglong(self._ctx))
     self._handle = self._lib.trt_engine_create(buf, len(data))
     if not self._handle:
       raise RuntimeError(f"trt_engine_create failed for {engine_path}")
@@ -108,6 +121,24 @@ class TrtRunner:
     dtype_val = self._lib.trt_engine_output_dtype(self._handle, 0)
     self.output_dtype_np = _TRT_DTYPE_TO_NP.get(dtype_val, np.float32)
     self.output_nbytes = int(np.prod(self.output_shape)) * np.dtype(self.output_dtype_np).itemsize
+    # Input bindings for this generation of fp16-native v2 models
+    # (Classic / FiletOFish / BigCombo drive-v2) are float16.  The C api
+    # does not expose an input-dtype getter, so introspect the plan with
+    # the python `tensorrt` module when present; otherwise assume fp16 and
+    # cast on copy (see __call__).
+    self._input_dtypes: dict[str, np.dtype] = {}
+    try:
+      import tensorrt as _trt
+      _logger = _trt.Logger(_trt.Logger.ERROR)
+      with open(engine_path, "rb") as _f:
+        _engine = _trt.Runtime(_logger).deserialize_cuda_engine(_f.read())
+      for i in range(_engine.num_io_tensors):
+        _n = _engine.get_tensor_name(i)
+        if _engine.get_tensor_mode(_n) == _trt.TensorIOMode.INPUT:
+          self._input_dtypes[_n] = np.dtype(_trt.nptype(_engine.get_tensor_dtype(_n)))
+    except Exception:
+      for name in self.input_names:
+        self._input_dtypes[name] = np.float16
     self.stream = ctypes.c_ulonglong()
     _check(self._cuda.cuStreamCreate(ctypes.byref(self.stream), 0))
     self.gpu_output = ctypes.c_ulonglong()
@@ -130,15 +161,29 @@ class TrtRunner:
       elif isinstance(val, np.ndarray):
         info = self._input_gpu.get(name)
         if info is None:
-          nbytes = int(np.prod(val.shape)) * val.dtype.itemsize
+          bind_dtype = self._input_dtypes.get(name, np.dtype(val.dtype))
+          nbytes = int(np.prod(val.shape)) * np.dtype(bind_dtype).itemsize
           ptr = ctypes.c_ulonglong()
           _check(self._cuda.cuMemAlloc_v2(ctypes.byref(ptr), nbytes))
-          info = {"ptr": ptr.value, "nbytes": nbytes}
+          info = {"ptr": ptr.value, "nbytes": nbytes, "bind_dtype": bind_dtype}
           self._input_gpu[name] = info
-        _check(self._cuda.cuMemcpyHtoDAsync_v2(info["ptr"], ctypes.c_void_p(val.ctypes.data), info["nbytes"], self.stream))
+        if val.dtype != info["bind_dtype"]:
+          cast = info.get("cast_buf")
+          if cast is None or cast.shape != val.shape:
+            cast = np.empty(val.shape, dtype=info["bind_dtype"])
+            info["cast_buf"] = cast
+          cast[:] = val
+          src = cast
+        else:
+          src = val
+        _check(self._cuda.cuMemcpyHtoDAsync_v2(info["ptr"], ctypes.c_void_p(src.ctypes.data), info["nbytes"], self.stream))
         addrs[i] = info["ptr"]
       else:
         raise TypeError(f"Unsupported input type for {name}: {type(val).__name__}")
+
+    # Ensure the async input copies above have landed before the engine
+    # reads them (engine enqueue may run ahead of the copies otherwise).
+    _check(self._cuda.cuStreamSynchronize(self.stream))
 
     ret = self._lib.trt_engine_execute(self._handle, addrs, self.gpu_output.value, self.stream.value)
     if ret != 0:

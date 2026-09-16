@@ -51,7 +51,11 @@ class GpuModelState:
     self._get_accel_from_plan = drive_helpers.get_accel_from_plan
     self._get_curvature_from_plan = drive_helpers.get_curvature_from_plan
     self._smooth_value = drive_helpers.smooth_value
-    self._should_stop = drive_helpers.should_stop
+    # Some forks (e.g. Carrot) don't ship `should_stop`; fall back to a
+    # minimal v_ego based stop heuristic so get_action_from_model works.
+    self._should_stop = getattr(drive_helpers, "should_stop", None) or (
+      lambda v_ego, a: a < -1.0 and v_ego < 1.0
+    )
 
     ModelStateBase = _import_attr(
       "openpilot.sunnypilot.modeld_v2.modeld_base", "ModelStateBase",
@@ -83,6 +87,9 @@ class GpuModelState:
         self._resolve_profile = None
 
     # Import constants
+    # Priority: sunnypilot modeld_v2 -> fork's own selfdrive.modeld module ->
+    # compat. Old-layout forks (Carrot / dp) keep ModelConstants/Plan in
+    # openpilot.selfdrive.modeld.constants with DESIRE_LEN=8 etc.
     try:
       constants_mod = _lazy_import(
         "openpilot.sunnypilot.modeld_v2.constants",
@@ -90,23 +97,40 @@ class GpuModelState:
       self._ModelConstants = constants_mod.ModelConstants
       self._Plan = constants_mod.Plan
     except ImportError:
-      compat_constants = _lazy_import(
-        "openpilot.sunnypilot.modeld_v2.compat.constants",
-      )
-      self._ModelConstants = compat_constants.ModelConstants
-      self._Plan = compat_constants.Plan
+      try:
+        legacy_constants = _lazy_import(
+          "openpilot.selfdrive.modeld.constants",
+          "selfdrive.modeld.constants",
+        )
+        self._ModelConstants = legacy_constants.ModelConstants
+        self._Plan = legacy_constants.Plan
+      except ImportError:
+        compat_constants = _lazy_import(
+          "openpilot.sunnypilot.modeld_v2.compat.constants",
+        )
+        self._ModelConstants = compat_constants.ModelConstants
+        self._Plan = compat_constants.Plan
 
     # Import parsers
+    # Old-layout forks ship their own MDN parsing in selfdrive.modeld; prefer
+    # it over the pass-through compat parsers so outputs match fill_model_msg.
     try:
       parse_mod = _lazy_import(
         "openpilot.sunnypilot.modeld_v2.parse_model_outputs",
       )
       self._CombinedParser = parse_mod.Parser
     except ImportError:
-      compat_parse = _lazy_import(
-        "openpilot.sunnypilot.modeld_v2.compat.parse_model_outputs",
-      )
-      self._CombinedParser = compat_parse.Parser
+      try:
+        legacy_parse = _lazy_import(
+          "openpilot.selfdrive.modeld.parse_model_outputs",
+          "selfdrive.modeld.parse_model_outputs",
+        )
+        self._CombinedParser = legacy_parse.Parser
+      except ImportError:
+        compat_parse = _lazy_import(
+          "openpilot.sunnypilot.modeld_v2.compat.parse_model_outputs",
+        )
+        self._CombinedParser = compat_parse.Parser
 
     try:
       parse_split_mod = _lazy_import(
@@ -114,14 +138,26 @@ class GpuModelState:
       )
       self._SplitParser = parse_split_mod.Parser
     except ImportError:
-      compat_parse_split = _lazy_import(
-        "openpilot.sunnypilot.modeld_v2.compat.parse_model_outputs_split",
-      )
-      self._SplitParser = compat_parse_split.Parser
+      try:
+        legacy_split = _lazy_import(
+          "openpilot.selfdrive.modeld.parse_model_outputs",
+          "selfdrive.modeld.parse_model_outputs",
+        )
+        self._SplitParser = legacy_split.Parser
+      except ImportError:
+        compat_parse_split = _lazy_import(
+          "openpilot.sunnypilot.modeld_v2.compat.parse_model_outputs_split",
+        )
+        self._SplitParser = compat_parse_split.Parser
 
     # --- Initialization ---
     self.chestnut = chestnut
-    model_name = os.getenv("MODEL_NAME") or Params().get("Model", encoding="utf-8")
+    try:
+      model_name = os.getenv("MODEL_NAME") or Params().get("Model", encoding="utf-8")
+    except Exception:
+      # Some forks (e.g. Carrot) use the cython Params which lacks `encoding`
+      # and has no "Model" key (the model is always the bundled classic one).
+      model_name = os.getenv("MODEL_NAME")
 
     if self._resolve_profile is None:
       raise RuntimeError("No profile resolver available")
@@ -131,6 +167,17 @@ class GpuModelState:
 
     if self._create_gpu_backend is None:
       raise RuntimeError("CUDA backend module not available")
+    # TrtRunner + CudaTransform both talk to the CUDA driver directly and need
+    # a live context on the current thread. Initialize tinygrad's CUDA device
+    # (which creates a primary context with cuDevicePrimaryCtxRetain) so all the
+    # raw driver calls below run inside it.
+    try:
+      os.environ["DEV"] = os.getenv("DEV", "CUDA")
+      from tinygrad import Device as _TinygradDevice
+      _TinygradDevice["CUDA"]
+      cloudlog.warning("tinygrad CUDA device initialized")
+    except Exception:
+      cloudlog.exception("tinygrad CUDA device init failed; CUDA backend will fail")
     self.backend = self._create_gpu_backend(self.profile)
     if self.backend is None:
       raise RuntimeError("CUDA backend unavailable (not AGX Orin or TensorRT missing)")
@@ -161,10 +208,28 @@ class GpuModelState:
     return False
 
   def slice_outputs(self, model_output: np.ndarray, slices: dict[str, slice]) -> dict[str, np.ndarray]:
-    return {k: model_output[np.newaxis, v] for k, v in slices.items()}
+    out = {}
+    for k, v in slices.items():
+      if v.stop is None and v.start is not None and v.start < 0:
+        continue
+      if v.stop is None:
+        continue
+      out[k] = model_output[np.newaxis, v]
+    return out
 
   def _update_temporal(self, raw_output: np.ndarray) -> None:
-    hidden = raw_output[self.profile.policy_slices["hidden_state"]]
+    # Classic Carrot keeps hidden_state in the vision output; backend.infer_split
+    # already shifts+appends features_buffer for split mode. For merged models it
+    # may live in policy slices. Only update if the key is present and for split
+    # mode the backend already did the shift (here it would double-shift).
+    if self.profile.mode == "split":
+      return
+    slices = self.profile.policy_slices
+    if "hidden_state" not in slices:
+      slices = self.profile.vision_slices
+    if "hidden_state" not in slices:
+      return
+    hidden = raw_output[slices["hidden_state"]]
     feats = self.numpy_inputs.get("features_buffer")
     if feats is None:
       return
@@ -219,7 +284,12 @@ class GpuModelState:
     return outputs
 
   def _split_vision_size(self) -> int:
-    return sum(s.stop - s.start for s in self.profile.vision_slices.values())
+    total = 0
+    for s in self.profile.vision_slices.values():
+      if s.stop is None:
+        continue
+      total += s.stop - s.start
+    return total
 
   def get_action_from_model(self, model_output, prev_action, lat_action_t, long_action_t, v_ego):
     Plan = self._Plan
