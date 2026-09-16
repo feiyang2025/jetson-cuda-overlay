@@ -69,6 +69,41 @@ trtexec --onnx=model.onnx --saveEngine=xxx_fp16.plan --fp16
 sudo tw_camera_cfg bring      # 森云 serdes 初始化, 必须先于 camerad
 ```
 
+### 2.4 AGX Orin 相机完整链路（标准）
+
+```
+tw_camera_cfg(serdes 初始化)
+  → V4L2 采集 GMSL IMX390 UYVY (30fps, /dev/video0/1)
+  → VIC 硬件转 NV12 (v4l2_dmabuf_camera.py, 1920x1080)
+  → FrameSync 帧同步 (road 致密发号, wide 跟随, 帧 id 配对)
+  → 帧计数节流 20fps (30fps 每 3 帧交付 2 帧, 无 sleep 无拍频)
+  → VisionIPC (4 个共享 buffer)
+  → modeld: GpuModelState (CUDA 变换 + TensorRT 推理)
+```
+
+入口: `USE_WEBCAM=1` → `webcamerad` (Python `tools/webcam/camerad.py`), 由
+process_config 的 `WEBCAM` 开关启用。**不要**设 `DISABLE_CUDA_TRANSFORM=1`
+(那是 USB 摄像头 PC 模式的 CPU 转换路径; 本机 GMSL 走 CUDA 变换)。
+
+### 2.5 相机适配"水土不服"防护（2026-09-16 起）
+
+历史教训: patch_camerad.py 只认官方结构的 import 锚点
+(`from tools.webcam.camera import Camera` / 新布局路径), 对胡萝卜系 fork
+(ajouatom/cpv9 等用 `from openpilot.tools.webcam.camera import Camera`
+带前缀) 锚点失配 → **静默跳过** → fork 自己的旧 camerad.py 保留 → VIC /
+FrameSync 链路接不上, 表现为相机黑屏或 16Hz 拍频, 且无任何报错。
+
+apply_cuda.sh 现在做两层防护:
+1. 检测 fork 的 camerad.py 无 "V4L2 DMABUF"/"v4l2_dmabuf_camera" 字样
+   → 判定旧版, 用 overlay 完整适配版 (328 行, sp 同款) 覆盖, 原文件备份
+   为 `.orig_openpilot`
+2. 对新版再跑 patch_camerad.py 确认 import 锚点
+
+安装到旧布局: `tools/webcam/camerad.py`; 新布局:
+`openpilot/system/camerad/webcam/camerad.py`。overlay 内的
+`openpilot/system/camerad/webcam/camerad.py` 即完整入口(与 sp 树内一致),
+apply 时按布局拷到对应位置。
+
 ---
 
 ## 3. 相机标定工具链（本轮新增，重点）

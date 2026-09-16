@@ -99,6 +99,17 @@ else
   install_file "$OVERLAY_DIR/openpilot/system/camerad/webcam/cuda_jpeg_decoder.py" "$REPO_ROOT/tools/webcam/cuda_jpeg_decoder.py"
 fi
 if [ -f "$CAMERAD_PY" ]; then
+  # 水土不服根治: patch_camerad.py 只认官方结构的 import 锚点, 对胡萝卜系
+  # (openpilot. 前缀) fork 会静默跳过 → 旧 camerad.py 保留 → VIC/FrameSync
+  # 链路接不上。这里检测旧版(无 "V4L2 DMABUF" 字样)就直接用 overlay 完整
+  # 适配版覆盖(备份原文件), 保证任何 fork 拿到 sp 同款链路。
+  if grep -q "V4L2 DMABUF\|v4l2_dmabuf_camera" "$CAMERAD_PY" 2>/dev/null; then
+    echo "  - camerad.py 已是 V4L2/VIC 适配版, 不动"
+  else
+    cp -f "$CAMERAD_PY" "$CAMERAD_PY.orig_openpilot" 2>/dev/null || true
+    install_file "$OVERLAY_DIR/openpilot/system/camerad/webcam/camerad.py" "$CAMERAD_PY"
+    echo "  - camerad.py 已替换为 overlay V4L2/VIC 完整适配版 (原文件备份为 .orig_openpilot)"
+  fi
   python3 "$OVERLAY_DIR/patch_camerad.py" "$CAMERAD_PY" || \
     echo "[apply_cuda] WARN camerad patch skipped (camera import not found)"
 fi
