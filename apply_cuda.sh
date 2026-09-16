@@ -77,7 +77,11 @@ fi
 install_file "$OVERLAY_DIR/openpilot/selfdrive/modeld/transforms/cuda_transform.cu" "$TRANSFORMS_DIR/cuda_transform.cu"
 install_file "$OVERLAY_DIR/openpilot/selfdrive/modeld/transforms/cuda_transform.h" "$TRANSFORMS_DIR/cuda_transform.h"
 install_file "$OVERLAY_DIR/openpilot/selfdrive/modeld/runners/tensorrt_runner.py" "$RUNNERS_DIR/tensorrt_runner.py"
-install_file "$OVERLAY_DIR/openpilot/selfdrive/modeld/runners/trt_c_api.so" "$RUNNERS_DIR/trt_c_api.so"
+if [ -f "$OVERLAY_DIR/openpilot/selfdrive/modeld/runners/trt_c_api.so" ]; then
+  install_file "$OVERLAY_DIR/openpilot/selfdrive/modeld/runners/trt_c_api.so" "$RUNNERS_DIR/trt_c_api.so"
+else
+  echo "  - trt_c_api.so not bundled in overlay (device-side artifact); skip copy (ensure the target tree already provides it)"
+fi
 
 echo "Installing V4L2/VIC camera adapter..."
 if [ "$LAYOUT" = "new" ]; then
@@ -132,8 +136,12 @@ cp -rf "$OVERLAY_DIR/openpilot/tools/calib/." "$REPO_ROOT/tools/calib/"
 echo "  + tools/calib/ ($(ls -1 "$OVERLAY_DIR/openpilot/tools/calib" | wc -l) files)"
 
 # Patch calendar intrinsics plumbing (camera.py) + the Param keys it needs.
+# patch_calib.py returns 0=no-op, 1=error, 2=applied. Guard against set -e
+# so the success code (2) does not abort the whole script.
+set +e
 python3 "$OVERLAY_DIR/patch_calib.py" "$REPO_ROOT"
 CALIB_RC=$?
+set -e
 if [ "$CALIB_RC" = "1" ]; then
   echo "[apply_cuda] WARN calibration patch reported anchors that need manual merge (see above)"
 elif [ "$CALIB_RC" = "2" ]; then

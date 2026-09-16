@@ -91,20 +91,25 @@ def apply_file(fork: str, rel: str, subs, markers) -> tuple[str, str]:
     txt = open(path, errors="replace").read()
     if satisfied(txt, markers):
         return ("OK", f"{rel} 已是基准")
+    # Apply all substitutions in memory first. Only write the file when the
+    # result satisfies every marker — otherwise a partial write could leave
+    # version.h / health.h in a broken intermediate state (e.g. HEALTH_PACKET
+    # bumped but the old field layout not removed).
     hits, missed = 0, []
+    candidate = txt
     for old, new in subs:
-        if old and old in txt:
-            txt = txt.replace(old, new, 1)
+        if old and old in candidate:
+            candidate = candidate.replace(old, new, 1)
             hits += 1
         elif old:
             missed.append(old.strip().splitlines()[0][:60])
+    if not satisfied(candidate, markers):
+        bad = [m for m in markers if not ((m[1:] not in candidate) if m.startswith("!") else (m in candidate))]
+        return ("NEEDS_MANUAL", f"{rel} 锚点不匹配 {missed or ''} 仍缺 {bad} (未写入, 保持原样)")
     if hits:
-        open(path, "w").write(txt)
-        txt = open(path, errors="replace").read()
-    if not satisfied(txt, markers):
-        bad = [m for m in markers if not ((m[1:] not in txt) if m.startswith("!") else (m in txt))]
-        return ("NEEDS_MANUAL", f"{rel} 锚点不匹配 {missed or ''} 仍缺 {bad}")
-    return ("CHANGED" if hits else "OK", f"{rel} 已修 ({hits} 处)")
+        open(path, "w").write(candidate)
+        return ("CHANGED", f"{rel} 已修 ({hits} 处)")
+    return ("OK", f"{rel} 已是基准")
 
 
 def ensure_qt3(fork: str):

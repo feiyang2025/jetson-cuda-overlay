@@ -11,7 +11,7 @@ set -euo pipefail
 #   3. (optional) build TRT .plan from onnx via trtexec
 #   Prints a verification checklist.
 
-REPO_ROOT="$(cd "$(dirname "$0")/../../../../.." && pwd)"   # master-c3 (root)
+REPO_ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"   # 4 levels up from gpu_backend -> repo root
 OPENPILOT="$REPO_ROOT/openpilot"
 MODELD="$OPENPILOT/selfdrive/modeld"
 TRANSFORMS="$MODELD/transforms"

@@ -193,6 +193,8 @@ class V4L2Camera:
     self.cur_frame_id = 0
     self.cam_bytesperline = 0
     self.cam_sizeimage = 0
+    self.cam_pixelformat = V4L2_PIX_FMT_UYVY
+    self.cam_format_name = 'UYVY'
     self._vic = False
     self._external_dst_surfs = {}
     self._fd_cache_generation = 0
@@ -215,9 +217,11 @@ class V4L2Camera:
       fcntl.ioctl(self.fd, VIDIOC_G_FMT, fmt)
       self.cam_w = struct.unpack_from("I", fmt, 4)[0]
       self.cam_h = struct.unpack_from("I", fmt, 8)[0]
+      self.cam_pixelformat = struct.unpack_from("I", fmt, 12)[0]
       self.cam_bytesperline = struct.unpack_from("I", fmt, 20)[0]
       self.cam_sizeimage = struct.unpack_from("I", fmt, 24)[0]
-      print(f"[V4L2Camera] {self.device}: G_FMT {self.cam_w}x{self.cam_h} stride={self.cam_bytesperline}")
+      self.cam_format_name = 'UYVY' if self.cam_pixelformat == V4L2_PIX_FMT_UYVY else f'0x{self.cam_pixelformat:08x}'
+      print(f"[V4L2Camera] {self.device}: G_FMT {self.cam_w}x{self.cam_h} fmt={self.cam_format_name} stride={self.cam_bytesperline}")
     except OSError:
       self.cam_w = self.target_w
       self.cam_h = self.target_h
@@ -543,6 +547,7 @@ class V4L2Camera:
     finally:
       self._requeue_buffer(index)
 
+    self.cur_frame_id += 1
     return frame_id, timestamp_sof, timestamp_eof
 
   def read_frame(self):
@@ -562,19 +567,26 @@ class V4L2Camera:
       timestamp_eof = timestamp_sof
       break
 
-    if self._vic:
-      data = self._vic_convert(index)
-    else:
-      mm = self.mmap_ptrs[index]
-      raw_data = bytes(mm[:self.cam_sizeimage])
+    try:
+      if self._vic:
+        data = self._vic_convert(index)
+      else:
+        mm = self.mmap_ptrs[index]
+        raw_data = bytes(mm[:self.cam_sizeimage])
 
-    self._requeue_buffer(index)
+      if not self._vic:
+        data = self._numpy_downsample(raw_data)
 
-    if not self._vic:
-      data = self._numpy_downsample(raw_data)
-
-    dmabuf_fd = self._nvbuf_fds[index] if self._use_dmabuf else self.dmabuf_fds[index]
-    return dmabuf_fd, data, index, timestamp_sof, timestamp_eof
+      # MMAP path: the exported dmabuf matches the raw UYVY bytes we return.
+      # VIC path: only the UYVY *source* surface fd exists — labelling it as
+      # NV12 for GPU consumers would be wrong; the zero-copy NV12 path is
+      # read_frame_to_fd(). Report fd=-1 here so downstream maps the CPU copy.
+      dmabuf_fd = self.dmabuf_fds[index] if not self._vic else -1
+      return dmabuf_fd, data, index, timestamp_sof, timestamp_eof
+    finally:
+      # Always return the buffer to the driver queue, even on transform
+      # errors, so the camera cannot starve of buffers.
+      self._requeue_buffer(index)
 
   def _numpy_downsample(self, raw_data):
     if self.cam_w == self.target_w and self.cam_h == self.target_h:
@@ -593,7 +605,7 @@ class V4L2Camera:
     while self.streaming:
       try:
         dmabuf_fd, data, index, timestamp_sof, timestamp_eof = self.read_frame()
-        if dmabuf_fd is not None and dmabuf_fd >= 0:
+        if data is not None:
           is_nv12 = self._vic
           yield VisionBuf(
             dmabuf_fd=dmabuf_fd,

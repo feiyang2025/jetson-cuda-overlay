@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import ctypes
 import glob
 import os
 import re
@@ -94,7 +95,12 @@ line(True, f"tw_camera_cfg 正在跑: {'是' if run(['pgrep','-x','tw_camera_cfg
 # ---------------------------------------------------------------- 4. CUDA 后端
 head("4. CUDA 后端与模型")
 libcuda = run(["bash", "-lc", "ldconfig -p | grep -E 'libcuda\\.so' | head -3"])
-line("nvgpu" in libcuda, f"libcuda.so 解析: {libcuda.replace(chr(10),' | ') or '未解析(见技能 §6b: 需 nvgpu 那份)'}")
+libcuda_ok = False
+try:
+    libcuda_ok = ctypes.CDLL("libcuda.so.1") is not None
+except Exception:
+    libcuda_ok = False
+line(libcuda_ok, f"libcuda.so 解析: {libcuda.replace(chr(10),' | ') or '未解析(需要 nvgpu 驱动的 libcuda)'}")
 for f in forks:
     name = os.path.basename(f)
     so = glob.glob(os.path.join(f, "**", "libcuda_transform.so"), recursive=True)
@@ -128,7 +134,7 @@ for k in ("FcamIntrinsics", "EcamIntrinsics"):
 for f in forks:
     hh = os.path.join(f, "common", "params_keys.h")
     if os.path.isfile(hh):
-        n = len(re.findall(r'"(FcamIntrinsics|EcamIntrinsics|WideCalib\w*|FcamLiveActive|PendingCalibReset)"', open(hh, errors="replace").read()))
+        n = len(set(re.findall(r'"(FcamIntrinsics|EcamIntrinsics|FcamCalibResult|WideCalib\w*|FcamLiveActive|PendingCalibReset)"', open(hh, errors="replace").read())))
         line(n >= 8, f"{os.path.basename(f)}: 标定 params 键 {n}/10")
         line(os.path.isfile(os.path.join(f, "common", "params_pyx.so")), f"{os.path.basename(f)}: params_pyx.so 已编译")
 

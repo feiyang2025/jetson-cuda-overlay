@@ -23,6 +23,11 @@ class CudaTransform:
     self._library.cuda_transform_execute.restype = ctypes.c_void_p
     self._library.cuda_transform_destroy.argtypes = [ctypes.c_void_p]
     self._library.cuda_transform_destroy.restype = None
+    self._cuda.cuMemHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+    self._cuda.cuMemHostRegister.restype = ctypes.c_int
+    self._cuda.cuMemHostUnregister.argtypes = [ctypes.c_void_p]
+    self._cuda.cuMemHostUnregister.restype = ctypes.c_int
+    self._registered: set[tuple[str, int]] = set()
     self._states: dict[str, ctypes.Array] = {}
     self._model_w = model_w
     self._model_h = model_h
@@ -61,10 +66,17 @@ class CudaTransform:
   def __call__(self, camera: str, frame, projection: np.ndarray, shape: tuple[int, ...]) -> Tensor:
     self._restore_ctx()
     data = np.frombuffer(frame.data, dtype=np.uint8)
-    # AGX Orin has a unified memory model: the transform kernel reads the NV12
-    # frame buffer directly at its host address, no pinning required.
+    ptr = int(data.ctypes.data)
+    # Pin the NV12 frame buffer (CUDA_MEMHOSTREGISTER_DEVICEMAP=0x02) so the
+    # transform kernel can safely read it on AGX Orin's unified memory.
+    key = (camera, ptr)
+    if key not in self._registered:
+      ret = self._cuda.cuMemHostRegister(ctypes.c_void_p(ptr), data.nbytes, 0x02)
+      if ret != 0:
+        raise RuntimeError(f"cuMemHostRegister failed: {ret}")
+      self._registered.add(key)
     output = self._library.cuda_transform_execute(
-      ctypes.byref(self._state(camera)), data.ctypes.data_as(ctypes.c_void_p),
+      ctypes.byref(self._state(camera)), ctypes.c_void_p(ptr),
       frame.width, frame.height, frame.stride, frame.uv_offset,
       projection.astype(np.float32, copy=False).ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
     )
@@ -74,6 +86,17 @@ class CudaTransform:
     return Tensor.from_blob(output, shape, dtype=dtypes.uint8, device="CUDA")
 
   def close(self) -> None:
+    # Release pinned-memory registrations before tearing down the transform
+    # states (CUDA_MEMHOSTREGISTER_DEVICEMAP pins the pages until unregistered).
+    for _, ptr in list(self._registered):
+      self._cuda.cuMemHostUnregister(ctypes.c_void_p(ptr))
+    self._registered.clear()
     for state in self._states.values():
       self._library.cuda_transform_destroy(ctypes.byref(state))
     self._states.clear()
+
+  def __del__(self):
+    try:
+      self.close()
+    except Exception:
+      pass

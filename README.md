@@ -81,15 +81,24 @@ The overlay registers `sensord_ch347` as an optional daemon. It:
   Orin / PCs that have no on-board IMU;
 - publishes `accelerometer` / `gyroscope` / `temperatureSensor` cereal messages,
   so the project's own `imu_calibrationd` / `calibrationd` can consume them;
+- loads the full calibration from `imu_calibration.json` (or `IMU_CALIB_JSON`)
+  and applies it on every sample:
+  `gyro_rad = raw_rad - imuBiasGyro * pi/180` and
+  `accel_ms2 = imuCalibMatrix @ (raw_mps2 - 9.81 * imuBiasAccel)`
+  (schema: `imuBiasGyro` in deg/s, `imuBiasAccel` in g, `imuCalibMatrix`
+  row-major 3x3 — compatible with the sunnypilot-cuda `tools/imu_calib`
+  multi-pose ellipsoid calibrator);
 - runs a **boot-time auto zero-rate bias calibration**: skips the first second,
   collects ~5 s, and if the gyro magnitude 1-sigma is < 0.015 rad/s (stationary)
-  it writes the bias to `imu_calibration.json` (or `IMU_CALIB_JSON`);
+  it updates `imuBiasGyro` only — a pre-existing `imuBiasAccel` / `imuCalibMatrix`
+  from a multi-pose calibration is preserved, never overwritten;
 - if no CH347 device (`/dev/ch34x_pis*` / `/dev/ttyACM*`) is present it exits
   cleanly and does not affect the system.
 
 `run_ch347t.sh` builds `ch347t` on first run (needs `g++` + `libzmq` + `capnp`
 dev packages), then execs it. On-board sensors (comma-style I2C LSM6DS3) keep
-working via the project's stock `sensord`.
+working via the project's stock `sensord`. The Python fallback `ch347t.py`
+mirrors the same calibration load/apply path.
 
 ## usage (any project)
 

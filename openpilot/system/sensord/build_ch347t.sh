@@ -38,17 +38,21 @@ fi
 
 # Link against pre-built libraries instead of compiling from source.
 # This avoids complex dependency chains (json11, msgq internal deps).
-MSGQ_LIB="$REPO_ROOT/msgq_repo/libmsgq.a"
-COMMON_LIB="$REPO_ROOT/common/libcommon.a"
-JSON11_O="$REPO_ROOT/third_party/json11/json11.o"
-
-# Verify required libs exist
-for lib in "$MSGQ_LIB" "$COMMON_LIB" "$JSON11_O"; do
-  if [ ! -f "$lib" ]; then
-    echo "ERROR: required library not found: $lib" >&2
-    exit 1
+# In the new layout these live under $CEREAL_ROOT (= <root>/openpilot),
+# in the old layout directly under $REPO_ROOT — resolve both.
+find_lib() { # relpath
+  if [ -f "$REPO_ROOT/$1" ]; then
+    echo "$REPO_ROOT/$1"
+  elif [ -f "$CEREAL_ROOT/$1" ]; then
+    echo "$CEREAL_ROOT/$1"
+  else
+    return 1
   fi
-done
+}
+
+MSGQ_LIB="$(find_lib msgq_repo/libmsgq.a)" || { echo "ERROR: required library not found: msgq_repo/libmsgq.a (also tried \$CEREAL_ROOT)" >&2; exit 1; }
+COMMON_LIB="$(find_lib common/libcommon.a)" || { echo "ERROR: required library not found: common/libcommon.a (also tried \$CEREAL_ROOT)" >&2; exit 1; }
+JSON11_O="$(find_lib third_party/json11/json11.o)" || { echo "ERROR: required library not found: third_party/json11/json11.o (also tried \$CEREAL_ROOT)" >&2; exit 1; }
 
 g++ -O2 -std=c++17 -o "$OUT" "$SRC" \
   "$CEREAL_ROOT/cereal/messaging/socketmaster.cc" \

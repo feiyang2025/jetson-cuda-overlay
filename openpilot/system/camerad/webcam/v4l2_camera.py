@@ -16,6 +16,10 @@ class Camera:
       camera_id = int(camera_id)
     except ValueError:
       pass
+    # openpilot passes a numeric camera index in some forks; turn it into a
+    # device node so V4L2Camera's os.open() gets a path (int would crash).
+    if isinstance(camera_id, int):
+      camera_id = f"/dev/video{camera_id}"
     self.cam_type_state = cam_type_state
     self.stream_type = stream_type
     self.cur_frame_id = 0

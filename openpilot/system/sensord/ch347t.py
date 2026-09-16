@@ -42,6 +42,91 @@ CH347_WHO_AM_I_REG = 0x0F
 CH347_LSM6_ADDRS = (0x6B, 0x6A)
 CH347_WHO_AM_I_IDS = (0x69, 0x6A)
 
+# Calibration schema matches sunnypilot-cuda tools/imu_calib (imu_calibration.json):
+#   "imuBiasGyro"    : [gx, gy, gz]  (deg/s, dps)
+#   "imuBiasAccel"   : [ax, ay, az]  (g)
+#   "imuCalibMatrix" : [m0..m8]      (row-major 3x3: axis coupling + scale)
+# Apply: gyro_rad = raw_rad - imuBiasGyro * pi/180
+#        accel_ms2 = imuCalibMatrix @ (raw_mps2 - 9.81 * imuBiasAccel)
+DEG_TO_RAD = math.pi / 180.0
+RAD_TO_DEG = 180.0 / math.pi
+
+
+def calib_json_path():
+    env = os.getenv("IMU_CALIB_JSON")
+    if env:
+        return env
+    return os.path.join(os.getcwd(), "imu_calibration.json")
+
+
+def _find_json_key(json: str, key: str) -> int:
+    i = 0
+    pat = f'"{key}"'
+    while True:
+        i = json.find(pat, i)
+        if i < 0:
+            return -1
+        j = i + len(pat)
+        while j < len(json) and json[j] in " \t\r\n":
+            j += 1
+        if j < len(json) and json[j] == ":":
+            return j + 1
+        i += len(pat)
+
+
+def _parse_json_array(json: str, start: int, max_count: int) -> list[float]:
+    i = start
+    while i < len(json) and json[i] in " \t\r\n":
+        i += 1
+    if i >= len(json) or json[i] != "[":
+        return []
+    i += 1
+    out = []
+    while len(out) < max_count and i < len(json):
+        while i < len(json) and json[i] in " \t\r\n,":
+            i += 1
+        if i >= len(json) or json[i] == "]":
+            break
+        j = i
+        while j < len(json) and json[j] not in ",]\r\n":
+            j += 1
+        try:
+            out.append(float(json[i:j]))
+        except ValueError:
+            out.append(0.0)
+        i = j
+    return out
+
+
+def load_calibration() -> dict:
+    calib = {
+        "gyro_bias_dps": [0.0, 0.0, 0.0],
+        "accel_bias_g": [0.0, 0.0, 0.0],
+        "matrix": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    }
+    path = calib_json_path()
+    if not os.path.exists(path):
+        return calib
+    try:
+        with open(path, encoding="utf-8") as f:
+            json = f.read()
+    except OSError as e:
+        cloudlog.warning(f"IMU: could not read {path}: {e}")
+        return calib
+    pos = _find_json_key(json, "imuBiasGyro")
+    if pos >= 0:
+        for k, v in enumerate(_parse_json_array(json, pos, 3)):
+            calib["gyro_bias_dps"][k] = v
+    pos = _find_json_key(json, "imuBiasAccel")
+    if pos >= 0:
+        for k, v in enumerate(_parse_json_array(json, pos, 3)):
+            calib["accel_bias_g"][k] = v
+    pos = _find_json_key(json, "imuCalibMatrix")
+    if pos >= 0:
+        for k, v in enumerate(_parse_json_array(json, pos, 9)):
+            calib["matrix"][k] = v
+    return calib
+
 
 class CH347LSM6:
     def __init__(self, dev_path: str, lib_path: str) -> None:
@@ -165,6 +250,11 @@ def ch347_loop(dev_path: str, lib_path: str, event: threading.Event) -> None:
         sensor.init_sensor()
         cloudlog.info(f"Using CH347 backend: dev={dev_path}")
 
+        calib = load_calibration()
+        gyro_bias_rad = [v * DEG_TO_RAD for v in calib["gyro_bias_dps"]]
+        cloudlog.info(f"IMU: calibration loaded gyro_bias_dps={calib['gyro_bias_dps']} "
+                      f"accel_bias_g={calib['accel_bias_g']}")
+
         while not event.is_set():
             status = sensor.read_u8(0x1E)
 
@@ -175,6 +265,10 @@ def ch347_loop(dev_path: str, lib_path: str, event: threading.Event) -> None:
                 z = Sensor.parse_16bit(b[4], b[5])
                 scale = 9.81 * 2.0 / (1 << 15)
 
+                raw = [y * scale, -x * scale, z * scale]
+                centered = [raw[k] - 9.81 * calib["accel_bias_g"][k] for k in range(3)]
+                m = calib["matrix"]
+
                 msg = messaging.new_message("accelerometer", valid=True)
                 msg.accelerometer.version = 1
                 msg.accelerometer.sensor = 1
@@ -182,7 +276,11 @@ def ch347_loop(dev_path: str, lib_path: str, event: threading.Event) -> None:
                 msg.accelerometer.source = sensor.source
                 msg.accelerometer.timestamp = msg.logMonoTime
                 acc = msg.accelerometer.init("acceleration")
-                acc.v = [y * scale, -x * scale, z * scale]
+                acc.v = [
+                    m[0] * centered[0] + m[1] * centered[1] + m[2] * centered[2],
+                    m[3] * centered[0] + m[4] * centered[1] + m[5] * centered[2],
+                    m[6] * centered[0] + m[7] * centered[1] + m[8] * centered[2],
+                ]
                 acc.status = 1
                 pm.send("accelerometer", msg)
 
@@ -200,7 +298,7 @@ def ch347_loop(dev_path: str, lib_path: str, event: threading.Event) -> None:
                 msg.gyroscope.source = sensor.source
                 msg.gyroscope.timestamp = msg.logMonoTime
                 gyro = msg.gyroscope.init("gyroUncalibrated")
-                gyro.v = [y * scale, -x * scale, z * scale]
+                gyro.v = [y * scale - gyro_bias_rad[0], -x * scale - gyro_bias_rad[1], z * scale - gyro_bias_rad[2]]
                 gyro.status = 1
                 pm.send("gyroscope", msg)
 
