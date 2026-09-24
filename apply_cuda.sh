@@ -89,9 +89,9 @@ MODELD_KIT_DST="$REPO_ROOT/selfdrive/modeld"
 mkdir -p "$MODELD_KIT_DST/runners" "$MODELD_KIT_DST/transforms"
 for f in modeld.py modeld_bigcombo.py; do
   if [ -f "$MODELD_KIT_DST/$f" ] && ! grep -q "TRT_LOAD_ATTEMPTS\|BigComboTrtUnavailable" "$MODELD_KIT_DST/$f" 2>/dev/null; then
-    cp -f "$MODELD_KIT_DST/$f" "$MODELD_KIT_DST/$f.orig_openpilot" 2>/dev/null || true
+    cp -f "$MODELD_KIT_DST/$f" "$MODELD_KIT_DST/$f.orig_local" 2>/dev/null || true
     install_file "$MODELD_KIT/$f" "$MODELD_KIT_DST/$f"
-    echo "  - $f 已替换为 TRT 兜底闭环版 (原文件备份 .orig_openpilot)"
+    echo "  - $f 已替换为 TRT 兜底闭环版 (原文件备份 .orig_local)"
   else
     echo "  - $f 已是兜底闭环版, 不动"
   fi
@@ -116,7 +116,16 @@ fi
 mkdir -p "$CAM_DST_DIR"
 for f in camerad.py v4l2_dmabuf_camera.py v4l2_camera.py camera_cuda.py packed_to_nv12.cu nvbuf_import.cu; do
   if [ -f "$CAM_DST_DIR/$f" ] && [ "$f" = "camerad.py" ]; then
-    cp -f "$CAM_DST_DIR/$f" "$CAM_DST_DIR/$f.orig_openpilot" 2>/dev/null || true
+    # 替换前提示本地未提交改动(供用户决定是否先 commit/stash)
+    if git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+      LOCAL_DIFF=$(git -C "$REPO_ROOT" diff --stat -- "$CAM_DST_DIR/camerad.py" 2>/dev/null)
+      if [ -n "$LOCAL_DIFF" ]; then
+        echo "  [注意] $CAM_DST_DIR/camerad.py 有本地未提交改动, 将被 kit 版替换:"
+        echo "$LOCAL_DIFF" | sed 's/^/         /'
+      fi
+    fi
+    cp -f "$CAM_DST_DIR/$f" "$CAM_DST_DIR/$f.orig_local" 2>/dev/null || true
+    echo "  - 原版备份: $CAM_DST_DIR/$f.orig_local"
   fi
   install_file "$CAMERA_KIT/$f" "$CAM_DST_DIR/$f"
 done

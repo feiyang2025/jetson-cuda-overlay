@@ -110,7 +110,7 @@ FrameSync 链路接不上, 表现为相机黑屏或 16Hz 拍频, 且无任何报
 apply_cuda.sh 现在做两层防护:
 1. 检测 fork 的 camerad.py 无 "V4L2 DMABUF"/"v4l2_dmabuf_camera" 字样
    → 判定旧版, 用 overlay 完整适配版 (sp 同款: twgmsl 色度 + 20 buffer + 零拷贝)
-   覆盖, 原文件备份为 `.orig_openpilot`
+   覆盖, 原文件备份为 `.orig_local`
 2. 对新版再跑 patch_camerad.py 确认 import 锚点
 
 安装到旧布局: `tools/webcam/camerad.py`; 新布局:
