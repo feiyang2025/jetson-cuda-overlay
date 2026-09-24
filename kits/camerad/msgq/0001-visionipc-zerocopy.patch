@@ -1,0 +1,205 @@
+From 09c14e4178f563b60631bb9592a85e984a8af6c6 Mon Sep 17 00:00:00 2001
+From: nvidia <nvidia@localhost>
+Date: Thu, 24 Sep 2026 16:30:33 +0800
+Subject: [PATCH] =?UTF-8?q?feat(visionipc):=20=E9=9B=B6=E6=8B=B7=E8=B4=9D?=
+ =?UTF-8?q?=E9=80=9A=E9=81=93=20write=5Fand=5Fsend=20+=20=E5=85=B1?=
+ =?UTF-8?q?=E4=BA=AB=20refcount(acquire/release)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- visionipc_pyx: 新增 write_and_send: get_buffer 一次, 写完发送同一 buffer(分开 get/send 会拿两个不同 buffer)
+- visionbuf_jetson.cc: CUDA 映射完善(__JETSON__ 路径), cudaHostRegister 映射内存 kernel 可读写
+- visionipc_server/client: refcount 同步, 客户端 recv acquire / 用完 release
+- 供 sunnypilot-cuda AGXOrin 分支相机链路使用
+---
+ msgq/visionipc/visionbuf.h         | 10 +++++++++
+ msgq/visionipc/visionbuf_jetson.cc |  6 +++++-
+ msgq/visionipc/visionipc.pxd       |  4 ++++
+ msgq/visionipc/visionipc_client.cc |  3 +++
+ msgq/visionipc/visionipc_pyx.pyx   | 34 ++++++++++++++++++++++++++++--
+ msgq/visionipc/visionipc_server.cc | 17 ++++++++++++++-
+ 6 files changed, 70 insertions(+), 4 deletions(-)
+
+diff --git a/msgq/visionipc/visionbuf.h b/msgq/visionipc/visionbuf.h
+index ca167df..c6272ed 100644
+--- a/msgq/visionipc/visionbuf.h
++++ b/msgq/visionipc/visionbuf.h
+@@ -2,6 +2,8 @@
+ 
+ #include "msgq/visionipc/visionipc.h"
+ 
++#include <atomic>
++
+ #define CL_USE_DEPRECATED_OPENCL_1_2_APIS
+ #ifdef __APPLE__
+ #include <OpenCL/cl.h>
+@@ -43,6 +45,14 @@ class VisionBuf {
+   size_t idx = 0;
+   VisionStreamType type;
+ 
++  // Shared refcount: 客户端 recv 时 +1 (acquire), 用完 -1 (release);
++  // server 端写入前等待 ref_count==0, 防止读写竞争导致画面撕裂。
++  std::atomic<uint64_t> *ref_count = nullptr;
++
++  void acquire() { if (ref_count) (*ref_count)++; }
++  void release() { if (ref_count) (*ref_count)--; }
++  uint64_t get_ref_count() { return ref_count ? ref_count->load() : 0; }
++
+   // OpenCL
+   cl_mem buf_cl = nullptr;
+   cl_command_queue copy_q = nullptr;
+diff --git a/msgq/visionipc/visionbuf_jetson.cc b/msgq/visionipc/visionbuf_jetson.cc
+index d999ec1..eb97bcb 100644
+--- a/msgq/visionipc/visionbuf_jetson.cc
++++ b/msgq/visionipc/visionbuf_jetson.cc
+@@ -40,9 +40,12 @@ static void *malloc_with_fd(size_t len, int *fd) {
+ 
+ void VisionBuf::allocate(size_t length) {
+   this->len = length;
+-  this->mmap_len = this->len + sizeof(uint64_t);
++  // 元数据区: [frame_id (8B)] [ref_count (8B)]
++  this->mmap_len = this->len + 2 * sizeof(uint64_t);
+   this->addr = malloc_with_fd(this->mmap_len, &this->fd);
+   this->frame_id = (uint64_t*)((uint8_t*)this->addr + this->len);
++  this->ref_count = (std::atomic<uint64_t>*)((uint8_t*)this->addr + this->len + sizeof(uint64_t));
++  *this->ref_count = 0;
+ 
+ #ifdef __JETSON__
+   cudaError_t err = cudaHostRegister(this->addr, this->mmap_len,
+@@ -65,6 +68,7 @@ void VisionBuf::import() {
+   this->addr = mmap(NULL, this->mmap_len, PROT_READ | PROT_WRITE, MAP_SHARED, this->fd, 0);
+   assert(this->addr != MAP_FAILED);
+   this->frame_id = (uint64_t*)((uint8_t*)this->addr + this->len);
++  this->ref_count = (std::atomic<uint64_t>*)((uint8_t*)this->addr + this->len + sizeof(uint64_t));
+ 
+ #ifdef __JETSON__
+   cudaError_t err = cudaHostRegister(this->addr, this->mmap_len, cudaHostRegisterMapped);
+diff --git a/msgq/visionipc/visionipc.pxd b/msgq/visionipc/visionipc.pxd
+index 046430f..827fbca 100644
+--- a/msgq/visionipc/visionipc.pxd
++++ b/msgq/visionipc/visionipc.pxd
+@@ -1,4 +1,5 @@
+ # distutils: language = c++
++# distutils: language=c++
+ #cython: language_level=3
+ 
+ from libcpp.string cimport string
+@@ -28,6 +29,9 @@ cdef extern from "msgq/visionipc/visionbuf.h":
+     size_t uv_offset
+     cl_mem buf_cl
+     void set_frame_id(uint64_t id)
++    void acquire()
++    void release()
++    uint64_t get_ref_count()
+ 
+ cdef extern from "msgq/visionipc/visionipc.h":
+   struct VisionIpcBufExtra:
+diff --git a/msgq/visionipc/visionipc_client.cc b/msgq/visionipc/visionipc_client.cc
+index 19f130e..77bf030 100644
+--- a/msgq/visionipc/visionipc_client.cc
++++ b/msgq/visionipc/visionipc_client.cc
+@@ -111,6 +111,9 @@ VisionBuf * VisionIpcClient::recv(VisionIpcBufExtra * extra, const int timeout_m
+     LOGE("Failed to sync buffer");
+   }
+ 
++  // 标记客户端正在使用该 buffer (server 端写入前等待 ref_count==0)
++  buf->acquire();
++
+   delete r;
+   return buf;
+ }
+diff --git a/msgq/visionipc/visionipc_pyx.pyx b/msgq/visionipc/visionipc_pyx.pyx
+index 6b1178e..a3a564c 100644
+--- a/msgq/visionipc/visionipc_pyx.pyx
++++ b/msgq/visionipc/visionipc_pyx.pyx
+@@ -1,5 +1,4 @@
+-# distutils: language = c++
+-# cython: c_string_encoding=ascii, language_level=3
++# cython: language=c++, c_string_encoding=ascii, language_level=3
+ 
+ import sys
+ import numpy as np
+@@ -35,6 +34,18 @@ cdef class VisionBuf:
+     buf.buf = cbuf
+     return buf
+ 
++  def acquire(self):
++    """标记本客户端正在使用该 buffer (ref_count++)"""
++    self.buf.acquire()
++
++  def release(self):
++    """使用完毕释放 (ref_count--), server 端才能复用该 buffer"""
++    self.buf.release()
++
++  @property
++  def ref_count(self):
++    return self.buf.get_ref_count()
++
+   @property
+   def data(self):
+     return np.asarray(<cnp.uint8_t[:self.buf.len]> self.buf.addr)
+@@ -86,6 +97,25 @@ cdef class VisionIpcServer:
+   def set_buffer_fd(self, VisionStreamType tp, size_t idx, int new_fd):
+     self.server.set_buffer_fd(tp, idx, new_fd)
+ 
++  def get_writable_buffer(self, VisionStreamType tp):
++    """返回当前可写 buffer 的 numpy 视图, 指向 VisionIPC 共享内存本身。
++    写入后用 send_raw 发送, 不再 memcpy。零拷贝路径用。"""
++    cdef cppVisionBuf * buf = self.server.get_buffer(tp)
++    return np.asarray(<cnp.uint8_t[:buf.len]> buf.addr)
++
++  def write_and_send(self, VisionStreamType tp, fill, uint32_t frame_id, uint64_t timestamp_sof, uint64_t timestamp_eof):
++    """get_buffer 一次: 把 buffer 交给 fill(host_ptr_array) 写, 然后发送同一个 buffer。
++    避免 get 和 send 各轮转一次拿到不同 buffer。"""
++    cdef cppVisionBuf * buf = self.server.get_buffer(tp)
++    arr = np.asarray(<cnp.uint8_t[:buf.len]> buf.addr)
++    fill(arr)
++    buf.set_frame_id(frame_id)
++    cdef VisionIpcBufExtra extra
++    extra.frame_id = frame_id
++    extra.timestamp_sof = timestamp_sof
++    extra.timestamp_eof = timestamp_eof
++    self.server.send(buf, &extra, False)
++
+   def send_raw(self, VisionStreamType tp, uint32_t frame_id, uint64_t timestamp_sof, uint64_t timestamp_eof):
+     """Send without memcpy - buffer data already written by VIC."""
+     cdef cppVisionBuf * buf = self.server.get_buffer(tp)
+diff --git a/msgq/visionipc/visionipc_server.cc b/msgq/visionipc/visionipc_server.cc
+index 2e7b36d..f36dad9 100644
+--- a/msgq/visionipc/visionipc_server.cc
++++ b/msgq/visionipc/visionipc_server.cc
+@@ -12,6 +12,7 @@
+ #include "msgq/visionipc/visionipc.h"
+ #include "msgq/visionipc/visionipc_server.h"
+ #include "msgq/logger/logger.h"
++#include "common/timing.h"
+ 
+ std::string get_endpoint_name(std::string name, VisionStreamType type){
+   if (messaging_use_zmq()){
+@@ -170,7 +171,21 @@ VisionBuf * VisionIpcServer::get_buffer(VisionStreamType type, int idx){
+     assert(idx < b.size() && idx >= 0);
+     cur_idx[type] = idx;
+   }
+-  return b[idx];
++
++  VisionBuf* buf = b[idx];
++  // 等待客户端读完该 buffer (ref_count==0) 再写入, 防止读写竞争导致画面撕裂。
++  // 超时 200ms 跳过并告警, 防止客户端崩溃/忘记 release 时死锁。
++  if (buf->get_ref_count() > 0) {
++    uint64_t start = nanos_since_boot();
++    while (buf->get_ref_count() > 0) {
++      if (nanos_since_boot() - start > 200ULL * 1000000ULL) {
++        LOGE("get_buffer: buffer idx=%zu type=%d busy for >200ms (ref=%llu), skipping", buf->idx, (int)type, (unsigned long long)buf->get_ref_count());
++        break;
++      }
++      usleep(500);
++    }
++  }
++  return buf;
+ }
+ 
+ void VisionIpcServer::send(VisionBuf * buf, VisionIpcBufExtra * extra, bool sync){
+-- 
+2.43.0
+

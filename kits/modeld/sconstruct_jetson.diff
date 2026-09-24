@@ -1,0 +1,30 @@
+commit 5fe2abe2eceb42396c54f1503eb6088e85912b01
+Author: nvidia <nvidia@localhost>
+Date:   Thu Sep 24 16:35:56 2026 +0800
+
+    feat(camera): twgmsl 色度修正 + VIC 门控 + CUDA packed kernel + VisionIPC 零拷贝
+    
+    - camerad.py: GMSL_CHROMA_LAYOUT=twgmsl 专用色度归一化(Y 偶数字节, U/V lane 互换), 优先加载 libpacked_to_nv12.so CUDA kernel, 失败退 CPU
+    - 零拷贝: SP_ZEROCOPY=1 时 cudaHostGetDevicePointer 直接写 VisionIPC buffer 设备指针(write_and_send), 省掉 D2H/H2D
+    - 20 个共享 buffer + refcount(客户端 recv acquire/用完 release), 消除读写竞争撕裂
+    - v4l2_dmabuf_camera.py: twgmsl 特殊布局默认禁 VIC(SP_ENABLE_VIC_GMSL=1 才开), 下游 NV12 锁死 1920x1080
+    - modeld.py: 零拷贝消费(input_is_device=1), 推理后 release buffer
+    - UI cameraview.cc: QCOM2/EGLImage 路径 release + draw 后 glFinish
+    - SConstruct/cython.py: aarch64 分支 -D__JETSON__ + CUDA include; cython --cplus 修复
+    - msgq_repo: write_and_send + refcount 同步(09c14e4)
+
+diff --git a/SConstruct b/SConstruct
+--- a/SConstruct
++++ b/SConstruct
+@@ -139,6 +139,11 @@ elif arch == "x86_64":
+     Dir(f"#third_party/snpe/{arch}").abspath,
+   ]
+ elif arch == "aarch64":
++  # Jetson (Orin): 打开 visionbuf_jetson.cc 里的 CUDA 零拷贝映射
++  # (cudaHostRegister + cudaHostGetDevicePointer)。实测 driver 595 上可用。
++  cflags += ["-D__JETSON__"]
++  cxxflags += ["-D__JETSON__"]
++  cpppath += ["/usr/local/cuda/include"]
+   libpath = [
+     f"#third_party/acados/{arch}/lib",
+     f"#third_party/libyuv/{arch}/lib",

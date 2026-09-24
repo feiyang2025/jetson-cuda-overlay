@@ -83,33 +83,85 @@ else
   echo "  - trt_c_api.so not bundled in overlay (device-side artifact); skip copy (ensure the target tree already provides it)"
 fi
 
-echo "Installing V4L2/VIC camera adapter..."
-if [ "$LAYOUT" = "new" ]; then
-  install "openpilot/system/camerad/webcam/v4l2_dmabuf_camera.py"
-  install "openpilot/system/camerad/webcam/v4l2_camera.py"
-  install "openpilot/system/camerad/webcam/camera_cuda.py"
-  install "openpilot/system/camerad/webcam/packed_to_nv12.cu"
-else
-  # Old layout: tools/webcam/
-  install_file "$OVERLAY_DIR/openpilot/system/camerad/webcam/v4l2_dmabuf_camera.py" "$REPO_ROOT/tools/webcam/v4l2_dmabuf_camera.py"
-  install_file "$OVERLAY_DIR/openpilot/system/camerad/webcam/v4l2_camera.py" "$REPO_ROOT/tools/webcam/v4l2_camera.py"
-  install_file "$OVERLAY_DIR/openpilot/system/camerad/webcam/camera_cuda.py" "$REPO_ROOT/tools/webcam/camera_cuda.py"
-  install_file "$OVERLAY_DIR/openpilot/system/camerad/webcam/packed_to_nv12.cu" "$REPO_ROOT/tools/webcam/packed_to_nv12.cu"
-fi
-if [ -f "$CAMERAD_PY" ]; then
-  # 水土不服根治: patch_camerad.py 只认官方结构的 import 锚点, 对胡萝卜系
-  # (openpilot. 前缀) fork 会静默跳过 → 旧 camerad.py 保留 → VIC/FrameSync
-  # 链路接不上。这里检测旧版(无 "V4L2 DMABUF" 字样)就直接用 overlay 完整
-  # 适配版覆盖(备份原文件), 保证任何 fork 拿到 sp 同款链路。
-  if grep -q "V4L2 DMABUF\|v4l2_dmabuf_camera" "$CAMERAD_PY" 2>/dev/null; then
-    echo "  - camerad.py 已是 V4L2/VIC 适配版, 不动"
+echo "Installing modeld kit (kits/modeld, TRT 兜底闭环)..."
+MODELD_KIT="$OVERLAY_DIR/kits/modeld"
+MODELD_KIT_DST="$REPO_ROOT/selfdrive/modeld"
+mkdir -p "$MODELD_KIT_DST/runners" "$MODELD_KIT_DST/transforms"
+for f in modeld.py modeld_bigcombo.py; do
+  if [ -f "$MODELD_KIT_DST/$f" ] && ! grep -q "TRT_LOAD_ATTEMPTS\|BigComboTrtUnavailable" "$MODELD_KIT_DST/$f" 2>/dev/null; then
+    cp -f "$MODELD_KIT_DST/$f" "$MODELD_KIT_DST/$f.orig_openpilot" 2>/dev/null || true
+    install_file "$MODELD_KIT/$f" "$MODELD_KIT_DST/$f"
+    echo "  - $f 已替换为 TRT 兜底闭环版 (原文件备份 .orig_openpilot)"
   else
-    cp -f "$CAMERAD_PY" "$CAMERAD_PY.orig_openpilot" 2>/dev/null || true
-    install_file "$OVERLAY_DIR/openpilot/system/camerad/webcam/camerad.py" "$CAMERAD_PY"
-    echo "  - camerad.py 已替换为 overlay V4L2/VIC 完整适配版 (原文件备份为 .orig_openpilot)"
+    echo "  - $f 已是兜底闭环版, 不动"
   fi
-  python3 "$OVERLAY_DIR/patch_camerad.py" "$CAMERAD_PY" || \
-    echo "[apply_cuda] WARN camerad patch skipped (camera import not found)"
+done
+install_file "$MODELD_KIT/tensorrt_runner.py" "$MODELD_KIT_DST/runners/tensorrt_runner.py"
+install_file "$MODELD_KIT/cuda_transform.cu" "$MODELD_KIT_DST/transforms/cuda_transform.cu"
+install_file "$MODELD_KIT/cuda_transform.h" "$MODELD_KIT_DST/transforms/cuda_transform.h"
+
+echo "Installing V4L2/VIC camera adapter..."
+CAMERA_KIT="$OVERLAY_DIR/kits/camerad"
+# 布局检测以目标 fork 实际目录为准 (不猜 new/old):
+# sp 系 = tools/webcam; 官方新系 = system/camerad/webcam (或 openpilot/ 前缀)
+if [ -d "$REPO_ROOT/openpilot/system/camerad/webcam" ]; then
+  CAM_DST_DIR="$REPO_ROOT/openpilot/system/camerad/webcam"
+elif [ -d "$REPO_ROOT/system/camerad/webcam" ]; then
+  CAM_DST_DIR="$REPO_ROOT/system/camerad/webcam"
+elif [ -d "$REPO_ROOT/tools/webcam" ]; then
+  CAM_DST_DIR="$REPO_ROOT/tools/webcam"
+else
+  CAM_DST_DIR="$REPO_ROOT/tools/webcam"
+fi
+mkdir -p "$CAM_DST_DIR"
+for f in camerad.py v4l2_dmabuf_camera.py v4l2_camera.py camera_cuda.py packed_to_nv12.cu; do
+  if [ -f "$CAM_DST_DIR/$f" ] && [ "$f" = "camerad.py" ]; then
+    cp -f "$CAM_DST_DIR/$f" "$CAM_DST_DIR/$f.orig_openpilot" 2>/dev/null || true
+  fi
+  install_file "$CAMERA_KIT/$f" "$CAM_DST_DIR/$f"
+done
+echo "  -> camerad kit 已安装到 $CAM_DST_DIR"
+# 水土不服防护: kit 版自带自适应 import, 这里只验证不修复
+if grep -q "V4L2 DMABUF\|v4l2_dmabuf_camera" "$CAM_DST_DIR/camerad.py" 2>/dev/null; then
+  echo "  - camerad.py kit 版确认 (自适配入口)"
+else
+  echo "  [WARN] camerad.py 非 kit 版, 检查 $CAM_DST_DIR/camerad.py"
+fi
+
+echo "Applying msgq zerocopy patch (write_and_send + refcount)..."
+MSGQ_PATCH="$OVERLAY_DIR/kits/camerad/msgq/0001-visionipc-zerocopy.patch"
+for MSGQ_DIR in "$REPO_ROOT/msgq" "$REPO_ROOT/msgq_repo" "$REPO_ROOT/openpilot/msgq"; do
+  if [ -d "$MSGQ_DIR" ]; then
+    if grep -rq "write_and_send" "$MSGQ_DIR/visionipc" 2>/dev/null; then
+      echo "  - $MSGQ_DIR 已有 write_and_send, 跳过"
+    elif git -C "$MSGQ_DIR" apply --check "$MSGQ_PATCH" 2>/dev/null; then
+      git -C "$MSGQ_DIR" apply "$MSGQ_PATCH" && echo "  + $MSGQ_DIR zerocopy patch 已应用"
+    else
+      echo "  [WARN] $MSGQ_DIR patch 应用失败(子模块版本不同?), 手工:"
+      echo "         git -C $MSGQ_DIR apply $MSGQ_PATCH"
+    fi
+    break
+  fi
+done
+
+echo "Patching SConstruct (aarch64 -D__JETSON__)..."
+SCONSTRUCT="$REPO_ROOT/SConstruct"
+if [ -f "$SCONSTRUCT" ] && ! grep -q "__JETSON__" "$SCONSTRUCT"; then
+  python3 - "$SCONSTRUCT" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+anchor = 'elif arch == "aarch64":'
+if anchor in s and '-D__JETSON__' not in s:
+  ins = anchor + '\n  # Jetson (Orin): visionbuf_jetson.cc CUDA 零拷贝映射 (overlay kits/modeld)\n  cflags += ["-D__JETSON__"]\n  cxxflags += ["-D__JETSON__"]\n  cpppath += ["/usr/local/cuda/include"]'
+  s = s.replace(anchor, ins, 1)
+  open(p, 'w').write(s)
+  print("[apply_cuda] SConstruct aarch64: + -D__JETSON__ + CUDA include")
+else:
+  print("[apply_cuda] SConstruct 无 aarch64 锚点或已有 __JETSON__")
+PY
+else
+  echo "  - SConstruct 已有 __JETSON__"
 fi
 
 echo "Patching modeld.py..."

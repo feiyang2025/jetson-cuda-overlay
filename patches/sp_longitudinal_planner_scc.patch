@@ -1,0 +1,48 @@
+--- /tmp/longitudinal_planner.py.before_scc_restore	2026-09-02 20:43:50.528554844 +0800
++++ sunnypilot/selfdrive/controls/lib/longitudinal_planner.py	2026-09-24 14:07:39.382475157 +0800
+@@ -1,5 +1,6 @@
+ from cereal import messaging, custom
+ from opendbc.car import structs
++from openpilot.common.params import Params
+ from openpilot.sunnypilot.selfdrive.controls.lib.dec.dec import DynamicExperimentalController
+ from openpilot.sunnypilot.selfdrive.controls.lib.e2e_alerts_helper import E2EAlertsHelper
+ from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
+@@ -12,6 +13,11 @@
+     self.dec = DynamicExperimentalController(CP, mpc)
+     self.events_sp = EventsSP()
+     self.e2e_alerts_helper = E2EAlertsHelper()
++    self.params = Params()
++    self._smart_cruise_vision_enabled = False
++    self._smart_cruise_vision_active = False
++    self._smart_cruise_map_enabled = False
++    self._smart_cruise_map_active = False
+ 
+   def get_mpc_mode(self) -> str | None:
+     if not self.dec.active():
+@@ -24,6 +30,12 @@
+     self.dec.update(sm)
+     self.e2e_alerts_helper.update(sm, self.events_sp)
+ 
++    # SCC-V / SCC-M: read user toggles (active fixed False -> steady icon, no pulse)
++    self._smart_cruise_vision_enabled = self.params.get_bool("SmartCruiseControlVision")
++    self._smart_cruise_vision_active = False
++    self._smart_cruise_map_enabled = self.params.get_bool("SmartCruiseControlMap")
++    self._smart_cruise_map_active = False
++
+   def publish_longitudinal_plan_sp(self, sm: messaging.SubMaster, pm: messaging.PubMaster) -> None:
+     plan_sp_send = messaging.new_message('longitudinalPlanSP')
+ 
+@@ -45,4 +57,13 @@
+     e2eAlerts.greenLightAlert = self.e2e_alerts_helper.green_light_alert
+     e2eAlerts.leadDepartAlert = self.e2e_alerts_helper.lead_depart_alert
+ 
++    # Smart Cruise Control - Vision / Map
++    smart_cc = longitudinalPlanSP.smartCruiseControl
++    smart_cc.vision.enabled = self._smart_cruise_vision_enabled
++    smart_cc.vision.active = self._smart_cruise_vision_active
++    smart_cc.vision.state = 1 if self._smart_cruise_vision_active else 0
++    smart_cc.map.enabled = self._smart_cruise_map_enabled
++    smart_cc.map.active = self._smart_cruise_map_active
++    smart_cc.map.state = 1 if self._smart_cruise_map_active else 0
++
+     pm.send('longitudinalPlanSP', plan_sp_send)

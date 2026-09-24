@@ -57,7 +57,7 @@ JSON11_O="$(find_lib third_party/json11/json11.o)" || { echo "ERROR: required li
 g++ -O2 -std=c++17 -o "$OUT" "$SRC" \
   "$CEREAL_ROOT/cereal/messaging/socketmaster.cc" \
   "$MSGQ_LIB" "$COMMON_LIB" "$JSON11_O" \
-  -I"$CEREAL_ROOT" -I"$REPO_ROOT/msgq_repo" -I"$REPO_ROOT" \
+  -I"$CEREAL_ROOT" -I"$CEREAL_ROOT/cereal/gen/cpp" -I"$REPO_ROOT/msgq_repo" -I"$REPO_ROOT" \
   -pthread -ldl -lzmq -lcapnp -lkj
 
 echo "[build_ch347t] done: $OUT"

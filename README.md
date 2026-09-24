@@ -14,8 +14,22 @@ CUDA inference backend and GMSL camera path on AGX Orin.
 ```bash
 bash apply_cuda.sh <fork-root>          # apply everything (idempotent)
 bash panda/install.sh                   # install the cross-fork Panda tooling + start-up hooks
+bash tools/self_check.sh <fork-root>    # camerad/modeld kit 完整性自检 (PASS/FAIL 清单)
 python3 doctor.py                       # health-check the whole chain
 ```
+
+## Kit structure (2026-09-24, sp 实车验证版)
+
+采集→推理链路按"功能"打包成 kit, 与 fork 树路径解耦, 任何分支 apply 即用:
+
+| kit | 内容 | 对应契约文档 |
+|---|---|---|
+| `kits/camerad/` | camerad.py (跨分支自适应版) + v4l2_dmabuf_camera.py + v4l2_camera.py + camera_cuda.py + packed_to_nv12.cu + `msgq/0001-visionipc-zerocopy.patch` (write_and_send + refcount) | `kits/camerad/CAMERAD_CONTRACT.md` |
+| `kits/modeld/` | modeld.py + modeld_bigcombo.py (TRT 加载兜底闭环: 重试→降级 tinygrad / BigCombo→FiletOFish) + tensorrt_runner.py + cuda_transform.{cu,h} + `sconstruct_jetson.diff` | `kits/modeld/MODELD_CONTRACT.md` |
+| `patches/` | 本地散改补丁 (git 操作会冲掉的): sp_longitudinal_planner_scc.patch | — |
+
+契约文档钉死"不要再改"的规则: twgmsl 色度 (Y=raw[0::2], U=raw[1::4], V=raw[3::4])、20fps 输出、
+20 buffer refcount、零拷贝检测回退、入口 CPU 拷贝硬边界 (videobuf2 CMA 内存)、TRT 兜底参数等。
 
 ## What it installs
 

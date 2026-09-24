@@ -19,7 +19,8 @@ source .venv/bin/activate && scons -j8 common/         # 标定组件改了 para
 ```
 
 `apply_cuda.sh` 每次都做三件事：拷贝文件 → 运行补丁器（幂等注入）→ 打印还需要手动做的事。
-上传上游更新（`git pull`）之后**再跑一次**即可恢复全部改动。
+上传上游更新（`git pull`）之后**再跑一次**即可恢复全部改动。跑完用
+`bash tools/self_check.sh <树根>` 做 kit 完整性自检（相机链路/推理兜底/msgq 零拷贝/SCC 散改）。
 
 ---
 
