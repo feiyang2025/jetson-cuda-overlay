@@ -359,7 +359,12 @@ class V4L2Camera:
     # 相机输出不是 NV12（或需要缩放）时，启用 VIC 硬件转换 UYVY→NV12
     # 注：taegra-camrtc 驱动不实现 G_FMT/S_FMT，G_FMT 失败时 cam_pixelformat 为 UYVY，
     # 因此同尺寸 1920x1080 也会走 VIC 硬件转换而非 CPU fallback
-    if self.cam_pixelformat != V4L2_PIX_FMT_NV12 or (self.cam_active_w, self.cam_active_h) != (self.target_w, self.target_h):
+    # twgmsl 当前输出不是标准 UYVY：色度需按 GMSL_CHROMA_LAYOUT 归一化。
+    # VIC 只能按标准 UYVY 解码，直接走 VIC 会把错误色度带入 NV12 造成纯绿；
+    # 因此 GMSL 特殊布局默认禁用 VIC，除非显式 SP_ENABLE_VIC_GMSL=1。
+    gmsl_special_layout = os.environ.get('GMSL_CHROMA_LAYOUT', 'twgmsl').lower() == 'twgmsl'
+    vic_allowed = (not gmsl_special_layout) or os.environ.get('SP_ENABLE_VIC_GMSL') == '1'
+    if vic_allowed and os.environ.get("SP_FORCE_NO_VIC") != "1" and (self.cam_pixelformat != V4L2_PIX_FMT_NV12 or (self.cam_active_w, self.cam_active_h) != (self.target_w, self.target_h)):
       print(f"[V4L2Camera] {self.device}: VIC 裁剪/转换 buffer {self.cam_w}x{self.cam_h} 有效区 {self.cam_active_w}x{self.cam_active_h} → {self.target_w}x{self.target_h} NV12", flush=True)
       try:
         self.W = self.target_w
@@ -371,8 +376,10 @@ class V4L2Camera:
         self.W = self.target_w
         self.H = self.target_h
     else:
-      self.W = self.cam_w
-      self.H = self.cam_h
+      # 200万像素契约: 无论 V4L2 画布是 1080p 还是虚标 4K, 下游 NV12 都是 1920x1080。
+      # 有效像素由 _numpy_downsample 按 cam_active 裁出。
+      self.W = self.target_w
+      self.H = self.target_h
 
     self._src_surfs = []
     self._nvbuf_fds = []

@@ -69,21 +69,34 @@ trtexec --onnx=model.onnx --saveEngine=xxx_fp16.plan --fp16
 sudo tw_camera_cfg bring      # 森云 serdes 初始化, 必须先于 camerad
 ```
 
-### 2.4 AGX Orin 相机完整链路（标准）
+### 2.4 AGX Orin 相机完整链路（标准, 2026-09-24 sp 实车验证）
 
 ```
 tw_camera_cfg(serdes 初始化)
-  → V4L2 采集 GMSL IMX390 UYVY (30fps, /dev/video0/1)
-  → VIC 硬件转 NV12 (v4l2_dmabuf_camera.py, 1920x1080)
+  → V4L2 采集 GMSL IMX390 packed UYVY (30fps, /dev/video0=road, /dev/video1=wide)
+  → twgmsl 色度归一化 (GMSL_CHROMA_LAYOUT=twgmsl: Y 偶数字节 + U/V lane 互换)
+  → CUDA packed→NV12 kernel (libpacked_to_nv12.so, ~2.4ms; 无则 CPU fallback)
   → FrameSync 帧同步 (road 致密发号, wide 跟随, 帧 id 配对)
   → 帧计数节流 20fps (30fps 每 3 帧交付 2 帧, 无 sleep 无拍频)
-  → VisionIPC (4 个共享 buffer)
+  → VisionIPC (20 个共享 buffer + refcount, 消除撕裂)
   → modeld: GpuModelState (CUDA 变换 + TensorRT 推理)
 ```
 
 入口: `USE_WEBCAM=1` → `webcamerad` (Python `tools/webcam/camerad.py`), 由
 process_config 的 `WEBCAM` 开关启用。**不要**设 `DISABLE_CUDA_TRANSFORM=1`
 (那是 USB 摄像头 PC 模式的 CPU 转换路径; 本机 GMSL 走 CUDA 变换)。
+
+> 颜色规则不要再改: twgmsl 不是标准 UYVY, 标准 UYVY 直转会发绿/红蓝反;
+> VIC 只认标准 UYVY, 默认禁(门控在 v4l2_dmabuf_camera.py, SP_ENABLE_VIC_GMSL=1 才开)。
+> 下游 NV12 锁死 1920x1080(4K 只是驱动虚标画布, 有效像素 200 万)。
+
+### 2.4.1 packed CUDA kernel 编译(可选, 转换 4.7ms→2.4ms)
+
+```bash
+cd <目标fork>/openpilot/system/camerad/webcam    # 老布局: tools/webcam
+nvcc -arch=sm_87 -O3 --shared -o libpacked_to_nv12.so packed_to_nv12.cu
+# 产物与 camerad.py 同目录即可自动发现; 缺失时自动回退 CPU 转换
+```
 
 ### 2.5 相机适配"水土不服"防护（2026-09-16 起）
 
@@ -95,14 +108,27 @@ FrameSync 链路接不上, 表现为相机黑屏或 16Hz 拍频, 且无任何报
 
 apply_cuda.sh 现在做两层防护:
 1. 检测 fork 的 camerad.py 无 "V4L2 DMABUF"/"v4l2_dmabuf_camera" 字样
-   → 判定旧版, 用 overlay 完整适配版 (328 行, sp 同款) 覆盖, 原文件备份
-   为 `.orig_openpilot`
+   → 判定旧版, 用 overlay 完整适配版 (sp 同款: twgmsl 色度 + 20 buffer + 零拷贝)
+   覆盖, 原文件备份为 `.orig_openpilot`
 2. 对新版再跑 patch_camerad.py 确认 import 锚点
 
 安装到旧布局: `tools/webcam/camerad.py`; 新布局:
 `openpilot/system/camerad/webcam/camerad.py`。overlay 内的
 `openpilot/system/camerad/webcam/camerad.py` 即完整入口(与 sp 树内一致),
 apply 时按布局拷到对应位置。
+
+### 2.6 VisionIPC 零拷贝(可选高级层, sp 实车验证 2026-09-24)
+
+`SP_ZEROCOPY=1`(默认)时 camerad 用 cudaHostGetDevicePointer 直接把 NV12 写进
+VisionIPC buffer 的设备指针(write_and_send), 省掉 D2H/H2D(camerad CPU 41%→36%)。
+前提: 目标 fork 已移植配套改动, 否则自动回退主机路径, 不影响出图:
+
+- msgq_repo visionipc: `write_and_send` + 共享 refcount(SP 子模块 09c14e4)
+- modeld.py: 消费侧 cudaHostGetDevicePointer + `cuda_transform_execute(input_is_device=1)` + 推理后 release
+- UI cameraview.cc: QCOM2/EGLImage 路径 release + draw 后 `glFinish()`
+- SConstruct aarch64 分支: `-D__JETSON__` + CUDA include
+
+回退判断: camerad 检测 `vipc_server` 无 `write_and_send` 属性即 `_zerocopy=False`。
 
 ---
 

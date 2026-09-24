@@ -25,7 +25,7 @@ python3 doctor.py                       # health-check the whole chain
 | gpu_model_state | `openpilot/sunnypilot/modeld_v2/gpu_model_state.py` | CUDA-first ModelState (tinygrad fallback) |
 | cuda_transform | `openpilot/selfdrive/modeld/transforms/cuda_transform.*` | NV12 -> 12-channel GPU warp kernels |
 | tensorrt_runner | `openpilot/selfdrive/modeld/runners/tensorrt_runner.py` | TRT .plan loader (zero-copy) |
-| v4l2/vic camera | `openpilot/system/camerad/webcam/v4l2_dmabuf_camera.py` + `v4l2_camera.py` | GMSL IMX390 UYVY -> VIC -> NV12 |
+| v4l2/cuda camera | `openpilot/system/camerad/webcam/{v4l2_dmabuf_camera.py,camerad.py,packed_to_nv12.cu}` | GMSL IMX390 packed UYVY -> twgmsl 色度归一化 -> CUDA packed→NV12 (VIC 默认禁, 零拷贝可选) |
 | ch347 imu | `openpilot/system/sensord/ch347t.cc` + `third_party/ch347/` | USB-I2C LSM6DS3 IMU daemon w/ auto zero-bias calib |
 | camera calib | `tools/calib/*` + `patch_calib.py` | FCAM/ECAM intrinsic + ECAM extrinsic calibration toolkit and its Param plumbing |
 | panda unify | `panda/*` (installed to `/data/openpilot/panda_版本核对/`) | keep every fork on one Panda firmware/protocol -> no reflashing |

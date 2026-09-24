@@ -63,7 +63,15 @@ WIDE_CAM = os.getenv("WIDE_CAM", "2" if GMSL_WEBCAM else "")
 DRIVER_CAM = os.getenv("DRIVER_CAM")
 USE_NVMM = os.getenv("SP_VISIONIPC_NVMM", "0") == "1"
 USE_V4L2 = os.getenv("USE_V4L2_CAMERA", "1" if platform.system() != "Darwin" else "0") == "1"
-REPO_ROOT = Path(__file__).resolve().parents[2]
+def _find_repo_root():
+  """自适应 repo 根: 兼容老布局(<root>/tools/webcam)与新布局(<root>/openpilot/system/camerad/webcam)。"""
+  p = Path(__file__).resolve()
+  for parent in p.parents:
+    if (parent / 'selfdrive').is_dir():
+      return parent
+  return p.parents[2]
+
+REPO_ROOT = _find_repo_root()
 
 CameraType = namedtuple("CameraType", ["msg_name", "stream_type", "cam_id"])
 
@@ -109,27 +117,45 @@ CAMERAS = _build_cameras()
 
 
 def _packed_yuv_to_nv12(yuv_data, width, height, pixel_format='UYVY'):
-  """CPU UYVY/YUYV → NV12 conversion."""
+  """packed YUV -> NV12.
+
+  twgmsl 的 UYVY 节点实际是特殊 packed 两字节布局：有效亮度在奇数字节，
+  色度交错也来自奇数字节；按标准 UYVY 读取会得到 U/V≈0，画面纯绿。
+  通过 GMSL_CHROMA_LAYOUT=twgmsl 选择与 CP 相同的通道归一化。
+  """
   yuv = np.frombuffer(yuv_data, dtype=np.uint8).reshape(height, width * 2)
   nv12 = np.zeros(height * width * 3 // 2, dtype=np.uint8)
   y_plane = nv12[:height * width].reshape(height, width)
   uv_plane = nv12[height * width:].reshape(height // 2, width)
 
-  if pixel_format == 'UYVY':
-    # UYVY: U0 Y0 V0 Y1 U2 Y2 V2 Y3 ...
+  if pixel_format == 'UYVY' and os.environ.get('GMSL_CHROMA_LAYOUT', 'twgmsl').lower() == 'twgmsl':
+    # 与 CP openpilot/tools/webcam/camera.py 完全一致：
+    # 实测 twgmsl packed 布局中，Y 在偶数字节；V/U 位于奇数字节的两条色度 lane。
+    # CP 原实现：y=a[0::2], u=a[3::4], v=a[1::4]。
     for i in range(height):
       row = yuv[i]
-      y_plane[i] = row[1::2]  # Y bytes at odd positions
+      y_plane[i] = row[0::2]
       if i % 2 == 0:
-        uv_plane[i // 2, 0::2] = row[0::4]   # U at even macro-pixel
-        uv_plane[i // 2, 1::2] = row[2::4]   # V at odd macro-pixel
+        # 当前 Qt shader 按标准 NV12: U 在偶数位、V 在奇数位。
+        # 实测原始 lane 与 CP 的历史命名相反；为恢复红/蓝正确方向，交换两条 lane。
+        uv_plane[i // 2, 0::2] = row[1::4]  # U
+        uv_plane[i // 2, 1::2] = row[3::4]  # V
+    return nv12
+
+  if pixel_format == 'UYVY':
+    for i in range(height):
+      row = yuv[i]
+      y_plane[i] = row[1::2]
+      if i % 2 == 0:
+        uv_plane[i // 2, 0::2] = row[0::4]
+        uv_plane[i // 2, 1::2] = row[2::4]
   else:  # YUYV
     for i in range(height):
       row = yuv[i]
-      y_plane[i] = row[0::2]  # Y bytes at even positions
+      y_plane[i] = row[0::2]
       if i % 2 == 0:
-        uv_plane[i // 2, 0::2] = row[1::4]   # U
-        uv_plane[i // 2, 1::2] = row[3::4]   # V
+        uv_plane[i // 2, 0::2] = row[1::4]
+        uv_plane[i // 2, 1::2] = row[3::4]
   return nv12
 
 
@@ -141,6 +167,31 @@ class CudaUyvyConverter:
     self.nv12_size = width * height * 3 // 2
     self.stride = width * 2
     self._use_cuda = False
+    self._packed = None
+
+    # 优先: 已验证的 GMSL packed→NV12 CUDA kernel (与下方 CPU 路径字节规则一致)
+    # 部署位候选: 与 camerad.py 同目录 → 老布局 tools/webcam/ → 新布局 openpilot/tools/webcam/
+    _so_candidates = [
+      Path(__file__).resolve().parent / 'libpacked_to_nv12.so',
+      REPO_ROOT / 'tools' / 'webcam' / 'libpacked_to_nv12.so',
+      REPO_ROOT / 'openpilot' / 'tools' / 'webcam' / 'libpacked_to_nv12.so',
+    ]
+    packed_so = next((c for c in _so_candidates if c.exists()), None)
+    if packed_so is not None and packed_so.exists() and os.environ.get('GMSL_CHROMA_LAYOUT', 'twgmsl').lower() == 'twgmsl':
+      try:
+        self._packed = ctypes.CDLL(str(packed_so))
+        self._packed.packed_to_nv12.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        self._packed.packed_to_nv12.restype = ctypes.c_int
+        # 零拷贝入口: 直接写到设备指针, 不 D2H
+        self._packed.packed_to_nv12_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        self._packed.packed_to_nv12_device.restype = ctypes.c_int
+        self.nv12_cpu = np.zeros(self.nv12_size, dtype=np.uint8)
+        self._use_cuda = True
+        print(f"[CudaUyvyConverter] packed CUDA kernel OK: {width}x{height}", flush=True)
+        return
+      except Exception as e:
+        print(f"[CudaUyvyConverter] packed CUDA init failed: {e}, fallback", flush=True)
+        self._packed = None
 
     lib_path = REPO_ROOT / 'selfdrive' / 'modeld_v2' / 'libuyvy_convert.so'
     if not lib_path.exists():
@@ -148,8 +199,16 @@ class CudaUyvyConverter:
       if alt_path.exists():
         lib_path = alt_path
       else:
-        print(f"[CudaUyvyConverter] libuyvy_convert.so not found at {lib_path}, falling back to CPU UYVY→NV12", flush=True)
-        return
+        # 新布局: fork 有 openpilot/ 子目录时 selfdrive 在其下
+        alt2 = REPO_ROOT / 'openpilot' / 'selfdrive' / 'modeld_v2' / 'libuyvy_convert.so'
+        alt3 = REPO_ROOT / 'openpilot' / 'sunnypilot' / 'modeld_v2' / 'libuyvy_convert.so'
+        if alt2.exists():
+          lib_path = alt2
+        elif alt3.exists():
+          lib_path = alt3
+        else:
+          print(f"[CudaUyvyConverter] libuyvy_convert.so not found at {lib_path}, falling back to CPU UYVY→NV12", flush=True)
+          return
 
     try:
       self.cudart = ctypes.CDLL('libcudart.so.12')
@@ -177,6 +236,18 @@ class CudaUyvyConverter:
       self._use_cuda = False
 
   def convert(self, uyvy_data):
+    if self._packed is not None:
+      src = np.ascontiguousarray(uyvy_data, dtype=np.uint8)
+      ret = self._packed.packed_to_nv12(ctypes.c_void_p(src.ctypes.data),
+                                        ctypes.c_void_p(self.nv12_cpu.ctypes.data),
+                                        self.W, self.H)
+      if ret != 0:
+        print(f"[CUDA] packed_to_nv12 failed ret={ret}", flush=True)
+        return None
+      return self.nv12_cpu
+    return self._convert_fallback(uyvy_data)
+
+  def _convert_fallback(self, uyvy_data):
     if not self._use_cuda:
       return _packed_yuv_to_nv12(uyvy_data.tobytes() if hasattr(uyvy_data, 'tobytes') else bytes(uyvy_data), self.W, self.H, 'UYVY')
     ret_copy = self.cudart.cudaMemcpy(ctypes.c_void_p(self.uyvy_gpu.value), ctypes.c_void_p(uyvy_data.ctypes.data), self.uyvy_size, 1)
@@ -193,6 +264,19 @@ class CudaUyvyConverter:
       return None
     return self.nv12_cpu
 
+  def convert_to_device(self, uyvy_data, dst_device_ptr):
+    """零拷贝: NV12 直接写到 dst_device_ptr (VisionIPC buffer 的设备指针), 不 D2H。"""
+    if self._packed is None:
+      return False
+    src = np.ascontiguousarray(uyvy_data, dtype=np.uint8)
+    ret = self._packed.packed_to_nv12_device(ctypes.c_void_p(src.ctypes.data),
+                                             ctypes.c_void_p(dst_device_ptr),
+                                             self.W, self.H)
+    if ret != 0:
+      print(f"[CUDA] packed_to_nv12_device failed ret={ret}", flush=True)
+      return False
+    return True
+
 
 class Camerad:
   def __init__(self):
@@ -202,9 +286,28 @@ class Camerad:
     self.use_nvmm = USE_NVMM
     self.cameras = []
     self.converters = {}
+    # 零拷贝: stream_type -> (host_ptr -> device_ptr) 缓存
+    self._devptr_cache = {}
+    self._zerocopy = os.environ.get('SP_ZEROCOPY', '1') == '1'
+    self._cudart = None
+    if self._zerocopy:
+      try:
+        self._cudart = ctypes.CDLL('libcudart.so')
+        self._cudart.cudaHostGetDevicePointer.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
+        self._cudart.cudaHostGetDevicePointer.restype = ctypes.c_int
+      except Exception as e:
+        print(f"[camerad] zerocopy disabled, cudart load failed: {e}", flush=True)
+        self._zerocopy = False
+
+    if self._zerocopy and not hasattr(self.vipc_server, 'write_and_send'):
+      print("[camerad] msgq visionipc 无 write_and_send(目标 fork 未打零拷贝补丁), 回退主机路径", flush=True)
+      self._zerocopy = False
 
     if self.use_v4l2:
-      from openpilot.tools.webcam.v4l2_dmabuf_camera import Camera
+      try:
+        from openpilot.system.camerad.webcam.v4l2_dmabuf_camera import Camera
+      except ImportError:
+        from openpilot.tools.webcam.v4l2_dmabuf_camera import Camera
       print("[camerad] Using V4L2 DMABUF camera (UYVY → CUDA NV12 → send)", flush=True)
     else:
       from openpilot.tools.webcam.camera import Camera
@@ -216,8 +319,9 @@ class Camerad:
       cam_device = f"/dev/video{c.cam_id}" if platform.system() != "Darwin" else c.cam_id
       cam = Camera(c.msg_name, c.stream_type, cam_device)
       self.cameras.append(cam)
-      # 4 个共享 buffer: modeld 推理占 1 + UI 渲染占 1 时不阻塞 camerad 发帧 (2 个会限流到 ~15fps)
-      self.vipc_server.create_buffers(c.stream_type, 4, cam.W, cam.H)
+      # 20 个共享 buffer: 配合 refcount 同步 (server 写前等 ref_count==0),
+      # 轮转周期 1s @20fps, 消除读写竞争撕裂; modeld/UI 慢时 camerad 限流而非撕裂。
+      self.vipc_server.create_buffers(c.stream_type, 20, cam.W, cam.H)
       vic_enabled = getattr(getattr(cam, 'cam', None), '_vic', False)
       use_dmabuf = getattr(getattr(cam, 'cam', None), '_use_dmabuf', False)
       print(f"[camerad] camera={c.msg_name} device={cam_device} size={cam.W}x{cam.H} vic={vic_enabled} dmabuf={use_dmabuf}", flush=True)
@@ -235,6 +339,34 @@ class Camerad:
       timestamp_eof = timestamp_sof if timestamp_sof > 0 else int(time.monotonic_ns())
     self.vipc_server.send(yuv_type, nv12_data, frame_id, timestamp_sof, timestamp_eof)
     self._publish_camera_state(frame_id, pub_type, timestamp_sof, timestamp_eof)
+
+  def _send_nv12_zerocopy(self, raw, converter, frame_id, pub_type, yuv_type, timestamp_sof=0, timestamp_eof=0):
+    """kernel 直接把 NV12 写进 VisionIPC 共享内存的设备映射, 跳过 D2H 和 memcpy。
+    write_and_send 保证写入和发送是同一个 buffer。"""
+    if timestamp_eof <= 0:
+      timestamp_eof = timestamp_sof if timestamp_sof > 0 else int(time.monotonic_ns())
+
+    def fill(dst):
+      host_ptr = dst.ctypes.data
+      cache = self._devptr_cache.setdefault(yuv_type, {})
+      dptr = cache.get(host_ptr)
+      if dptr is None:
+        d = ctypes.c_void_p()
+        rc = self._cudart.cudaHostGetDevicePointer(ctypes.byref(d), ctypes.c_void_p(host_ptr), 0)
+        if rc != 0 or not d.value:
+          raise RuntimeError(f"cudaHostGetDevicePointer rc={rc}")
+        dptr = d.value
+        cache[host_ptr] = dptr
+      if not converter.convert_to_device(raw, dptr):
+        raise RuntimeError("convert_to_device failed")
+
+    try:
+      self.vipc_server.write_and_send(yuv_type, fill, frame_id, timestamp_sof, timestamp_eof)
+    except Exception as e:
+      print(f"[camerad] zerocopy fill failed: {e}", flush=True)
+      return False
+    self._publish_camera_state(frame_id, pub_type, timestamp_sof, timestamp_eof)
+    return True
 
   def _publish_camera_state(self, frame_id, pub_type, timestamp_sof=0, timestamp_eof=0):
     dat = messaging.new_message(pub_type, valid=True)
@@ -296,9 +428,19 @@ class Camerad:
           sync_frame_id = g_frame_sync.follow()
         else:
           sync_frame_id = g_frame_sync.wait()
-        nv12 = self._vision_buf_to_nv12(cam, vision_buf)
-        if nv12 is not None:
-          self._send_nv12(nv12, sync_frame_id, cam.cam_type_state, cam.stream_type, vision_buf.timestamp_sof, vision_buf.timestamp_eof)
+        converter = self.converters.get(cam.stream_type)
+        sent = False
+        if self._zerocopy and converter is not None and converter._packed is not None and vision_buf is not None and vision_buf.data is not None:
+          raw = np.frombuffer(vision_buf.data, dtype=np.uint8)
+          sent = self._send_nv12_zerocopy(raw, converter, sync_frame_id, cam.cam_type_state, cam.stream_type, vision_buf.timestamp_sof, vision_buf.timestamp_eof)
+          if not sent and not getattr(self, '_zc_warned', False):
+            print("[camerad] zerocopy send failed, falling back to host path", flush=True)
+            self._zc_warned = True
+            self._zerocopy = False
+        if not sent:
+          nv12 = self._vision_buf_to_nv12(cam, vision_buf)
+          if nv12 is not None:
+            self._send_nv12(nv12, sync_frame_id, cam.cam_type_state, cam.stream_type, vision_buf.timestamp_sof, vision_buf.timestamp_eof)
       # 无 sleep: 以传感器原速 30fps 消费, 每 3 帧交付 2 帧 = 精确 20fps。
       # 输出节奏锁定 VI 的 33.3ms 硬件网格 (66.7ms 双步), 零拍频零积压。
     else:

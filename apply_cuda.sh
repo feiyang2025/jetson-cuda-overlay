@@ -88,15 +88,13 @@ if [ "$LAYOUT" = "new" ]; then
   install "openpilot/system/camerad/webcam/v4l2_dmabuf_camera.py"
   install "openpilot/system/camerad/webcam/v4l2_camera.py"
   install "openpilot/system/camerad/webcam/camera_cuda.py"
-  install "openpilot/system/camerad/webcam/cuda_ipc_bridge.py"
-  install "openpilot/system/camerad/webcam/cuda_jpeg_decoder.py"
+  install "openpilot/system/camerad/webcam/packed_to_nv12.cu"
 else
   # Old layout: tools/webcam/
   install_file "$OVERLAY_DIR/openpilot/system/camerad/webcam/v4l2_dmabuf_camera.py" "$REPO_ROOT/tools/webcam/v4l2_dmabuf_camera.py"
   install_file "$OVERLAY_DIR/openpilot/system/camerad/webcam/v4l2_camera.py" "$REPO_ROOT/tools/webcam/v4l2_camera.py"
   install_file "$OVERLAY_DIR/openpilot/system/camerad/webcam/camera_cuda.py" "$REPO_ROOT/tools/webcam/camera_cuda.py"
-  install_file "$OVERLAY_DIR/openpilot/system/camerad/webcam/cuda_ipc_bridge.py" "$REPO_ROOT/tools/webcam/cuda_ipc_bridge.py"
-  install_file "$OVERLAY_DIR/openpilot/system/camerad/webcam/cuda_jpeg_decoder.py" "$REPO_ROOT/tools/webcam/cuda_jpeg_decoder.py"
+  install_file "$OVERLAY_DIR/openpilot/system/camerad/webcam/packed_to_nv12.cu" "$REPO_ROOT/tools/webcam/packed_to_nv12.cu"
 fi
 if [ -f "$CAMERAD_PY" ]; then
   # 水土不服根治: patch_camerad.py 只认官方结构的 import 锚点, 对胡萝卜系

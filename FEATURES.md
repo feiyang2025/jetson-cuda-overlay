@@ -41,7 +41,7 @@ python3 /data/openpilot/jetson-cuda-overlay/doctor.py
 | 能力 | 具体做了什么 | 证据 |
 |---|---|---|
 | 自动适配分支 | 自动识别新布局（`openpilot/sunnypilot/modeld_v2`）与旧布局（`selfdrive/modeld`），幂等、版本无关 | `apply_cuda.sh` 实测（cuda/ajouatom/dp 三个分支） |
-| 相机链路 | GMSL IMX390（森云 SG2）UYVY → V4L2 → VIC → NV12；5 个 webcam 适配文件 + 自动 patch camerad 的 import | 实机出图 20Hz（20fps 锁定，无丢帧告警） |
+| 相机链路 | GMSL IMX390（森云 SG2）packed UYVY → V4L2 → twgmsl 色度归一化 → CUDA packed→NV12（VIC 默认禁）；4 个适配文件 + packed_to_nv12.cu + 自动 patch camerad | 实机出图 20Hz（20fps 锁定，颜色平衡实车验证，零拷贝可选） |
 | CUDA 推理后端 | CUDA 图像变换（NV12→12 通道 warp，绕开 pocl/OpenCL）+ TensorRT 运行器（零拷贝），tinygrad 自动回退 | 实机 `Using TensorRT` ～2ms/帧 |
 | 模型兼容 | **小模型（分体 vision+policy，FiletOFish 类）与 1.7G 大模型（BigCombo 单引擎合并）都支持**，走 ModelProfile 注册表自动选 | 本机两套引擎都跑过（BigCombo 240 帧漂移测试通过） |
 | CH347 IMU | 外置 USB-I2C LSM6DS3 守护进程：发 accelerometer/gyroscope/temperatureSensor，开机零偏自动校准，**没插设备自动干净退出** | 实机验证；`process_config` 注册可选守护进程 |
