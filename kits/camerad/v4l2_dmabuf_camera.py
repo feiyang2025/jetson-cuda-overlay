@@ -118,6 +118,32 @@ class NvBufSurfaceCreateParams(ctypes.Structure):
   ]
 
 
+class _NvBufSurfaceParamsLite(ctypes.Structure):
+  _fields_ = [
+    ("width", ctypes.c_uint32),
+    ("height", ctypes.c_uint32),
+    ("pitch", ctypes.c_uint32),
+    ("colorFormat", ctypes.c_uint32),
+    ("layout", ctypes.c_uint32),
+    ("bufferDesc", ctypes.c_uint64),
+    ("dataSize", ctypes.c_uint32),
+    ("_pad", ctypes.c_uint32),
+    ("dataPtr", ctypes.c_void_p),
+  ]
+
+
+class _NvBufSurfaceLite(ctypes.Structure):
+  _fields_ = [
+    ("gpuId", ctypes.c_uint32),
+    ("batchSize", ctypes.c_uint32),
+    ("numFilled", ctypes.c_uint32),
+    ("isContiguous", ctypes.c_bool),
+    ("_pad", ctypes.c_uint8 * 3),
+    ("memType", ctypes.c_uint32),
+    ("surfaceList", ctypes.POINTER(_NvBufSurfaceParamsLite)),
+  ]
+
+
 class NvBufSurfTransformRect(ctypes.Structure):
   _fields_ = [
     ("top", ctypes.c_uint32), ("left", ctypes.c_uint32),
@@ -149,7 +175,7 @@ class NvBufSurfTransformConfigParams(ctypes.Structure):
 
 
 class VisionBuf:
-  def __init__(self, dmabuf_fd, width, height, stride, data_size, frame_id, pixel_format='NV12', data=None, timestamp_sof=0, timestamp_eof=0):
+  def __init__(self, dmabuf_fd, width, height, stride, data_size, frame_id, pixel_format='NV12', data=None, timestamp_sof=0, timestamp_eof=0, v4l2_index=None):
     self.fd = dmabuf_fd
     self.width = width
     self.height = height
@@ -166,6 +192,7 @@ class VisionBuf:
     self.data = data
     self.timestamp_sof = timestamp_sof
     self.timestamp_eof = timestamp_eof
+    self.v4l2_index = v4l2_index
 
 
 class V4L2Camera:
@@ -383,6 +410,42 @@ class V4L2Camera:
 
     self._src_surfs = []
     self._nvbuf_fds = []
+    self._nvbuf_zerocopy = os.environ.get("SP_NVBUF_ZEROCOPY", "0") == "1" and not self._vic
+    if self._nvbuf_zerocopy:
+      try:
+        self._nvbuf = ctypes.CDLL("/usr/lib/aarch64-linux-gnu/nvidia/libnvbufsurface.so")
+        self._nvbuf.NvBufSurfaceCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32, ctypes.POINTER(NvBufSurfaceCreateParams)]
+        self._nvbuf.NvBufSurfaceCreate.restype = ctypes.c_int
+        self._nvbuf.NvBufSurfaceDestroy.argtypes = [ctypes.c_void_p]
+        self._nvbuf.NvBufSurfaceDestroy.restype = ctypes.c_int
+        for i in range(self.num_buffers):
+          src_params = NvBufSurfaceCreateParams()
+          src_params.gpuId = 0
+          src_params.width = self.target_w
+          src_params.height = self.target_h
+          src_params.size = 0
+          src_params.isContiguous = True
+          src_params.colorFormat = NVBUF_COLOR_FORMAT_UYVY
+          src_params.layout = NVBUF_LAYOUT_PITCH
+          src_params.memType = NVBUF_MEM_DEFAULT
+          src_surf = ctypes.c_void_p()
+          r = self._nvbuf.NvBufSurfaceCreate(ctypes.byref(src_surf), 1, ctypes.byref(src_params))
+          if r != 0:
+            raise RuntimeError(f"NvBufSurfaceCreate(src) failed: {r}")
+          self._src_surfs.append(src_surf)
+          params = ctypes.cast(src_surf, ctypes.POINTER(_NvBufSurfaceLite)).contents.surfaceList.contents
+          self._nvbuf_fds.append(int(params.bufferDesc))
+          print(f"[V4L2Camera] {self.device}: NVBUF zerocopy buffer {i} fd={params.bufferDesc} size={params.dataSize} pitch={params.pitch}", flush=True)
+      except Exception as e:
+        print(f"[V4L2Camera] {self.device}: NVBUF zerocopy init failed, fallback MMAP: {e}", flush=True)
+        for surf in self._src_surfs:
+          try:
+            self._nvbuf.NvBufSurfaceDestroy(surf)
+          except Exception:
+            pass
+        self._src_surfs = []
+        self._nvbuf_fds = []
+        self._nvbuf_zerocopy = False
     if self._vic:
       try:
         for i in range(self.num_buffers):
@@ -418,13 +481,13 @@ class V4L2Camera:
     req = v4l2_requestbuffers()
     req.count = self.num_buffers
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE
-    if self._vic and self._nvbuf_fds:
+    if (self._vic or self._nvbuf_zerocopy) and self._nvbuf_fds:
       req.memory = V4L2_MEMORY_DMABUF
     else:
       req.memory = V4L2_MEMORY_MMAP
     try:
       fcntl.ioctl(self.fd, VIDIOC_REQBUFS, req)
-      use_dmabuf = self._vic and self._nvbuf_fds
+      use_dmabuf = (self._vic or self._nvbuf_zerocopy) and self._nvbuf_fds
     except OSError:
       print(f"[V4L2Camera] DMABUF 不支持，回退 MMAP", flush=True)
       req.memory = V4L2_MEMORY_MMAP
@@ -704,6 +767,8 @@ class V4L2Camera:
     if self._vic:
       data = self._vic_convert(index)
       self._requeue_buffer(index)
+    elif self._nvbuf_zerocopy:
+      data = None
     else:
       mm = self.mmap_ptrs[index]
       raw_data = bytes(mm[:self.cam_sizeimage])
@@ -767,7 +832,7 @@ class V4L2Camera:
     while self.streaming:
       try:
         dmabuf_fd, data, index, timestamp_sof, timestamp_eof = self.read_frame()
-        if dmabuf_fd is not None and dmabuf_fd >= 0:
+        if self._nvbuf_zerocopy or (dmabuf_fd is not None and dmabuf_fd >= 0):
           is_nv12 = self._vic or self.cam_pixelformat == V4L2_PIX_FMT_NV12
           yield VisionBuf(
             dmabuf_fd=dmabuf_fd,
@@ -780,6 +845,7 @@ class V4L2Camera:
             data=data,
             timestamp_sof=timestamp_sof,
             timestamp_eof=timestamp_eof,
+            v4l2_index=index,
           )
         self.cur_frame_id += 1
       except BlockingIOError:

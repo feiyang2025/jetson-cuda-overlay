@@ -76,3 +76,16 @@ extern "C" int packed_to_nv12_device(const uint8_t* src_host, uint8_t* dst_devic
   cudaFree(d_src);
   return err == cudaSuccess ? 0 : 4;
 }
+
+// 完整零拷贝版: src/dst 都是 CUDA device pointer。
+// src_device 来自 NvBufSurface dma-buf 的 CUDA import，dst_device 来自 VisionIPC mapped buffer。
+extern "C" int packed_to_nv12_device_to_device(const uint8_t* src_device, uint8_t* dst_device,
+                                               int width, int height) {
+  dim3 block(32, 8);
+  dim3 grid((width + 31) / 32, (height + 7) / 8);
+  packed_to_nv12_kernel<<<grid, block>>>(src_device, dst_device, width, height);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return 6;
+  err = cudaDeviceSynchronize();
+  return err == cudaSuccess ? 0 : 7;
+}

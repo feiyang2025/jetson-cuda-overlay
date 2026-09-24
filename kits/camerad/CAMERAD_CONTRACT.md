@@ -42,17 +42,21 @@ V = raw[3::4]
 - 20fps 节流: 30fps 源每 3 帧交付 2 帧, 无 sleep 无拍频
 - frame_id: road 致密递增发号 (modeld 丢帧统计只看主镜头 id, 不能跳号), wide 跟随配对
 - 20 个共享 buffer + refcount (客户端 recv acquire / 用完 release) — 撕裂根因是 4 buffer + 无同步, 已修
-- 零拷贝: `SP_ZEROCOPY=1` (默认) 时 NV12 直写 VisionIPC buffer 设备指针 (write_and_send),
-  省 D2H/H2D; camerad 检测 msgq visionipc 无 write_and_send 属性 → 自动回退主机路径, 不影响出图
+- 零拷贝两级 (camerad.py 读 env, 任一不满足自动回退, 不影响出图):
+  - `SP_NVBUF_ZEROCOPY=1` (推荐/默认): **完整零拷贝** — V4L2 REQBUFS DMABUF 接收自建
+    NvBufSurface 的 dma-buf → nvbuf_import_fd 导入 CUDA → kernel(src→staging) 转换完
+    **立即归还相机 buffer** (不等 VisionIPC refcount) → write_and_send fill 里 staging→dst
+    D2D。采集到模型输入全程无 CPU 拷贝。依赖: libnvbuf_import.so + msgq write_and_send。
+  - `SP_ZEROCOPY=1` (默认): NV12 后零拷贝 (入口一次 CPU 拷贝, 硬边界已被 nvbuf 方案覆盖,
+    此级为无 nvbuf 硬件/驱动时的回退)。
 - VisionIPC 客户端用 `msgq.visionipc` (不是 openpilot.common.visionipc)
 
 ## 硬边界 (实验已证明, 不要再试)
 
-- 入口那一次 CPU 拷贝 (V4L2 mmap -> bytes() -> H2D) 去不掉:
-  twgmsl 用 videobuf2_dma_contig CMA 内存, CUDA cuImportExternalMemory 能 import 但映射不进
-  GPU 地址空间 (GetMappedBuffer 999 / DMA_BUF 801); cudaHostRegister invalid argument;
-  twgmsl 不支持 V4L2_MEMORY_DMABUF 接收 ("DMABUF 不支持, 回退 MMAP")。
-  NV12 之后全零拷贝, 之前那次 CPU 拷贝是硬边界。
+- ~~入口那一次 CPU 拷贝 (V4L2 mmap -> bytes() -> H2D) 去不掉~~ **已被推翻 (2026-09-24 晚)**:
+  早期结论"twgmsl 不支持 V4L2_MEMORY_DMABUF 接收"只对 videobuf2 自带缓冲成立;
+  自建 NvBufSurface (MEM_DEFAULT) 的 dma-buf fd 走 REQBUFS DMABUF 注入, tegra 驱动
+  直接写 NVMM 连续内存, CUDA 可 import 可映射可读 → 完整零拷贝成立, 见输出契约。
 - 关停时 `get_buffer busy for >200ms` 是进程退出时引用未归零, 不是推理失败。
 
 ## 跨分支适配 (kit 与 fork 本地版的区别)
@@ -68,8 +72,12 @@ fork 本地版 = 单分支直连 (import 写死)。**不要用 fork 本地版替
 ## msgq 配套 (零拷贝必需)
 
 - msgq/0001-visionipc-zerocopy.patch: write_and_send + 共享 refcount (6 文件 70 行,
-  含 visionbuf_jetson.cc 的 __JETSON__ CUDA 映射)。目标 fork 的 msgq 子模块未打则零拷贝自动回退。
+  含 visionbuf_jetson.cc 的 __JETSON__ CUDA 映射)。目标 fork 的 msgq 子模块未打则
+  SP_ZEROCOPY 与 SP_NVBUF_ZEROCOPY **都**自动回退 (camerad 检测 write_and_send 属性缺失)。
 - 坑: get_buffer 是轮转的, 分开 get 和 send 会拿到两个不同 buffer (必须 write_and_send 一次完成)。
+- 坑: cudaMemcpy kind 枚举 — D2D 必须是 3 (cudaMemcpyDeviceToDevice), 2 是 DeviceToHost (踩过)。
+- 坑: nvbuf 相机 buffer 归还要在 kernel 转换完成后立即做, 不许等 write_and_send;
+      丢帧/异常路径必须 finally 兜底归还 + requeued 标志防双还 (4 块 buffer 12 帧=0.4s 扣死过)。
 
 ## 环境变量清单
 
@@ -78,6 +86,7 @@ fork 本地版 = 单分支直连 (import 写死)。**不要用 fork 本地版替
 | USE_WEBCAM | 1 | 走 webcamerad python 链路 |
 | ROAD_CAM / WIDE_CAM | 0 / 1 | 相机设备索引 |
 | GMSL_CHROMA_LAYOUT | twgmsl | 色度布局 (非 twgmsl 时走 CPU 标准转换) |
-| SP_ZEROCOPY | 1 | 零拷贝通道 (无 write_and_send 自动回退) |
+| SP_NVBUF_ZEROCOPY | 1 | 完整零拷贝 (V4L2 DMABUF+NvBufSurface; 依赖 so+msgq 补丁, 缺则自动回退) |
+| SP_ZEROCOPY | 1 | NV12 后零拷贝通道 (无 write_and_send 自动回退) |
 | SP_ENABLE_VIC_GMSL | 0 | 实验性 VIC 硬件转换, 默认关 |
 | DISABLE_CUDA_TRANSFORM | 0 | 不要设 1 (那是 USB 摄像头 PC 模式) |

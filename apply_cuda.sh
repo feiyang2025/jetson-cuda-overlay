@@ -114,7 +114,7 @@ else
   CAM_DST_DIR="$REPO_ROOT/tools/webcam"
 fi
 mkdir -p "$CAM_DST_DIR"
-for f in camerad.py v4l2_dmabuf_camera.py v4l2_camera.py camera_cuda.py packed_to_nv12.cu; do
+for f in camerad.py v4l2_dmabuf_camera.py v4l2_camera.py camera_cuda.py packed_to_nv12.cu nvbuf_import.cu; do
   if [ -f "$CAM_DST_DIR/$f" ] && [ "$f" = "camerad.py" ]; then
     cp -f "$CAM_DST_DIR/$f" "$CAM_DST_DIR/$f.orig_openpilot" 2>/dev/null || true
   fi
@@ -127,6 +127,22 @@ if grep -q "V4L2 DMABUF\|v4l2_dmabuf_camera" "$CAM_DST_DIR/camerad.py" 2>/dev/nu
 else
   echo "  [WARN] camerad.py 非 kit 版, 检查 $CAM_DST_DIR/camerad.py"
 fi
+
+# camerad 的 CUDA 辅助 so: 缺才编译 (libpacked_to_nv12.so 必编; libnvbuf_import.so 仅 SP_NVBUF_ZEROCOPY=1 需要, 仍一并编译兜底)
+cd "$CAM_DST_DIR"
+NVCC_BIN="$(command -v nvcc || true)"
+[ -z "$NVCC_BIN" ] && [ -x /usr/local/cuda/bin/nvcc ] && NVCC_BIN=/usr/local/cuda/bin/nvcc
+if [ -z "$NVCC_BIN" ]; then
+  echo "  [WARN] 无 nvcc, 跳过 libpacked_to_nv12.so / libnvbuf_import.so 编译 (camerad 将走 CPU 回退)"
+elif [ ! -f libpacked_to_nv12.so ]; then
+  echo "  + 编译 libpacked_to_nv12.so ..."
+  nvcc -arch=sm_87 -shared -O2 -o libpacked_to_nv12.so packed_to_nv12.cu && echo "    OK" || echo "    [WARN] 编译失败, camerad 走 CPU 回退"
+fi
+if [ -n "$NVCC_BIN" ] && [ ! -f libnvbuf_import.so ]; then
+  echo "  + 编译 libnvbuf_import.so ..."
+  nvcc -arch=sm_87 -shared -O2 -o libnvbuf_import.so nvbuf_import.cu -lcuda && echo "    OK" || echo "    [WARN] 编译失败, SP_NVBUF_ZEROCOPY 将无法启用(其余链路不受影响)"
+fi
+cd "$OVERLAY_DIR"
 
 echo "Applying msgq zerocopy patch (write_and_send + refcount)..."
 MSGQ_PATCH="$OVERLAY_DIR/kits/camerad/msgq/0001-visionipc-zerocopy.patch"

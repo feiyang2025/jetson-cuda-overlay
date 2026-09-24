@@ -63,6 +63,8 @@ WIDE_CAM = os.getenv("WIDE_CAM", "2" if GMSL_WEBCAM else "")
 DRIVER_CAM = os.getenv("DRIVER_CAM")
 USE_NVMM = os.getenv("SP_VISIONIPC_NVMM", "0") == "1"
 USE_V4L2 = os.getenv("USE_V4L2_CAMERA", "1" if platform.system() != "Darwin" else "0") == "1"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 def _find_repo_root():
   """自适应 repo 根: 兼容老布局(<root>/tools/webcam)与新布局(<root>/openpilot/system/camerad/webcam)。"""
   p = Path(__file__).resolve()
@@ -185,6 +187,8 @@ class CudaUyvyConverter:
         # 零拷贝入口: 直接写到设备指针, 不 D2H
         self._packed.packed_to_nv12_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
         self._packed.packed_to_nv12_device.restype = ctypes.c_int
+        self._packed.packed_to_nv12_device_to_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        self._packed.packed_to_nv12_device_to_device.restype = ctypes.c_int
         self.nv12_cpu = np.zeros(self.nv12_size, dtype=np.uint8)
         self._use_cuda = True
         print(f"[CudaUyvyConverter] packed CUDA kernel OK: {width}x{height}", flush=True)
@@ -277,6 +281,18 @@ class CudaUyvyConverter:
       return False
     return True
 
+  def convert_device_to_device(self, src_device_ptr, dst_device_ptr):
+    """完整零拷贝: packed 源和 NV12 目标都在 CUDA device pointer 上。"""
+    if self._packed is None:
+      return False
+    ret = self._packed.packed_to_nv12_device_to_device(ctypes.c_void_p(src_device_ptr),
+                                                       ctypes.c_void_p(dst_device_ptr),
+                                                       self.W, self.H)
+    if ret != 0:
+      print(f"[CUDA] packed_to_nv12_device_to_device failed ret={ret}", flush=True)
+      return False
+    return True
+
 
 class Camerad:
   def __init__(self):
@@ -289,19 +305,43 @@ class Camerad:
     # 零拷贝: stream_type -> (host_ptr -> device_ptr) 缓存
     self._devptr_cache = {}
     self._zerocopy = os.environ.get('SP_ZEROCOPY', '1') == '1'
+    self._nvbuf_zerocopy = os.environ.get('SP_NVBUF_ZEROCOPY', '0') == '1'
+    self._src_devptr = {}
+    self._staging_devptr = {}   # stream_type -> CUDA 暂存 NV12 device ptr
+    self._staging_size = {}     # stream_type -> NV12 staging 字节数
     self._cudart = None
-    if self._zerocopy:
+    self._cuda = None
+    if self._zerocopy or self._nvbuf_zerocopy:
       try:
         self._cudart = ctypes.CDLL('libcudart.so')
         self._cudart.cudaHostGetDevicePointer.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
         self._cudart.cudaHostGetDevicePointer.restype = ctypes.c_int
+        self._cudart.cudaMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+        self._cudart.cudaMalloc.restype = ctypes.c_int
+        self._cudart.cudaMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        self._cudart.cudaMemcpy.restype = ctypes.c_int
+        if self._nvbuf_zerocopy:
+          # libnvbuf_import.so 部署位候选(与 packed_so 同规则)
+          _imp_candidates = [
+            Path(__file__).resolve().parent / 'libnvbuf_import.so',
+            REPO_ROOT / 'tools' / 'webcam' / 'libnvbuf_import.so',
+            REPO_ROOT / 'openpilot' / 'tools' / 'webcam' / 'libnvbuf_import.so',
+          ]
+          _imp_so = next((c for c in _imp_candidates if c.exists()), None)
+          if _imp_so is None:
+            raise RuntimeError("libnvbuf_import.so not found in any deploy location")
+          self._nvbuf_import = ctypes.CDLL(str(_imp_so))
+          self._nvbuf_import.nvbuf_import_fd.argtypes = [ctypes.c_int, ctypes.c_ulonglong, ctypes.POINTER(ctypes.c_ulonglong)]
+          self._nvbuf_import.nvbuf_import_fd.restype = ctypes.c_int
       except Exception as e:
         print(f"[camerad] zerocopy disabled, cudart load failed: {e}", flush=True)
         self._zerocopy = False
+        self._nvbuf_zerocopy = False
 
-    if self._zerocopy and not hasattr(self.vipc_server, 'write_and_send'):
+    if (self._zerocopy or self._nvbuf_zerocopy) and not hasattr(self.vipc_server, 'write_and_send'):
       print("[camerad] msgq visionipc 无 write_and_send(目标 fork 未打零拷贝补丁), 回退主机路径", flush=True)
       self._zerocopy = False
+      self._nvbuf_zerocopy = False
 
     if self.use_v4l2:
       try:
@@ -327,6 +367,15 @@ class Camerad:
       print(f"[camerad] camera={c.msg_name} device={cam_device} size={cam.W}x{cam.H} vic={vic_enabled} dmabuf={use_dmabuf}", flush=True)
       if self.use_v4l2 and not vic_enabled:
         self.converters[c.stream_type] = CudaUyvyConverter(cam.W, cam.H)
+      if self._nvbuf_zerocopy:
+        stage = ctypes.c_void_p()
+        nv12_size = cam.W * cam.H * 3 // 2
+        r = self._cudart.cudaMalloc(ctypes.byref(stage), nv12_size)
+        if r != 0 or not stage.value:
+          raise RuntimeError(f"cudaMalloc staging failed r={r}")
+        self._staging_devptr[c.stream_type] = stage.value
+        self._staging_size[c.stream_type] = nv12_size
+        print(f"[camerad] staging NV12 device ptr {c.stream_type}: {stage.value:#x} size={nv12_size}", flush=True)
 
     # Initialize frame sync barrier
     n_v4l2 = len([c for c in self.cameras if self.use_v4l2])
@@ -365,6 +414,57 @@ class Camerad:
     except Exception as e:
       print(f"[camerad] zerocopy fill failed: {e}", flush=True)
       return False
+    self._publish_camera_state(frame_id, pub_type, timestamp_sof, timestamp_eof)
+    return True
+
+  def _import_nvbuf(self, dmabuf_fd, size):
+    dptr = self._src_devptr.get(dmabuf_fd)
+    if dptr is not None:
+      return dptr
+    fd2 = os.dup(dmabuf_fd)
+    dev = ctypes.c_ulonglong()
+    rc = self._nvbuf_import.nvbuf_import_fd(fd2, size, ctypes.byref(dev))
+    if rc != 0 or not dev.value:
+      raise RuntimeError(f"nvbuf_import_fd failed fd={dmabuf_fd} rc={rc}")
+    self._src_devptr[dmabuf_fd] = dev.value
+    return dev.value
+
+  def _send_nv12_nvbuf(self, vision_buf, converter, frame_id, pub_type, yuv_type, timestamp_sof=0, timestamp_eof=0):
+    if timestamp_eof <= 0:
+      timestamp_eof = timestamp_sof if timestamp_sof > 0 else int(time.monotonic_ns())
+    staging = self._staging_devptr.get(yuv_type)
+    if staging is None:
+      raise RuntimeError(f"no staging buffer for {yuv_type}")
+    try:
+      # 第一步：kernel 把相机 buffer 直接转换到独立暂存区（这是唯一读相机 buffer 的时刻）。
+      src = self._import_nvbuf(vision_buf.fd, os.fstat(vision_buf.fd).st_size)
+      if not converter.convert_device_to_device(src, staging):
+        raise RuntimeError("convert_device_to_device failed")
+    finally:
+      # 相机 buffer 用完立刻归还，不等 VisionIPC。
+      if vision_buf.v4l2_index is not None:
+        for cam in self.cameras:
+          if getattr(cam, "stream_type", None) == yuv_type and hasattr(getattr(cam, "cam", None), "_requeue_buffer"):
+            cam.cam._requeue_buffer(vision_buf.v4l2_index)
+            break
+
+    # 第二步：把暂存区 NV12 D2D 拷进 VisionIPC 自己的 device ptr，然后发送。
+    def fill(dst):
+      host_ptr = dst.ctypes.data
+      cache = self._devptr_cache.setdefault(yuv_type, {})
+      dptr = cache.get(host_ptr)
+      if dptr is None:
+        d = ctypes.c_void_p()
+        rc = self._cudart.cudaHostGetDevicePointer(ctypes.byref(d), ctypes.c_void_p(host_ptr), 0)
+        if rc != 0 or not d.value:
+          raise RuntimeError(f"cudaHostGetDevicePointer rc={rc}")
+        dptr = d.value
+        cache[host_ptr] = dptr
+      rc = self._cudart.cudaMemcpy(dptr, staging, converter.nv12_size, 3)  # 3 = cudaMemcpyDeviceToDevice; 2 是 DeviceToHost 会写错地方
+      if rc != 0:
+        raise RuntimeError(f"staging D2D copy failed rc={rc}")
+
+    self.vipc_server.write_and_send(yuv_type, fill, frame_id, timestamp_sof, timestamp_eof)
     self._publish_camera_state(frame_id, pub_type, timestamp_sof, timestamp_eof)
     return True
 
@@ -417,30 +517,61 @@ class Camerad:
     frame_interval = 1.0 / target_fps
     if self.use_v4l2:
       in_count = 0
+      # nvbuf 零拷贝模式下 read_frame 的 data=None 分支(770行)不归还相机 buffer,
+      # 归还点只剩 _send_nv12_nvbuf 的 finally → 丢帧 continue / 异常降级空转 都会漏还,
+      # 4 块 buffer 在 ~0.4s (12帧) 内被扣死 → DQBUF 永久 BlockingIOError。
+      # 兜底: 每帧 try/finally, 除 _send_nv12_nvbuf 已归还外, 一律补还。
+      cam_nvbuf = bool(getattr(getattr(cam, "cam", None), "_nvbuf_zerocopy", False))
       for vision_buf in cam.read_frames():
         in_count += 1
-        if in_count % 3 == 0:
-          continue  # 丢弃第 3 帧: 不进 FrameSync, 不占 VisionIPC buffer
-        # Frame sync: road 致密发号(丢帧统计依赖), wide 跟随 road 最新号
-        if cam.cam_type_state == "roadCameraState":
-          sync_frame_id = g_frame_sync.claim()
-        elif g_frame_sync.n_cameras > 1:
-          sync_frame_id = g_frame_sync.follow()
-        else:
-          sync_frame_id = g_frame_sync.wait()
-        converter = self.converters.get(cam.stream_type)
-        sent = False
-        if self._zerocopy and converter is not None and converter._packed is not None and vision_buf is not None and vision_buf.data is not None:
-          raw = np.frombuffer(vision_buf.data, dtype=np.uint8)
-          sent = self._send_nv12_zerocopy(raw, converter, sync_frame_id, cam.cam_type_state, cam.stream_type, vision_buf.timestamp_sof, vision_buf.timestamp_eof)
-          if not sent and not getattr(self, '_zc_warned', False):
-            print("[camerad] zerocopy send failed, falling back to host path", flush=True)
-            self._zc_warned = True
-            self._zerocopy = False
-        if not sent:
-          nv12 = self._vision_buf_to_nv12(cam, vision_buf)
-          if nv12 is not None:
-            self._send_nv12(nv12, sync_frame_id, cam.cam_type_state, cam.stream_type, vision_buf.timestamp_sof, vision_buf.timestamp_eof)
+        requeued = False
+        try:
+          if in_count % 3 == 0:
+            continue  # 丢弃第 3 帧: 不进 FrameSync, 不占 VisionIPC buffer(相机 buffer 由 finally 兜底归还)
+          # Frame sync: road 致密发号(丢帧统计依赖), wide 跟随 road 最新号
+          if cam.cam_type_state == "roadCameraState":
+            sync_frame_id = g_frame_sync.claim()
+          elif g_frame_sync.n_cameras > 1:
+            sync_frame_id = g_frame_sync.follow()
+          else:
+            sync_frame_id = g_frame_sync.wait()
+          converter = self.converters.get(cam.stream_type)
+          sent = False
+          if self._nvbuf_zerocopy and converter is not None and cam_nvbuf:
+            try:
+              sent = self._send_nv12_nvbuf(vision_buf, converter, sync_frame_id, cam.cam_type_state, cam.stream_type, vision_buf.timestamp_sof, vision_buf.timestamp_eof)
+              self._nvbuf_fail = 0
+            except Exception as e:
+              # staging 方案下失败极罕见(import/convert/memcpy), 单帧跳过重试即可,
+              # 不轻易整体降级(降级后 read_frame 仍走 data=None, 发送链全空, 需重启恢复)。
+              self._nvbuf_fail = getattr(self, '_nvbuf_fail', 0) + 1
+              if self._nvbuf_fail >= 10:
+                print(f"[camerad] nvbuf zerocopy failed {self._nvbuf_fail}x consecutively, disabling: {e}", flush=True)
+                self._nvbuf_zerocopy = False
+              else:
+                print(f"[camerad] nvbuf zerocopy frame skipped ({self._nvbuf_fail}x): {e}", flush=True)
+            finally:
+              requeued = True  # _send_nv12_nvbuf 的 finally 已归还(成功或异常都会执行)
+          if (not sent) and self._zerocopy and converter is not None and converter._packed is not None and vision_buf is not None and vision_buf.data is not None:
+            raw = np.frombuffer(vision_buf.data, dtype=np.uint8)
+            sent = self._send_nv12_zerocopy(raw, converter, sync_frame_id, cam.cam_type_state, cam.stream_type, vision_buf.timestamp_sof, vision_buf.timestamp_eof)
+            if not sent and not getattr(self, '_zc_warned', False):
+              print("[camerad] zerocopy send failed, falling back to host path", flush=True)
+              self._zc_warned = True
+              self._zerocopy = False
+          if not sent:
+            nv12 = self._vision_buf_to_nv12(cam, vision_buf)
+            if nv12 is not None:
+              self._send_nv12(nv12, sync_frame_id, cam.cam_type_state, cam.stream_type, vision_buf.timestamp_sof, vision_buf.timestamp_eof)
+        finally:
+          # 相机 buffer 归还兜底: 丢帧/降级空转时 _send_nv12_nvbuf 未被调用, 靠这里补还;
+          # 已走 _send_nv12_nvbuf 的帧不重复还(避免同一 index 双 QBUF 乱序)。
+          # 非 nvbuf 模式 read_frame 内部已归还(mmap/VIC 分支), 这里不碰。
+          if cam_nvbuf and not requeued and vision_buf is not None and vision_buf.v4l2_index is not None:
+            try:
+              cam.cam._requeue_buffer(vision_buf.v4l2_index)
+            except Exception as e:
+              print(f"[camerad] requeue failed idx={vision_buf.v4l2_index}: {e}", flush=True)
       # 无 sleep: 以传感器原速 30fps 消费, 每 3 帧交付 2 帧 = 精确 20fps。
       # 输出节奏锁定 VI 的 33.3ms 硬件网格 (66.7ms 双步), 零拍频零积压。
     else:
