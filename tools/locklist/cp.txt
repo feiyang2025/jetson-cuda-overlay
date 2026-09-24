@@ -1,0 +1,20 @@
+# 锁定清单 — cp (ajouatom, egpucp 分支)
+# 模板: 填入 cp 自己的适配文件 (git 相对路径), 上游动了它们脚本会 STOP
+# 参考 sp 清单 tools/locklist/sunnypilot-cuda.txt 的类别:
+#   camerad kit / modeld kit / SConstruct / 本地散改 / 其他适配
+
+# --- camerad ---
+# tools/webcam/camerad.py
+# tools/webcam/v4l2_dmabuf_camera.py
+# tools/webcam/packed_to_nv12.cu
+
+# --- modeld (cp 是 precompiled 体系 + usbgpu 逻辑, 和 sp 不同!) ---
+# selfdrive/modeld/modeld.py
+# selfdrive/modeld/tensorrt_policy_runner.py
+# selfdrive/modeld/helpers.py
+
+# --- 构建 ---
+# SConstruct
+
+# --- 本地散改 / 其他适配 ---
+# (补丁有落档的在这里登记)

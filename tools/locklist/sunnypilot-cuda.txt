@@ -1,0 +1,29 @@
+# 锁定清单 — sunnypilot-cuda (AGXOrin 分支)
+# 格式: git 相对路径, 每行一个, # 开头为注释
+# 上游 (upstream/$UPSTREAM_BRANCH) 动了这些文件时必须人工决策, 脚本会 STOP
+# 更新方式: 吸收上游改动 -> 改 kits/ 补丁 -> 本清单也同步更新
+
+# --- camerad kit (kits/camerad/, 跨分支自适应版) ---
+tools/webcam/camerad.py
+tools/webcam/v4l2_dmabuf_camera.py
+tools/webcam/v4l2_camera.py
+tools/webcam/camera_cuda.py
+tools/webcam/packed_to_nv12.cu
+
+# --- modeld kit (kits/modeld/, TRT 兜底闭环) ---
+selfdrive/modeld/modeld.py
+selfdrive/modeld/modeld_bigcombo.py
+selfdrive/modeld/runners/tensorrt_runner.py
+selfdrive/modeld/transforms/cuda_transform.cu
+selfdrive/modeld/transforms/cuda_transform.h
+
+# --- 构建与副产物 ---
+SConstruct
+
+# --- 本地散改 (patches/ 有落档, git 操作会冲掉) ---
+sunnypilot/selfdrive/controls/lib/longitudinal_planner.py
+
+# --- 其他适配 ---
+system/sensord/ch347t.cc
+system/sensord/ch347t.py
+system/manager/manager.py
