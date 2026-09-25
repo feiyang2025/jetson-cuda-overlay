@@ -8,11 +8,37 @@ import numpy as np
 from pathlib import Path
 from collections import namedtuple
 
-from msgq.visionipc import VisionIpcServer, VisionStreamType
+from msgq.visionipc import VisionIpcServer
+try:
+  from msgq.visionipc import VisionStreamType
+  _VST_ROAD = VisionStreamType.VISION_STREAM_ROAD
+  _VST_DRIVER = VisionStreamType.VISION_STREAM_DRIVER
+  _VST_WIDE_ROAD = VisionStreamType.VISION_STREAM_WIDE_ROAD
+  _HAS_VST = True
+except ImportError:
+  # 无类型 msgq (新代, master-c3 系): VisionStreamType 只是 uint32, 无数值常量;
+  # 数值与 sp 系枚举一致 (visionbuf.h: ROAD=0 DRIVER=1 WIDE_ROAD=2)，kit 内部自洽
+  _VST_ROAD, _VST_DRIVER, _VST_WIDE_ROAD = 0, 1, 2
+  _HAS_VST = False
+# Venus 对齐输出: master-c3 系 modeld 按 get_nv12_info 对齐 stride 读输入, 必须对齐输出;
+# sp/cp 系 modeld 按紧密 stride 读. 默认 = 无 VisionStreamType(新代 msgq) 对齐; env CAM_STRIDE=aligned/tight 可强制
+_ALIGNED = (os.environ.get('CAM_STRIDE', 'auto') == 'aligned') or (os.environ.get('CAM_STRIDE', 'auto') == 'auto' and not _HAS_VST)
 try:
   from openpilot.cereal import messaging
 except ImportError:
   from cereal import messaging
+try:
+  from openpilot.cereal import log as _cereal_log
+except ImportError:
+  from cereal import log as _cereal_log
+
+# 相机消息名按 cereal schema 自适应:
+#   sp 系: roadCameraState + wideRoadCameraState + driverCameraState
+#   master-c3 系: narrowRoadCameraState + wideRoadCameraState + cabinCameraState
+_EV_FIELDS = set(_cereal_log.Event.schema.fields.keys())
+_MSG_ROAD = 'roadCameraState' if 'roadCameraState' in _EV_FIELDS else 'narrowRoadCameraState'
+_MSG_WIDE = 'wideRoadCameraState' if 'wideRoadCameraState' in _EV_FIELDS else None
+_MSG_DRIVER = 'driverCameraState' if 'driverCameraState' in _EV_FIELDS else ('cabinCameraState' if 'cabinCameraState' in _EV_FIELDS else None)
 
 
 # ---------------------------------------------------------------------------
@@ -96,12 +122,12 @@ def _normalize_cam_id(cam_id):
 
 def _build_cameras():
   cameras = [
-    CameraType("roadCameraState", VisionStreamType.VISION_STREAM_ROAD, _normalize_cam_id(ROAD_CAM)),
+    CameraType(_MSG_ROAD, _VST_ROAD, _normalize_cam_id(ROAD_CAM)),
   ]
-  if WIDE_CAM:
-    cameras.append(CameraType("wideRoadCameraState", VisionStreamType.VISION_STREAM_WIDE_ROAD, _normalize_cam_id(WIDE_CAM)))
-  if DRIVER_CAM:
-    cameras.append(CameraType("driverCameraState", VisionStreamType.VISION_STREAM_DRIVER, _normalize_cam_id(DRIVER_CAM)))
+  if WIDE_CAM and _MSG_WIDE:
+    cameras.append(CameraType(_MSG_WIDE, _VST_WIDE_ROAD, _normalize_cam_id(WIDE_CAM)))
+  if DRIVER_CAM and _MSG_DRIVER:
+    cameras.append(CameraType(_MSG_DRIVER, _VST_DRIVER, _normalize_cam_id(DRIVER_CAM)))
 
   non_empty_ids = [c.cam_id for c in cameras if c.cam_id not in (None, "")]
   if len(non_empty_ids) > 1 and len(set(non_empty_ids)) == 1 and not GMSL_WEBCAM:
@@ -165,9 +191,18 @@ def _packed_yuv_to_nv12(yuv_data, width, height, pixel_format='UYVY'):
 
 
 class CudaUyvyConverter:
-  def __init__(self, width, height, src_w=1920, src_h=1080):
+  def __init__(self, width, height, src_w=1920, src_h=1080, dst_stride=None, y_plane_rows=None):
     self.W = width
     self.H = height
+    self.dst_stride = dst_stride if dst_stride is not None else width
+    self.y_plane_rows = y_plane_rows if y_plane_rows is not None else height
+    if self.dst_stride != width:
+      # Venus 对齐 buffer 总大小 (与 master-c3 get_nv12_info 一致)
+      uvh = ((height // 2 + 15) // 16) * 16
+      s = self.dst_stride * self.y_plane_rows + self.dst_stride * uvh + 4096 + max(16 * 1024, 8 * self.dst_stride)
+      self.aligned_size = ((s + 4095) // 4096) * 4096
+    else:
+      self.aligned_size = None
     self.src_w = src_w      # 源 packed 采集尺寸 (NvBufSurface, 1920x1080)
     self.src_h = src_h
     # cp 适配开关 (env): SP_CAM_FLIP=1 180°翻转; SP_CHROMA_SWAP=1 色度 U/V 交换
@@ -198,7 +233,7 @@ class CudaUyvyConverter:
         self._packed.packed_to_nv12_device_to_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
         self._packed.packed_to_nv12_device_to_device.restype = ctypes.c_int
         # resize+flip 零拷贝 (cp 链路: 1920x1080 源 → 1344x760 输出, 双线性)
-        self._packed.packed_to_nv12_resize_device_to_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        self._packed.packed_to_nv12_resize_device_to_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
         self._packed.packed_to_nv12_resize_device_to_device.restype = ctypes.c_int
         self.nv12_cpu = np.zeros(self.nv12_size, dtype=np.uint8)
         self._use_cuda = True
@@ -306,9 +341,10 @@ class CudaUyvyConverter:
 
   def convert_resize_device_to_device(self, src_device_ptr, dst_device_ptr,
                                       src_w=None, src_h=None, dst_w=None, dst_h=None,
-                                      flip=None, chroma_swap=None):
+                                      flip=None, chroma_swap=None, dst_stride=None, y_plane_rows=None):
     """resize+flip 零拷贝: 源采集尺寸 → 目标输出尺寸 (cp 链路: 1920x1080 → 1344x760)。
-    参数缺省取 self 的构造值(env 可配)。flip=1 时 180°翻转, chroma_swap=1 时 U/V 交换。"""
+    参数缺省取 self 的构造值(env 可配)。flip=1 时 180°翻转, chroma_swap=1 时 U/V 交换。
+    dst_stride/y_plane_rows: 对齐输出时传入 (Venus 布局), 缺省紧密 (stride=W, rows=H)。"""
     if self._packed is None:
       return False
     sw = src_w if src_w is not None else self.src_w
@@ -317,10 +353,13 @@ class CudaUyvyConverter:
     dh = dst_h if dst_h is not None else self.H
     fl = self.flip if flip is None else flip
     cs = self.chroma_swap if chroma_swap is None else chroma_swap
+    st = dst_stride if dst_stride is not None else self.dst_stride
+    yr = y_plane_rows if y_plane_rows is not None else self.y_plane_rows
     ret = self._packed.packed_to_nv12_resize_device_to_device(ctypes.c_void_p(src_device_ptr),
                                                               ctypes.c_void_p(dst_device_ptr),
                                                               sw, sh, dw, dh,
-                                                              1 if fl else 0, 1 if cs else 0)
+                                                              1 if fl else 0, 1 if cs else 0,
+                                                              st, yr)
     if ret != 0:
       print(f"[CUDA] packed_to_nv12_resize_device_to_device failed ret={ret} {sw}x{sh}->{dw}x{dh}", flush=True)
       return False
@@ -394,17 +433,33 @@ class Camerad:
       cam_device = f"/dev/video{c.cam_id}" if platform.system() != "Darwin" else c.cam_id
       cam = Camera(c.msg_name, c.stream_type, cam_device)
       self.cameras.append(cam)
+      out_w = int(os.environ.get('CAM_WIDTH', cam.W))
+      out_h = int(os.environ.get('CAM_HEIGHT', cam.H))
+      _st = out_w
+      _yh = out_h
       # 20 个共享 buffer: 配合 refcount 同步 (server 写前等 ref_count==0),
       # 轮转周期 1s @20fps, 消除读写竞争撕裂; modeld/UI 慢时 camerad 限流而非撕裂。
-      self.vipc_server.create_buffers(c.stream_type, 20, cam.W, cam.H)
+      if _ALIGNED:
+        # Venus 对齐布局 (master-c3 系 modeld 按 get_nv12_info stride 读): stride=align(w,128), y=align(h,32), uv=align(h/2,16)
+        _st = ((out_w + 127) // 128) * 128
+        _yh = ((out_h + 31) // 32) * 32
+        _uvh = ((out_h // 2 + 15) // 16) * 16
+        _size = _st * _yh + _st * _uvh + 4096 + max(16 * 1024, 8 * _st)
+        _size = ((_size + 4095) // 4096) * 4096
+        self.vipc_server.create_buffers_with_sizes(c.stream_type, 20, out_w, out_h, _size, _st, _st * _yh)
+        print(f"[camerad] {c.msg_name}: aligned NV12 stride={_st} y_rows={_yh} size={_size}", flush=True)
+      else:
+        self.vipc_server.create_buffers(c.stream_type, 20, out_w, out_h)
       vic_enabled = getattr(getattr(cam, 'cam', None), '_vic', False)
       use_dmabuf = getattr(getattr(cam, 'cam', None), '_use_dmabuf', False)
-      print(f"[camerad] camera={c.msg_name} device={cam_device} size={cam.W}x{cam.H} vic={vic_enabled} dmabuf={use_dmabuf}", flush=True)
+      print(f"[camerad] camera={c.msg_name} device={cam_device} size={out_w}x{out_h} src={cam.W}x{cam.H} vic={vic_enabled} dmabuf={use_dmabuf}", flush=True)
       if self.use_v4l2 and not vic_enabled:
-        self.converters[c.stream_type] = CudaUyvyConverter(cam.W, cam.H)
+        # 源尺寸 = 相机实际采集尺寸, 输出尺寸 = CAM_WIDTH/CAM_HEIGHT (可配, 如 1344x760)
+        self.converters[c.stream_type] = CudaUyvyConverter(out_w, out_h, src_w=cam.W, src_h=cam.H,
+                                                           dst_stride=(_st if _ALIGNED else out_w), y_plane_rows=(_yh if _ALIGNED else out_h))
       if self._nvbuf_zerocopy:
         stage = ctypes.c_void_p()
-        nv12_size = cam.W * cam.H * 3 // 2
+        nv12_size = out_w * out_h * 3 // 2
         r = self._cudart.cudaMalloc(ctypes.byref(stage), nv12_size)
         if r != 0 or not stage.value:
           raise RuntimeError(f"cudaMalloc staging failed r={r}")
@@ -421,7 +476,20 @@ class Camerad:
   def _send_nv12(self, nv12_data, frame_id, pub_type, yuv_type, timestamp_sof=0, timestamp_eof=0):
     if timestamp_eof <= 0:
       timestamp_eof = timestamp_sof if timestamp_sof > 0 else int(time.monotonic_ns())
-    self.vipc_server.send(yuv_type, nv12_data, frame_id, timestamp_sof, timestamp_eof)
+    data = nv12_data
+    cv = self.converters.get(yuv_type)
+    if _ALIGNED and cv is not None and cv.aligned_size is not None:
+      # 紧密 NV12 → Venus 对齐布局 (master-c3 modeld 按 stride 读): 每行补 padding
+      st, yr, h, w = cv.dst_stride, cv.y_plane_rows, cv.H, cv.W
+      buf = np.zeros(cv.aligned_size, dtype=np.uint8)
+      for i in range(h):
+        buf[i * st:i * st + w] = nv12_data[i * w:(i + 1) * w]
+      src = nv12_data[w * h:]
+      off = yr * st
+      for i in range(h // 2):
+        buf[off + i * st:off + i * st + w] = src[i * w:(i + 1) * w]
+      data = buf
+    self.vipc_server.send(yuv_type, data, frame_id, timestamp_sof, timestamp_eof)
     self._publish_camera_state(frame_id, pub_type, timestamp_sof, timestamp_eof)
 
   def _send_nv12_zerocopy(self, raw, converter, frame_id, pub_type, yuv_type, timestamp_sof=0, timestamp_eof=0):
@@ -570,7 +638,7 @@ class Camerad:
           if in_count % 3 == 0:
             continue  # 丢弃第 3 帧: 不进 FrameSync, 不占 VisionIPC buffer(相机 buffer 由 finally 兜底归还)
           # Frame sync: road 致密发号(丢帧统计依赖), wide 跟随 road 最新号
-          if cam.cam_type_state == "roadCameraState":
+          if cam.cam_type_state == _MSG_ROAD:
             sync_frame_id = g_frame_sync.claim()
           elif g_frame_sync.n_cameras > 1:
             sync_frame_id = g_frame_sync.follow()

@@ -3,6 +3,20 @@
 本 kit = VisionIPC 帧 → CUDA transform → TensorRT FP16 推理 → modelV2 (20Hz)。
 兜底闭环从 CP (ajouatom) 的「推理资源兜底闭环」融合而来, 已在 SP 实车验证。
 
+## 适用边界 (2026-09-25 master-c3 实证补充)
+
+- **kit modeld.py (TRT 体系) 依赖 commonmodel_pyx (Cython 模型结构层) + OpenCL clutil 链**。
+  此依赖只在 sp/cp 系树存在; **master-c3 系树没有 commonmodel_pyx 源, msgq 已去 OpenCL
+  (visionipc.pxd 无 cl_device_id/cl_context/cl_mem), 编译不过** → master-c3 用其原生
+  modeld.py (tinygrad pkl 体系) 出 modelV2, 不走 kit TRT。
+- kit modeld.py 已加 master-c3 兼容层 (TICI try/except、msgq VisionStreamType fallback、
+  cereal 双路径、opendbc.car.structs、LAT_SMOOTH_SECONDS 常量、cereal schema 消息名自适应),
+  保证 import 级兼容; 但完整 TRT 推理只在有 commonmodel_pyx 的树可用。
+- **master-c3 模型输入要求 Venus 对齐 NV12** (get_nv12_info: stride=align(w,128) 等):
+  camerad kit 的 _ALIGNED 模式自动输出对齐布局 (见 CAMERAD_CONTRACT), 两者配套。
+- master-c3 原生 modeld 只认编译过的 (cam_w, cam_h): 1928x1208 / 1344x760,
+  输出尺寸必须 CAM_WIDTH/CAM_HEIGHT 设为其中之一 (KeyError: (1920,1080) 坑过)。
+
 ## 边界与输出契约
 
 - 输入: VisionIPC road/wide 帧 (NV12 1920x1080), 零拷贝时直接吃设备指针

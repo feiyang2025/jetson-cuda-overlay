@@ -13,6 +13,12 @@ IMX390 200万像素 -> MAX9295 -> MAX96712 -> MIPI CSI-2 -> Orin VI5 -> twgmsl
   -> VisionIPC 20 buffer + refcount -> cameraState + 帧 buffer 发布
 本 kit 到 VisionIPC 发布为止。modeld 消费侧见 MODELD_KIT。
 
+**相机消息名按 cereal schema 自适应** (2026-09-25 master-c3 实证):
+- sp/cp 系: roadCameraState / wideRoadCameraState / driverCameraState
+- master-c3 系: narrowRoadCameraState / wideRoadCameraState / cabinCameraState
+- camerad.py 运行时查 log.capnp 的 Event schema 字段自动切换, 不要硬编码消息名字符串
+  (坑过: master-c3 没有 roadCameraState, capnp 发布直接崩)
+
 不要用 /dev/video2 当 wide: 没有实际帧, modeld 会一直等 wide 不出 modelV2。
 ```
 
@@ -24,6 +30,13 @@ IMX390 200万像素 -> MAX9295 -> MAX96712 -> MIPI CSI-2 -> Orin VI5 -> twgmsl
   CAM_WIDTH/CAM_HEIGHT (cp 用 1344x760) 或 SP_CAM_OUT_W/SP_CAM_OUT_H,
   resize 由 CUDA kernel 双线性完成; 源尺寸永远用相机实际采集尺寸 (cam_active),
   不能拿输出尺寸建源 surface (会溢出/越界)
+- **输出 NV12 布局自动适配消费侧** (2026-09-25 master-c3 实证添加):
+  - 有 VisionStreamType 的 msgq (sp/cp 系) → 紧密布局 (stride=width), 兼容 sp/cp modeld
+  - 无 VisionStreamType 的 msgq (master-c3 新代) → Venus 对齐布局
+    (stride=align(w,128), y_rows=align(h,32), uv_rows=align(h/2,16), size 按 get_nv12_info 公式),
+    用 create_buffers_with_sizes 创建 + packed_to_nv12_resize kernel 的 dst_stride/y_plane_rows 参数
+    写对齐布局 + send 前每行补 padding 重排; env CAM_STRIDE=aligned/tight 可强制
+  - 判定: 改了 camerad.py 顶部 _ALIGNED 逻辑就是改了这条契约
 - 启动先决: `sudo tw_camera_cfg bring` (serdes 初始化) 必须先于 camerad
 - 内核: twgmsl 是 tegra-capture-vi 老框架 + 第三方驱动, 不是 SIPL
 

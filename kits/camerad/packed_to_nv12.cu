@@ -141,7 +141,8 @@ __device__ __forceinline__ uint8_t _bilinear_chroma(const uint8_t* src, int sw, 
 __global__ void packed_to_nv12_resize_kernel(const uint8_t* __restrict__ src,
                                              uint8_t* __restrict__ dst,
                                              int sw, int sh, int dw, int dh,
-                                             int flip, int chroma_swap) {
+                                             int flip, int chroma_swap,
+                                             int dst_stride, int y_plane_rows) {
   int dx = blockIdx.x * blockDim.x + threadIdx.x;
   int dy = blockIdx.y * blockDim.y + threadIdx.y;
   if (dx >= dw || dy >= dh) return;
@@ -150,7 +151,7 @@ __global__ void packed_to_nv12_resize_kernel(const uint8_t* __restrict__ src,
   float sx = (dx + 0.5f) * (float)sw / (float)dw - 0.5f;
   float sy = (dy + 0.5f) * (float)sh / (float)dh - 0.5f;
   if (flip) { sx = (float)(sw - 1) - sx; sy = (float)(sh - 1) - sy; }
-  dst[dy * dw + dx] = _bilinear_y(src, sw, sh, sx, sy);
+  dst[dy * dst_stride + dx] = _bilinear_y(src, sw, sh, sx, sy);
 
   // UV: 偶数输出行/列各算一对
   if ((dy & 1) == 0 && (dx & 1) == 0) {
@@ -161,21 +162,25 @@ __global__ void packed_to_nv12_resize_kernel(const uint8_t* __restrict__ src,
     if (flip) { ux_src = (float)(sw / 2 - 1) - ux_src; uy_src = (float)(sh - 1) - uy_src; }
     uint8_t u = _bilinear_chroma(src, sw, sh, ux_src, uy_src, 0, chroma_swap);
     uint8_t v = _bilinear_chroma(src, sw, sh, ux_src, uy_src, 1, chroma_swap);
-    uint8_t* uv = dst + dw * dh + uy * dw;
+    // uv 平面偏移 = dst_stride * y_plane_rows (对齐时 y_plane_rows = align(dh,32), 紧密时 = dh)
+    uint8_t* uv = dst + (size_t)dst_stride * y_plane_rows + (size_t)uy * dst_stride;
     uv[ux * 2] = u;
     uv[ux * 2 + 1] = v;
   }
 }
 
 // resize+flip 零拷贝: src 设备指针 (NvBufSurface import) -> dst 设备指针 (VisionIPC)
-// src 尺寸 sw x sh (packed UYVY, sw*sh*2 字节), dst 尺寸 dw x dh (NV12, dw*dh*3/2 字节)
+// src 尺寸 sw x sh (packed UYVY, sw*sh*2 字节), dst 尺寸 dw x dh (NV12)
+// dst_stride: 输出行距 (紧密=dw, Venus 对齐=align(dw,128)); y_plane_rows: y 平面行数 (紧密=dh, 对齐=align(dh,32))
 extern "C" int packed_to_nv12_resize_device_to_device(const uint8_t* src_device, uint8_t* dst_device,
                                                       int sw, int sh, int dw, int dh,
-                                                      int flip, int chroma_swap) {
+                                                      int flip, int chroma_swap,
+                                                      int dst_stride, int y_plane_rows) {
   dim3 block(32, 8);
   dim3 grid((dw + 31) / 32, (dh + 7) / 8);
   packed_to_nv12_resize_kernel<<<grid, block>>>(src_device, dst_device, sw, sh, dw, dh,
-                                                flip ? 1 : 0, chroma_swap ? 1 : 0);
+                                                flip ? 1 : 0, chroma_swap ? 1 : 0,
+                                                dst_stride, y_plane_rows);
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) return 6;
   err = cudaDeviceSynchronize();

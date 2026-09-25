@@ -2,7 +2,11 @@
 import os
 os.environ['LRU'] = '0'  # Disable LRU GPU alloc cache early (tinygrad import reads it)
 import ctypes
-from openpilot.system.hardware import TICI
+try:
+  from openpilot.system.hardware import TICI
+except ImportError:
+  # master-c3 系硬件抽象无 TICI 常量: 非 TICI 平台 → 走 CUDA 路径
+  TICI = False
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 from tinygrad.device import Device
@@ -14,12 +18,36 @@ else:
 import time
 import pickle
 import numpy as np
-import cereal.messaging as messaging
-from cereal import car, log
+try:
+  import openpilot.cereal.messaging as messaging
+  from openpilot.cereal import log
+  from opendbc.car.structs import car
+except ImportError:
+  import cereal.messaging as messaging
+  from cereal import car, log
 from pathlib import Path
 from setproctitle import setproctitle
-from cereal.messaging import PubMaster, SubMaster
-from msgq.visionipc import VisionIpcClient, VisionStreamType, VisionBuf
+try:
+  from openpilot.cereal.messaging import PubMaster, SubMaster
+except ImportError:
+  from cereal.messaging import PubMaster, SubMaster
+from msgq.visionipc import VisionIpcClient, VisionBuf
+try:
+  from msgq.visionipc import VisionStreamType
+  _VST_ROAD = VisionStreamType.VISION_STREAM_ROAD
+  _VST_DRIVER = VisionStreamType.VISION_STREAM_DRIVER
+  _VST_WIDE_ROAD = VisionStreamType.VISION_STREAM_WIDE_ROAD
+except ImportError:
+  # 无类型 msgq (新代, master-c3 系): 数值与 sp 枚举一致, kit 内部自洽
+  _VST_ROAD, _VST_DRIVER, _VST_WIDE_ROAD = 0, 1, 2
+try:
+  from openpilot.cereal import log as _cereal_log
+except ImportError:
+  from cereal import log as _cereal_log
+# cereal schema 自适应 (master-c3: roadCameraState→narrowRoadCameraState, 无 liveCalibration)
+_EV_FIELDS = set(_cereal_log.Event.schema.fields.keys())
+_MSG_ROAD = 'roadCameraState' if 'roadCameraState' in _EV_FIELDS else 'narrowRoadCameraState'
+_MSG_LIVECAL = 'liveCalibration' if 'liveCalibration' in _EV_FIELDS else None
 from opendbc.car.car_helpers import get_demo_car_params
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.params import Params
@@ -40,6 +68,9 @@ TRT_LOAD_RETRY_INTERVAL = float(os.getenv("TRT_LOAD_RETRY_INTERVAL", "2.0"))
 
 PROCESS_NAME = "selfdrive.modeld.modeld"
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
+
+# 兼容 master-c3 系: 原生 modeld.py 导出此常量, controlsd.py import 它
+LAT_SMOOTH_SECONDS = 0.0
 
 DEFAULT_MODEL_DIR = Path(__file__).parent / 'models'
 
@@ -381,14 +412,14 @@ def main(demo=False):
   while True:
     available_streams = VisionIpcClient.available_streams("camerad", block=False)
     if available_streams:
-      use_extra_client = VisionStreamType.VISION_STREAM_WIDE_ROAD in available_streams and VisionStreamType.VISION_STREAM_ROAD in available_streams
-      main_wide_camera = VisionStreamType.VISION_STREAM_ROAD not in available_streams
+      use_extra_client = _VST_WIDE_ROAD in available_streams and _VST_ROAD in available_streams
+      main_wide_camera = _VST_ROAD not in available_streams
       break
     time.sleep(.1)
 
-  vipc_client_main_stream = VisionStreamType.VISION_STREAM_WIDE_ROAD if main_wide_camera else VisionStreamType.VISION_STREAM_ROAD
+  vipc_client_main_stream = _VST_WIDE_ROAD if main_wide_camera else _VST_ROAD
   vipc_client_main = VisionIpcClient("camerad", vipc_client_main_stream, True, cl_context)
-  vipc_client_extra = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_WIDE_ROAD, True, cl_context)
+  vipc_client_extra = VisionIpcClient("camerad", _VST_WIDE_ROAD, True, cl_context)
   cloudlog.warning(f"vision stream set up, main_wide_camera: {main_wide_camera}, use_extra_client: {use_extra_client}")
 
   while not vipc_client_main.connect(False):
@@ -402,7 +433,7 @@ def main(demo=False):
 
   # messaging
   pm = PubMaster(["modelV2", "drivingModelData", "cameraOdometry"])
-  sm = SubMaster(["deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carControl"])
+  sm = SubMaster(["deviceState", "carState", _MSG_ROAD] + ([_MSG_LIVECAL] if _MSG_LIVECAL else []) + ["driverMonitoringState", "carControl"])
 
   publish_state = PublishState()
   params = Params()
@@ -477,12 +508,12 @@ def main(demo=False):
     sm.update(0)
     desire = DH.desire
     is_rhd = sm["driverMonitoringState"].isRHD
-    frame_id = sm["roadCameraState"].frameId
+    frame_id = sm[_MSG_ROAD].frameId
     v_ego = max(sm["carState"].vEgo, 0.)
     lateral_control_params = np.array([v_ego, steer_delay], dtype=np.float32)
-    if sm.updated["liveCalibration"] and sm.seen['roadCameraState'] and sm.seen['deviceState']:
-      device_from_calib_euler = np.array(sm["liveCalibration"].rpyCalib, dtype=np.float32)
-      dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['roadCameraState'].sensor))]
+    if _MSG_LIVECAL and sm.updated[_MSG_LIVECAL] and sm.seen[_MSG_ROAD] and sm.seen['deviceState']:
+      device_from_calib_euler = np.array(sm[_MSG_LIVECAL].rpyCalib, dtype=np.float32)
+      dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm[_MSG_ROAD].sensor))]
       model_transform_main = get_warp_matrix(device_from_calib_euler, dc.ecam.intrinsics if main_wide_camera else dc.fcam.intrinsics, False).astype(np.float32)
       model_transform_extra = get_warp_matrix(device_from_calib_euler, dc.ecam.intrinsics, True).astype(np.float32)
       live_calib_seen = True
