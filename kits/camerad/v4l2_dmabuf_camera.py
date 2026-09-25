@@ -678,14 +678,13 @@ class V4L2Camera:
   def _is_bad_buffer(self, buf):
     return buf.index >= self.num_buffers or (buf.bytesused == 0 and not self._use_dmabuf)
 
-  def _timestamp_ns_or_now(self, buf):
-    timestamp_ns = self._buf_timestamp_ns(buf)
-    if timestamp_ns > 0:
-      return timestamp_ns
-    if not hasattr(self, '_zero_timestamp_seen'):
-      self._zero_timestamp_seen = True
-      print(f"[V4L2Camera] {self.device}: V4L2 timestamp is zero; using monotonic clock for subsequent zero timestamp buffers", flush=True)
-    return time.monotonic_ns()
+  def _timestamp_ns_or_now(self, _buf):
+    # 帧时间戳必须用 openpilot 全链路时钟 (CLOCK_BOOTTIME, 与 logMonoTime/
+    # nanos_since_boot 一致)。twgmsl 驱动的 V4L2 buffer timestamp 不是 BOOTTIME
+    # 体系 (实测快 ~36s): 直接使用会让 cameraOdometry 时间错位, locationd 把
+    # 正确的 IMU 观测判为 "observation too old", 标定永远无法收敛。
+    # 帧间差值 (dt) 仍正确, modeld 的帧率/延迟补偿不受影响。 (cp 实车修复)
+    return int(time.clock_gettime_ns(time.CLOCK_BOOTTIME))
 
   def _note_error_flag(self, buf):
     if (buf.flags & V4L2_BUF_FLAG_ERROR) and not hasattr(self, '_error_flag_seen'):

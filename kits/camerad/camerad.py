@@ -165,9 +165,14 @@ def _packed_yuv_to_nv12(yuv_data, width, height, pixel_format='UYVY'):
 
 
 class CudaUyvyConverter:
-  def __init__(self, width, height):
+  def __init__(self, width, height, src_w=1920, src_h=1080):
     self.W = width
     self.H = height
+    self.src_w = src_w      # 源 packed 采集尺寸 (NvBufSurface, 1920x1080)
+    self.src_h = src_h
+    # cp 适配开关 (env): SP_CAM_FLIP=1 180°翻转; SP_CHROMA_SWAP=1 色度 U/V 交换
+    self.flip = os.environ.get('SP_CAM_FLIP', '0') == '1'
+    self.chroma_swap = os.environ.get('SP_CHROMA_SWAP', '0') == '1'
     self.uyvy_size = width * height * 2
     self.nv12_size = width * height * 3 // 2
     self.stride = width * 2
@@ -192,6 +197,9 @@ class CudaUyvyConverter:
         self._packed.packed_to_nv12_device.restype = ctypes.c_int
         self._packed.packed_to_nv12_device_to_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
         self._packed.packed_to_nv12_device_to_device.restype = ctypes.c_int
+        # resize+flip 零拷贝 (cp 链路: 1920x1080 源 → 1344x760 输出, 双线性)
+        self._packed.packed_to_nv12_resize_device_to_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        self._packed.packed_to_nv12_resize_device_to_device.restype = ctypes.c_int
         self.nv12_cpu = np.zeros(self.nv12_size, dtype=np.uint8)
         self._use_cuda = True
         print(f"[CudaUyvyConverter] packed CUDA kernel OK: {width}x{height}", flush=True)
@@ -293,6 +301,28 @@ class CudaUyvyConverter:
                                                        self.W, self.H)
     if ret != 0:
       print(f"[CUDA] packed_to_nv12_device_to_device failed ret={ret}", flush=True)
+      return False
+    return True
+
+  def convert_resize_device_to_device(self, src_device_ptr, dst_device_ptr,
+                                      src_w=None, src_h=None, dst_w=None, dst_h=None,
+                                      flip=None, chroma_swap=None):
+    """resize+flip 零拷贝: 源采集尺寸 → 目标输出尺寸 (cp 链路: 1920x1080 → 1344x760)。
+    参数缺省取 self 的构造值(env 可配)。flip=1 时 180°翻转, chroma_swap=1 时 U/V 交换。"""
+    if self._packed is None:
+      return False
+    sw = src_w if src_w is not None else self.src_w
+    sh = src_h if src_h is not None else self.src_h
+    dw = dst_w if dst_w is not None else self.W
+    dh = dst_h if dst_h is not None else self.H
+    fl = self.flip if flip is None else flip
+    cs = self.chroma_swap if chroma_swap is None else chroma_swap
+    ret = self._packed.packed_to_nv12_resize_device_to_device(ctypes.c_void_p(src_device_ptr),
+                                                              ctypes.c_void_p(dst_device_ptr),
+                                                              sw, sh, dw, dh,
+                                                              1 if fl else 0, 1 if cs else 0)
+    if ret != 0:
+      print(f"[CUDA] packed_to_nv12_resize_device_to_device failed ret={ret} {sw}x{sh}->{dw}x{dh}", flush=True)
       return False
     return True
 

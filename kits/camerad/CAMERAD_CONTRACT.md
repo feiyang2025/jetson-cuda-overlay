@@ -44,6 +44,10 @@ V = raw[3::4]
 ## 输出契约 (下游 modeld/UI 都按这个吃)
 
 - 20fps 节流: 30fps 源每 3 帧交付 2 帧, 无 sleep 无拍频
+- **帧时间戳必须用 CLOCK_BOOTTIME** (openpilot 全链路时钟, 与 logMonoTime/nanos_since_boot
+  一致)。twgmsl 的 V4L2 buffer timestamp 不是 BOOTTIME 体系 (实测快 ~36s): 直接使用会让
+  cameraOdometry 时间错位, locationd 把正确的 IMU 观测判为 "observation too old",
+  标定永远无法收敛。帧间差值 dt 仍正确, modeld 帧率/延迟补偿不受影响。(cp 实车修复)
 - frame_id: road 致密递增发号 (modeld 丢帧统计只看主镜头 id, 不能跳号), wide 跟随配对
 - 20 个共享 buffer + refcount (客户端 recv acquire / 用完 release) — 撕裂根因是 4 buffer + 无同步, 已修
 - 零拷贝两级 (camerad.py 读 env, 任一不满足自动回退, 不影响出图):
@@ -97,4 +101,6 @@ fork 本地版 = 单分支直连 (import 写死)。**不要用 fork 本地版替
 | SP_NVBUF_ZEROCOPY | 1 | 完整零拷贝 (V4L2 DMABUF+NvBufSurface; 依赖 so+msgq 补丁, 缺则自动回退) |
 | SP_ZEROCOPY | 1 | NV12 后零拷贝通道 (无 write_and_send 自动回退) |
 | SP_ENABLE_VIC_GMSL | 0 | 实验性 VIC 硬件转换, 默认关 |
+| SP_CAM_FLIP | 0 | 1=180° 翻转 (cp 相机倒装用, resize kernel 双线性) |
+| SP_CHROMA_SWAP | 0 | 1=U/V 交换 (个别相机色度布局差异) |
 | DISABLE_CUDA_TRANSFORM | 0 | 不要设 1 (那是 USB 摄像头 PC 模式) |
