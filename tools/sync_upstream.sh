@@ -66,8 +66,12 @@ if [ -z "$BASELINE" ]; then
   [ -f "$BASELINE_FILE" ] && BASELINE="$(cat "$BASELINE_FILE")"
 fi
 if [ -z "$BASELINE" ]; then
-  echo "首次同步? 基线取当前 HEAD, 等于"从今天开始锁"。" >&2
-  BASELINE="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  echo "首次同步没有基线文件。" >&2
+  echo "  基线 = 上次被吸收的上游 commit; 不能用适配 commit 本身" >&2
+  echo "  (它含本地适配改动, diff 基线..上游 会把自家改动误报为上游改动)。" >&2
+  echo "  推荐: --baseline HEAD~1 (= 适配 commit 的父, 即上游原版)" >&2
+  echo "  当前 HEAD 父: $(git -C "$REPO_ROOT" rev-parse HEAD~1 2>/dev/null || echo N/A)" >&2
+  exit 1
 fi
 echo "   基线: ${BASELINE:0:12}"
 git -C "$REPO_ROOT" cat-file -e "$BASELINE^{commit}" 2>/dev/null || fail "基线 SHA 无效: $BASELINE"
@@ -105,8 +109,10 @@ echo "  [OK] 上游未动锁定文件 ($(printf '%s' "$U" | grep -c .) 个文件
 # --- 6. merge + 重放 + 自检 ---
 echo "  merging upstream/$UPSTREAM_BRANCH ..."
 git merge "upstream/$UPSTREAM_BRANCH" --no-edit || fail "merge 冲突! 人工解决后: git merge --continue, 再重跑本脚本做 apply+自检"
-git rev-parse HEAD > .overlay_baseline
-echo "  + 基线已更新: $(git rev-parse --short HEAD)"
+# 基线 = 最近被吸收的上游 commit (merge 后 upstream 指针; 不能用 HEAD:
+# "Already up to date" 时 HEAD 还是适配 commit, 下次 diff 会误报自家改动)
+git rev-parse "upstream/$UPSTREAM_BRANCH" > .overlay_baseline
+echo "  + 基线已更新: $(git rev-parse --short "upstream/$UPSTREAM_BRANCH")"
 
 echo "  re-applying overlay ..."
 bash "$OVERLAY_DIR/apply_cuda.sh" "$REPO_ROOT" || echo "  [WARN] apply_cuda.sh 有非零退出, 见上"

@@ -1,0 +1,26 @@
+# 锁定清单 — openpilot-upstream-test (mouxangithub/openpilot master-c3, carrot 系新布局)
+# 上游 (mouxangithub/openpilot master-c3) 动了这些文件时必须人工决策, 脚本会 STOP
+# 布局: openpilot/ 子目录 (新布局), 子模块 msgq_repo/opendbc_repo/ai
+
+# --- camerad kit (kits/camerad/) ---
+openpilot/system/camerad/webcam/camerad.py
+openpilot/system/camerad/webcam/v4l2_dmabuf_camera.py
+openpilot/system/camerad/webcam/v4l2_camera.py
+openpilot/system/camerad/webcam/camera_cuda.py
+openpilot/system/camerad/webcam/packed_to_nv12.cu
+openpilot/system/camerad/webcam/nvbuf_import.cu
+
+# --- modeld kit (kits/modeld/) ---
+openpilot/selfdrive/modeld/modeld.py
+openpilot/selfdrive/modeld/modeld_bigcombo.py
+openpilot/selfdrive/modeld/runners/tensorrt_runner.py
+openpilot/selfdrive/modeld/transforms/cuda_transform.cu
+openpilot/selfdrive/modeld/transforms/cuda_transform.h
+
+# --- 构建与子模块 ---
+SConstruct
+msgq_repo
+
+# --- 启动/其他适配 (按需增删) ---
+# launch_env.sh
+# launch_chffrplus.sh
