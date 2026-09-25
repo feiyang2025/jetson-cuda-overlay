@@ -1,20 +1,29 @@
-# 锁定清单 — cp (ajouatom, egpucp 分支)
-# 模板: 填入 cp 自己的适配文件 (git 相对路径), 上游动了它们脚本会 STOP
-# 参考 sp 清单 tools/locklist/sunnypilot-cuda.txt 的类别:
-#   camerad kit / modeld kit / SConstruct / 本地散改 / 其他适配
+# 锁定清单 — cp (ajouatom 胡萝卜系, egpucp 分支, openpilot/ 前缀布局)
+# 格式: git 相对路径, 每行一个, # 开头为注释
+# 上游 (upstream/$UPSTREAM_BRANCH) 动了这些文件时必须人工决策, 脚本会 STOP
+# 注意: v4l2_dmabuf_camera.py 等是 untracked (靠 overlay 拷贝落地, 未提交 git),
+#       上游若创建同名文件会冲突, 同样需要报警
 
-# --- camerad ---
-# tools/webcam/camerad.py
-# tools/webcam/v4l2_dmabuf_camera.py
-# tools/webcam/packed_to_nv12.cu
+# --- camerad kit (kits/camerad/, 跨分支自适应版; 含完整零拷贝 SP_NVBUF_ZEROCOPY) ---
+openpilot/tools/webcam/camerad.py
+openpilot/tools/webcam/v4l2_dmabuf_camera.py
+openpilot/tools/webcam/packed_to_nv12.cu
+openpilot/tools/webcam/nvbuf_import.cu
+openpilot/tools/webcam/camera.py
 
-# --- modeld (cp 是 precompiled 体系 + usbgpu 逻辑, 和 sp 不同!) ---
-# selfdrive/modeld/modeld.py
-# selfdrive/modeld/tensorrt_policy_runner.py
-# selfdrive/modeld/helpers.py
+# --- 启动配置 (零拷贝/色度/相机索引 env 都在这里) ---
+launch_env.sh
+launch_openpilot.sh
+launch_chffrplus.sh
+
+# --- modeld (cp 是 precompiled + usbgpu 体系, 与 sp 不同) ---
+openpilot/selfdrive/modeld/modeld.py
+openpilot/selfdrive/modeld/helpers.py
+openpilot/selfdrive/modeld/tensorrt_policy_runner.py
+openpilot/selfdrive/modeld/big_model.py
 
 # --- 构建 ---
-# SConstruct
+SConstruct
 
 # --- 本地散改 / 其他适配 ---
-# (补丁有落档的在这里登记)
+# (SCC 类散改补丁有落档的在这里登记)

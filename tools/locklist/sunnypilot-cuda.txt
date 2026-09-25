@@ -4,6 +4,8 @@
 # 更新方式: 吸收上游改动 -> 改 kits/ 补丁 -> 本清单也同步更新
 
 # --- camerad kit (kits/camerad/, 跨分支自适应版) ---
+# 注: 完整零拷贝 SP_NVBUF_ZEROCOPY (NvBufSurface+nvbuf_import) 逻辑已含在
+#     v4l2_dmabuf_camera.py 与 packed_to_nv12.cu 里; libnvbuf_import.so 是产物(gitignore)
 tools/webcam/camerad.py
 tools/webcam/v4l2_dmabuf_camera.py
 tools/webcam/v4l2_camera.py
