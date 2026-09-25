@@ -19,7 +19,11 @@ IMX390 200万像素 -> MAX9295 -> MAX96712 -> MIPI CSI-2 -> Orin VI5 -> twgmsl
 ## 设备契约 (与上游无关, 由硬件决定)
 
 - /dev/video0 = road, /dev/video1 = wide (实车验证组合, launch 里 ROAD_CAM=0 WIDE_CAM=1)
-- V4L2 只出 UYVY 4:2:2 (1920x1080@30 等档位); 下游 NV12 锁死 1920x1080 (4K 是驱动虚标画布, 有效像素 200 万)
+- V4L2 只出 UYVY 4:2:2 (1920x1080@30 等档位); 下游 NV12 默认 1920x1080
+  (4K 是驱动虚标画布, 有效像素 200 万); **输出尺寸可 env 覆盖**:
+  CAM_WIDTH/CAM_HEIGHT (cp 用 1344x760) 或 SP_CAM_OUT_W/SP_CAM_OUT_H,
+  resize 由 CUDA kernel 双线性完成; 源尺寸永远用相机实际采集尺寸 (cam_active),
+  不能拿输出尺寸建源 surface (会溢出/越界)
 - 启动先决: `sudo tw_camera_cfg bring` (serdes 初始化) 必须先于 camerad
 - 内核: twgmsl 是 tegra-capture-vi 老框架 + 第三方驱动, 不是 SIPL
 
@@ -65,7 +69,11 @@ camerad.py 是跨分支自适应版, 相对 fork 本地版多了:
 - `_find_repo_root()`: 自适应老布局 (tools/webcam) / 新布局 (openpilot/system/camerad/webcam)
 - libpacked_to_nv12.so / libuyvy_convert.so 多候选路径探测
 - import 多路径: openpilot.system.camerad.webcam / openpilot.tools.webcam / tools.webcam
+- cereal messaging 前缀自适应: try openpilot.cereal -> except cereal (胡萝卜系补救, cp 实车)
 - 零拷贝能力检测回退
+- cudaHostRegister 补注册诊断: cudaHostGetDevicePointer 失败时进程内补注册后重试
+  (cp 实车踩坑: C++ 层 cudaHostRegister 可能因进程内早期 CUDA 状态未生效)
+- packed_to_nv12.cu 含 resize + flip 180 版 (cp 相机倒装用, 双线性插值)
 
 fork 本地版 = 单分支直连 (import 写死)。**不要用 fork 本地版替换 kit 版。**
 

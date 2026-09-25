@@ -9,7 +9,10 @@ from pathlib import Path
 from collections import namedtuple
 
 from msgq.visionipc import VisionIpcServer, VisionStreamType
-from cereal import messaging
+try:
+  from openpilot.cereal import messaging
+except ImportError:
+  from cereal import messaging
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +319,8 @@ class Camerad:
         self._cudart = ctypes.CDLL('libcudart.so')
         self._cudart.cudaHostGetDevicePointer.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
         self._cudart.cudaHostGetDevicePointer.restype = ctypes.c_int
+        self._cudart.cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+        self._cudart.cudaHostRegister.restype = ctypes.c_int
         self._cudart.cudaMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
         self._cudart.cudaMalloc.restype = ctypes.c_int
         self._cudart.cudaMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
@@ -403,7 +408,13 @@ class Camerad:
         d = ctypes.c_void_p()
         rc = self._cudart.cudaHostGetDevicePointer(ctypes.byref(d), ctypes.c_void_p(host_ptr), 0)
         if rc != 0 or not d.value:
-          raise RuntimeError(f"cudaHostGetDevicePointer rc={rc}")
+          # 诊断+补救 (cp 实车踩坑): 可能 C++ 层 cudaHostRegister 未生效
+          # (进程内早期 CUDA 状态干扰), 此处补注册后重试
+          reg = self._cudart.cudaHostRegister(ctypes.c_void_p(host_ptr), dst.nbytes, 2)  # 2 = cudaHostRegisterMapped
+          rc2 = self._cudart.cudaHostGetDevicePointer(ctypes.byref(d), ctypes.c_void_p(host_ptr), 0)
+          print(f"[camerad] cudaHostGetDevicePointer rc={rc} reg={reg} retry_rc={rc2} dptr={d.value and hex(d.value)} host={host_ptr:#x} len={dst.nbytes}", flush=True)
+          if rc2 != 0 or not d.value:
+            raise RuntimeError(f"cudaHostGetDevicePointer rc={rc} reg={reg} retry={rc2}")
         dptr = d.value
         cache[host_ptr] = dptr
       if not converter.convert_to_device(raw, dptr):

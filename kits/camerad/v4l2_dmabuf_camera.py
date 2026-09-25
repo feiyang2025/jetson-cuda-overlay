@@ -208,13 +208,18 @@ class V4L2Camera:
   ACTIVE_WIDTH = 1920             # buffer 内真实图像区 (传感器有效像素)
   ACTIVE_HEIGHT = 1080
 
-  OUTPUT_WIDTH = 1920             # VIC 输出 NV12 (openpilot 消费端契约, modeld/UI 全动态尺寸)
-  OUTPUT_HEIGHT = 1080
+  OUTPUT_WIDTH = 1920             # 下游输出 NV12 宽 (env CAM_WIDTH/SP_CAM_OUT_W 可覆盖, cp 用 1344)
+  OUTPUT_HEIGHT = 1080            # 下游输出 NV12 高 (env CAM_HEIGHT/SP_CAM_OUT_H 可覆盖, cp 用 760)
   OUTPUT_STRIDE = 1920
   OUTPUT_SIZE = 3110400           # 1920*1080*3//2
 
-  def __init__(self, device, width=OUTPUT_WIDTH, height=OUTPUT_HEIGHT, fps=20, num_buffers=4, exposure=33334):
+  def __init__(self, device, width=None, height=None, fps=20, num_buffers=4, exposure=33334):
     self.device = device
+    # 输出尺寸: 优先显式参数, 其次 CAM_WIDTH/CAM_HEIGHT (cp 兼容), 最后默认 1920x1080
+    if width is None:
+      width = int(os.environ.get("CAM_WIDTH", os.environ.get("SP_CAM_OUT_W", str(self.OUTPUT_WIDTH))))
+    if height is None:
+      height = int(os.environ.get("CAM_HEIGHT", os.environ.get("SP_CAM_OUT_H", str(self.OUTPUT_HEIGHT))))
     self.target_w = width
     self.target_h = height
     self.W = width
@@ -421,8 +426,11 @@ class V4L2Camera:
         for i in range(self.num_buffers):
           src_params = NvBufSurfaceCreateParams()
           src_params.gpuId = 0
-          src_params.width = self.target_w
-          src_params.height = self.target_h
+          # 源尺寸 = 相机实际采集尺寸 (cam_active = 探测的有效区, 1920x1080) —
+          # 驱动按 sensor 真实尺寸写 DMA; 下游输出尺寸(target_w/h)可能不同(cp: 1344x760),
+          # 由 CUDA kernel resize, 不能拿输出尺寸建源 surface(会溢出/越界)。
+          src_params.width = self.cam_active_w
+          src_params.height = self.cam_active_h
           src_params.size = 0
           src_params.isContiguous = True
           src_params.colorFormat = NVBUF_COLOR_FORMAT_UYVY

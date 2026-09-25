@@ -89,3 +89,95 @@ extern "C" int packed_to_nv12_device_to_device(const uint8_t* src_device, uint8_
   err = cudaDeviceSynchronize();
   return err == cudaSuccess ? 0 : 7;
 }
+
+// ============ resize + flip 版 (cp 链路: 源 1920x1080 UYVY -> 目标任意尺寸 NV12) ============
+// src: packed UYVY 4:2:2, 每宏像素 4 字节 [Y U Y V] (chroma_swap=0) 或 [Y V Y U] (chroma_swap=1)
+// dst: NV12 dst_w x dst_h
+// flip: 1 = 180 度翻转 (水平+垂直镜像, cp 相机倒装用)
+// 采样: Y/U/V 各自双线性插值
+__device__ __forceinline__ float _clampf(float v, float lo, float hi) {
+  return fminf(fmaxf(v, lo), hi);
+}
+
+__device__ __forceinline__ uint8_t _bilinear_y(const uint8_t* src, int sw, int sh,
+                                               float sx, float sy) {
+  int stride = sw * 2;
+  int x0 = (int)floorf(sx), y0 = (int)floorf(sy);
+  x0 = max(0, min(x0, sw - 1));
+  y0 = max(0, min(y0, sh - 1));
+  int x1 = min(x0 + 1, sw - 1), y1 = min(y0 + 1, sh - 1);
+  float fx = sx - x0, fy = sy - y0;
+  float v00 = (float)src[y0 * stride + x0 * 2];
+  float v10 = (float)src[y0 * stride + x1 * 2];
+  float v01 = (float)src[y1 * stride + x0 * 2];
+  float v11 = (float)src[y1 * stride + x1 * 2];
+  float top = v00 * (1.0f - fx) + v10 * fx;
+  float bot = v01 * (1.0f - fx) + v11 * fx;
+  return (uint8_t)(top * (1.0f - fy) + bot * fy + 0.5f);
+}
+
+// sx 单位 = 宏像素列 (0 .. sw/2-1), sy 单位 = 行 (0 .. sh-1); pick = 0 -> U, 1 -> V
+__device__ __forceinline__ uint8_t _bilinear_chroma(const uint8_t* src, int sw, int sh,
+                                                    float sx, float sy, int pick, int chroma_swap) {
+  int half_w = sw / 2;
+  int stride = sw * 2;
+  int x0 = (int)floorf(sx), y0 = (int)floorf(sy);
+  x0 = max(0, min(x0, half_w - 1));
+  y0 = max(0, min(y0, sh - 1));
+  int x1 = min(x0 + 1, half_w - 1), y1 = min(y0 + 1, sh - 1);
+  float fx = sx - x0, fy = sy - y0;
+  int uoff = chroma_swap ? 3 : 1;
+  int voff = chroma_swap ? 1 : 3;
+  int off = pick == 0 ? uoff : voff;
+  float v00 = (float)src[y0 * stride + x0 * 4 + off];
+  float v10 = (float)src[y0 * stride + x1 * 4 + off];
+  float v01 = (float)src[y1 * stride + x0 * 4 + off];
+  float v11 = (float)src[y1 * stride + x1 * 4 + off];
+  float top = v00 * (1.0f - fx) + v10 * fx;
+  float bot = v01 * (1.0f - fx) + v11 * fx;
+  return (uint8_t)(top * (1.0f - fy) + bot * fy + 0.5f);
+}
+
+__global__ void packed_to_nv12_resize_kernel(const uint8_t* __restrict__ src,
+                                             uint8_t* __restrict__ dst,
+                                             int sw, int sh, int dw, int dh,
+                                             int flip, int chroma_swap) {
+  int dx = blockIdx.x * blockDim.x + threadIdx.x;
+  int dy = blockIdx.y * blockDim.y + threadIdx.y;
+  if (dx >= dw || dy >= dh) return;
+
+  // Y: 源坐标 (未翻转), 双线性
+  float sx = (dx + 0.5f) * (float)sw / (float)dw - 0.5f;
+  float sy = (dy + 0.5f) * (float)sh / (float)dh - 0.5f;
+  if (flip) { sx = (float)(sw - 1) - sx; sy = (float)(sh - 1) - sy; }
+  dst[dy * dw + dx] = _bilinear_y(src, sw, sh, sx, sy);
+
+  // UV: 偶数输出行/列各算一对
+  if ((dy & 1) == 0 && (dx & 1) == 0) {
+    int ux = dx >> 1;            // 输出 U 网格列 (0 .. dw/2-1)
+    int uy = dy >> 1;            // 输出 U 网格行 (0 .. dh/2-1)
+    float ux_src = (ux + 0.5f) * (float)(sw / 2) / (float)(dw / 2) - 0.5f;
+    float uy_src = (uy + 0.5f) * (float)sh / (float)(dh / 2) - 0.5f;
+    if (flip) { ux_src = (float)(sw / 2 - 1) - ux_src; uy_src = (float)(sh - 1) - uy_src; }
+    uint8_t u = _bilinear_chroma(src, sw, sh, ux_src, uy_src, 0, chroma_swap);
+    uint8_t v = _bilinear_chroma(src, sw, sh, ux_src, uy_src, 1, chroma_swap);
+    uint8_t* uv = dst + dw * dh + uy * dw;
+    uv[ux * 2] = u;
+    uv[ux * 2 + 1] = v;
+  }
+}
+
+// resize+flip 零拷贝: src 设备指针 (NvBufSurface import) -> dst 设备指针 (VisionIPC)
+// src 尺寸 sw x sh (packed UYVY, sw*sh*2 字节), dst 尺寸 dw x dh (NV12, dw*dh*3/2 字节)
+extern "C" int packed_to_nv12_resize_device_to_device(const uint8_t* src_device, uint8_t* dst_device,
+                                                      int sw, int sh, int dw, int dh,
+                                                      int flip, int chroma_swap) {
+  dim3 block(32, 8);
+  dim3 grid((dw + 31) / 32, (dh + 7) / 8);
+  packed_to_nv12_resize_kernel<<<grid, block>>>(src_device, dst_device, sw, sh, dw, dh,
+                                                flip ? 1 : 0, chroma_swap ? 1 : 0);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return 6;
+  err = cudaDeviceSynchronize();
+  return err == cudaSuccess ? 0 : 7;
+}
