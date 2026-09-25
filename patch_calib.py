@@ -230,11 +230,25 @@ def main() -> int:
         print("usage: patch_calib.py <target-repo-root>", file=sys.stderr)
         return 2
     root = os.path.abspath(sys.argv[1])
-    targets = [
-        os.path.join(root, "common/transformations/camera.py"),
-        os.path.join(root, "common/params_keys.h"),
-    ]
     out: list[str] = []
+    # 布局候选: 老布局 common/ 在根, 新布局在 openpilot/common/
+    root_candidates = [root, os.path.join(root, "openpilot"),
+                       os.path.join(root, "openpilot", "sunnypilot")]
+    def _resolve(rel: str) -> str | None:
+        for rc in root_candidates:
+            p = os.path.join(rc, rel)
+            if os.path.isfile(p):
+                return p
+        return None
+    targets = []
+    for rel in ("common/transformations/camera.py", "common/params_keys.h"):
+        p = _resolve(rel)
+        if p is not None:
+            targets.append(p)
+        else:
+            out.append(f"!! missing {rel} (checked {[os.path.join(rc, rel) for rc in root_candidates]})")
+    if not targets:
+        return 1
     for t in targets:
         if not os.path.isfile(t):
             out.append(f"!! missing {t}")

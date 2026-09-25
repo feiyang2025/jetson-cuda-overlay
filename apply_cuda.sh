@@ -85,15 +85,23 @@ fi
 
 echo "Installing modeld kit (kits/modeld, TRT 兜底闭环)..."
 MODELD_KIT="$OVERLAY_DIR/kits/modeld"
-MODELD_KIT_DST="$REPO_ROOT/selfdrive/modeld"
+# 布局检测: 新布局 modeld 在 openpilot/selfdrive/modeld, 老布局在根 selfdrive/modeld
+if [ -d "$REPO_ROOT/openpilot/selfdrive/modeld" ]; then
+  MODELD_KIT_DST="$REPO_ROOT/openpilot/selfdrive/modeld"
+else
+  MODELD_KIT_DST="$REPO_ROOT/selfdrive/modeld"
+fi
 mkdir -p "$MODELD_KIT_DST/runners" "$MODELD_KIT_DST/transforms"
 for f in modeld.py modeld_bigcombo.py; do
-  if [ -f "$MODELD_KIT_DST/$f" ] && ! grep -q "TRT_LOAD_ATTEMPTS\|BigComboTrtUnavailable" "$MODELD_KIT_DST/$f" 2>/dev/null; then
-    cp -f "$MODELD_KIT_DST/$f" "$MODELD_KIT_DST/$f.orig_local" 2>/dev/null || true
-    install_file "$MODELD_KIT/$f" "$MODELD_KIT_DST/$f"
-    echo "  - $f 已替换为 TRT 兜底闭环版 (原文件备份 .orig_local)"
-  else
+  # 按文件分开检测; 文件不存在 → 直接装 kit 版 (sunnypilot 新 master 无 modeld_bigcombo.py)
+  marker="TRT_LOAD_ATTEMPTS"
+  [ "$f" = "modeld_bigcombo.py" ] && marker="BigComboTrtUnavailable"
+  if [ -f "$MODELD_KIT_DST/$f" ] && grep -q "$marker" "$MODELD_KIT_DST/$f" 2>/dev/null; then
     echo "  - $f 已是兜底闭环版, 不动"
+  else
+    [ -f "$MODELD_KIT_DST/$f" ] && cp -f "$MODELD_KIT_DST/$f" "$MODELD_KIT_DST/$f.orig_local" 2>/dev/null || true
+    install_file "$MODELD_KIT/$f" "$MODELD_KIT_DST/$f"
+    echo "  - $f 已安装 TRT 兜底闭环版 (原文件备份 .orig_local)"
   fi
 done
 install_file "$MODELD_KIT/tensorrt_runner.py" "$MODELD_KIT_DST/runners/tensorrt_runner.py"
@@ -145,11 +153,11 @@ if [ -z "$NVCC_BIN" ]; then
   echo "  [WARN] 无 nvcc, 跳过 libpacked_to_nv12.so / libnvbuf_import.so 编译 (camerad 将走 CPU 回退)"
 elif [ ! -f libpacked_to_nv12.so ]; then
   echo "  + 编译 libpacked_to_nv12.so ..."
-  nvcc -arch=sm_87 -shared -O2 -o libpacked_to_nv12.so packed_to_nv12.cu && echo "    OK" || echo "    [WARN] 编译失败, camerad 走 CPU 回退"
+  "$NVCC_BIN" -arch=sm_87 -shared -O2 -o libpacked_to_nv12.so packed_to_nv12.cu && echo "    OK" || echo "    [WARN] 编译失败, camerad 走 CPU 回退"
 fi
 if [ -n "$NVCC_BIN" ] && [ ! -f libnvbuf_import.so ]; then
   echo "  + 编译 libnvbuf_import.so ..."
-  nvcc -arch=sm_87 -shared -O2 -o libnvbuf_import.so nvbuf_import.cu -lcuda && echo "    OK" || echo "    [WARN] 编译失败, SP_NVBUF_ZEROCOPY 将无法启用(其余链路不受影响)"
+  "$NVCC_BIN" -arch=sm_87 -shared -O2 -o libnvbuf_import.so nvbuf_import.cu -lcuda && echo "    OK" || echo "    [WARN] 编译失败, SP_NVBUF_ZEROCOPY 将无法启用(其余链路不受影响)"
 fi
 cd "$OVERLAY_DIR"
 
@@ -171,15 +179,21 @@ done
 
 echo "Patching SConstruct (aarch64 -D__JETSON__)..."
 SCONSTRUCT="$REPO_ROOT/SConstruct"
+[ -f "$SCONSTRUCT" ] || SCONSTRUCT="$REPO_ROOT/openpilot/SConstruct"
 if [ -f "$SCONSTRUCT" ] && ! grep -q "__JETSON__" "$SCONSTRUCT"; then
   python3 - "$SCONSTRUCT" <<'PY'
 import sys
 p = sys.argv[1]
 s = open(p).read()
-anchor = 'elif arch == "aarch64":'
-if anchor in s and '-D__JETSON__' not in s:
-  ins = anchor + '\n  # Jetson (Orin): visionbuf_jetson.cc CUDA 零拷贝映射 (overlay kits/modeld)\n  cflags += ["-D__JETSON__"]\n  cxxflags += ["-D__JETSON__"]\n  cpppath += ["/usr/local/cuda/include"]'
-  s = s.replace(anchor, ins, 1)
+# 锚点: 兼容 'elif arch == "aarch64":' 与 'elif arch == "aarch64" and COMMA_HARDWARE:' 等写法
+import re
+m = re.search(r'^(elif|if) arch == "aarch64"[^\n]*:\n', s, re.M)
+if m and '-D__JETSON__' not in s:
+  ins = ('  # Jetson (Orin): visionbuf_jetson.cc CUDA 零拷贝映射 (overlay kits/modeld)\n'
+         '  cflags += ["-D__JETSON__"]\n'
+         '  cxxflags += ["-D__JETSON__"]\n'
+         '  cpppath += ["/usr/local/cuda/include"]\n')
+  s = s[:m.end()] + ins + s[m.end():]
   open(p, 'w').write(s)
   print("[apply_cuda] SConstruct aarch64: + -D__JETSON__ + CUDA include")
 else:

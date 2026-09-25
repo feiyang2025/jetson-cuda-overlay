@@ -53,7 +53,12 @@ else
 fi
 
 echo "[模型推理 modeld kit]"
-MD="$REPO_ROOT/selfdrive/modeld"
+# 布局检测: 新布局 openpilot/selfdrive/modeld, 老布局根 selfdrive/modeld
+if [ -d "$REPO_ROOT/openpilot/selfdrive/modeld" ]; then
+  MD="$REPO_ROOT/openpilot/selfdrive/modeld"
+else
+  MD="$REPO_ROOT/selfdrive/modeld"
+fi
 if [ -f "$MD/modeld.py" ]; then
   grep -q "TRT_LOAD_ATTEMPTS" "$MD/modeld.py" && pass "modeld.py TRT 兜底闭环在" || fail "modeld.py 非兜底闭环版 (缺 TRT_LOAD_ATTEMPTS)"
   grep -q "BigComboTrtUnavailable" "$MD/modeld_bigcombo.py" 2>/dev/null && pass "modeld_bigcombo.py BigCombo 降级闭环在" || fail "modeld_bigcombo.py 缺 BigComboTrtUnavailable"
