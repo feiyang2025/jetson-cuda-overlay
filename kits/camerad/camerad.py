@@ -227,6 +227,10 @@ class CudaUyvyConverter:
         self._packed = ctypes.CDLL(str(packed_so))
         self._packed.packed_to_nv12.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
         self._packed.packed_to_nv12.restype = ctypes.c_int
+        # host 版 resize: 源采集尺寸 != 输出尺寸时 (CAM_WIDTH/HEIGHT 覆盖), 修复行距错位花屏
+        self._packed.packed_to_nv12_resize.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                                       ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        self._packed.packed_to_nv12_resize.restype = ctypes.c_int
         # 零拷贝入口: 直接写到设备指针, 不 D2H
         self._packed.packed_to_nv12_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
         self._packed.packed_to_nv12_device.restype = ctypes.c_int
@@ -288,9 +292,16 @@ class CudaUyvyConverter:
   def convert(self, uyvy_data):
     if self._packed is not None:
       src = np.ascontiguousarray(uyvy_data, dtype=np.uint8)
-      ret = self._packed.packed_to_nv12(ctypes.c_void_p(src.ctypes.data),
-                                        ctypes.c_void_p(self.nv12_cpu.ctypes.data),
-                                        self.W, self.H)
+      if self.src_w != self.W or self.src_h != self.H:
+        # resize: 源采集尺寸 (1920x1080 packed) -> 输出尺寸, 用显式源尺寸读 packed 防行距错位
+        ret = self._packed.packed_to_nv12_resize(ctypes.c_void_p(src.ctypes.data),
+                                                 ctypes.c_void_p(self.nv12_cpu.ctypes.data),
+                                                 self.src_w, self.src_h, self.W, self.H,
+                                                 1 if self.flip else 0, 1 if self.chroma_swap else 0)
+      else:
+        ret = self._packed.packed_to_nv12(ctypes.c_void_p(src.ctypes.data),
+                                          ctypes.c_void_p(self.nv12_cpu.ctypes.data),
+                                          self.W, self.H)
       if ret != 0:
         print(f"[CUDA] packed_to_nv12 failed ret={ret}", flush=True)
         return None

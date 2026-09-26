@@ -186,3 +186,33 @@ extern "C" int packed_to_nv12_resize_device_to_device(const uint8_t* src_device,
   err = cudaDeviceSynchronize();
   return err == cudaSuccess ? 0 : 7;
 }
+
+// host 版 resize: packed (sw x sh) -> NV12 (dw x dh), 紧密输出 (dst_stride=dw, y_plane_rows=dh)
+// 供 camerad.py convert() 在源采集尺寸 != 输出尺寸时使用 (master-c3 链路: 1920x1080 -> 1344x760)
+// 修复: 原 convert() 用输出尺寸读源 packed 导致行距错位花屏
+extern "C" int packed_to_nv12_resize(const uint8_t* src_host, uint8_t* dst_host,
+                                     int sw, int sh, int dw, int dh,
+                                     int flip, int chroma_swap) {
+  size_t src_bytes = (size_t)sw * sh * 2;
+  size_t dst_bytes = (size_t)dw * dh * 3 / 2;
+  uint8_t *d_src = nullptr, *d_dst = nullptr;
+  if (cudaMalloc(&d_src, src_bytes) != cudaSuccess) return 1;
+  if (cudaMalloc(&d_dst, dst_bytes) != cudaSuccess) { cudaFree(d_src); return 2; }
+  if (cudaMemcpy(d_src, src_host, src_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(d_src); cudaFree(d_dst); return 3;
+  }
+  dim3 block(32, 8);
+  dim3 grid((dw + 31) / 32, (dh + 7) / 8);
+  packed_to_nv12_resize_kernel<<<grid, block>>>(d_src, d_dst, sw, sh, dw, dh,
+                                                flip ? 1 : 0, chroma_swap ? 1 : 0,
+                                                dw, dh);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) { cudaFree(d_src); cudaFree(d_dst); return 6; }
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) { cudaFree(d_src); cudaFree(d_dst); return 7; }
+  if (cudaMemcpy(dst_host, d_dst, dst_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+    cudaFree(d_src); cudaFree(d_dst); return 5;
+  }
+  cudaFree(d_src); cudaFree(d_dst);
+  return 0;
+}
