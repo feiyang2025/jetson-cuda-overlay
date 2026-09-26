@@ -42,6 +42,13 @@ IMX390 200万像素 -> MAX9295 -> MAX96712 -> MIPI CSI-2 -> Orin VI5 -> twgmsl
 
 ## 颜色规则 (不要再改!)
 
+twgmsl 数据布局特殊性 (master-c3 实证 2026-09-26):
+- twgmsl 无论 V4L2 元数据标 UYVY 还是 YUYV, 实际数据都是 "Y 在偶数字节" 布局
+  (video0 元数据 UYVY, video1 元数据 YUYV, 数据布局相同)
+- **禁止按 pixel_format 做 YUYV↔UYVY 字节对 swap**:
+  对 video1 (标 YUYV) 做 swap 会把 wide 反转成绿色条纹 (已踩: master-c3 实车可见)
+- Y=raw[0::2], U=raw[1::4], V=raw[3::4] 契约保持; 上述规则对 video0/video1 一致
+
 twgmsl 这路不是标准 UYVY。标准 UYVY 直转会发绿、雾、红蓝反。
 当前正确取值 (camerad.py 内):
 

@@ -619,8 +619,10 @@ class Camerad:
       print(f"[camerad] unsupported pixel format for {cam.cam_type_state}: {pixel_format}", flush=True)
       return None
     raw = np.frombuffer(vision_buf.data, dtype=np.uint8)
-    if pixel_format == 'YUYV':
+    if pixel_format == 'YUYV' and os.environ.get('GMSL_CHROMA_LAYOUT', 'twgmsl').lower() != 'twgmsl':
       # YUYV (Y0 U0 Y1 V0) → UYVY (U0 Y0 V0 Y1): swap each adjacent byte pair
+      # 仅非 twgmsl (USB 等) 需要; twgmsl 数据无论元数据标 UYVY/YUYV 都是
+      # "Y 在偶数字节" 特殊布局, swap 会把 wide 反转成绿色条纹 (master-c3 实证)
       raw = raw.reshape(-1, 2)[:, ::-1].ravel()
     # UYVY → NV12 converter handles UYVY natively, no swap needed
     nv12 = converter.convert(np.ascontiguousarray(raw))
