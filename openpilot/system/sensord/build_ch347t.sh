@@ -11,6 +11,12 @@ set -euo pipefail
 
 REPO_ROOT="${1:-$(pwd)}"
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd -P)"
+# master-c3 新布局自适应: openpilot/ 是真实子目录时, run_ch347t.sh 的
+# REPO_ROOT=../.. 物理两级会落在 <树根>/openpilot (老布局 openpilot 是软链则落在树根)。
+# 若当前 REPO_ROOT 下找不到 ch347t.cc 但父目录有, 提升一级。
+if [ ! -f "$REPO_ROOT/openpilot/system/sensord/ch347t.cc" ] && [ -f "$REPO_ROOT/system/sensord/ch347t.cc" ]; then
+  REPO_ROOT="$(dirname "$REPO_ROOT")"
+fi
 SRC="$REPO_ROOT/openpilot/system/sensord/ch347t.cc"
 OUT="$REPO_ROOT/openpilot/system/sensord/ch347t"
 MSGQ="$REPO_ROOT/openpilot/cereal/messaging"
