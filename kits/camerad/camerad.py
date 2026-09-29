@@ -195,13 +195,15 @@ def _praw(p, key):
   return v
 
 
-def _packed_yuv_to_nv12(yuv_data, width, height, pixel_format='UYVY'):
+def _packed_yuv_to_nv12(yuv_data, width, height, pixel_format='UYVY', chroma_swap=None):
   """packed YUV -> NV12.
 
   twgmsl 的 UYVY 节点实际是特殊 packed 两字节布局：有效亮度在奇数字节，
   色度交错也来自奇数字节；按标准 UYVY 读取会得到 U/V≈0，画面纯绿。
   通过 GMSL_CHROMA_LAYOUT=twgmsl 选择与 CP 相同的通道归一化。
   """
+  if chroma_swap is None:
+    chroma_swap = os.environ.get('SP_CHROMA_SWAP', '0') == '1'
   yuv = np.frombuffer(yuv_data, dtype=np.uint8).reshape(height, width * 2)
   nv12 = np.zeros(height * width * 3 // 2, dtype=np.uint8)
   y_plane = nv12[:height * width].reshape(height, width)
@@ -215,8 +217,9 @@ def _packed_yuv_to_nv12(yuv_data, width, height, pixel_format='UYVY'):
       row = yuv[i]
       y_plane[i] = row[0::2]
       if i % 2 == 0:
-        uv_plane[i // 2, 0::2] = row[1::4]
-        uv_plane[i // 2, 1::2] = row[3::4]
+        u_src, v_src = (row[3::4], row[1::4]) if chroma_swap else (row[1::4], row[3::4])
+        uv_plane[i // 2, 0::2] = u_src
+        uv_plane[i // 2, 1::2] = v_src
     return nv12
 
   if pixel_format == 'UYVY':
@@ -224,15 +227,17 @@ def _packed_yuv_to_nv12(yuv_data, width, height, pixel_format='UYVY'):
       row = yuv[i]
       y_plane[i] = row[1::2]
       if i % 2 == 0:
-        uv_plane[i // 2, 0::2] = row[0::4]
-        uv_plane[i // 2, 1::2] = row[2::4]
+        u_src, v_src = (row[2::4], row[0::4]) if chroma_swap else (row[0::4], row[2::4])
+        uv_plane[i // 2, 0::2] = u_src
+        uv_plane[i // 2, 1::2] = v_src
   else:  # YUYV
     for i in range(height):
       row = yuv[i]
       y_plane[i] = row[0::2]
       if i % 2 == 0:
-        uv_plane[i // 2, 0::2] = row[1::4]
-        uv_plane[i // 2, 1::2] = row[3::4]
+        u_src, v_src = (row[3::4], row[1::4]) if chroma_swap else (row[1::4], row[3::4])
+        uv_plane[i // 2, 0::2] = u_src
+        uv_plane[i // 2, 1::2] = v_src
   return nv12
 
 
@@ -294,9 +299,15 @@ class CudaUyvyConverter:
         # resize+flip 零拷贝 (cp 链路: 1920x1080 源 → 1344x760 输出, 双线性)
         self._packed.packed_to_nv12_resize_device_to_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
         self._packed.packed_to_nv12_resize_device_to_device.restype = ctypes.c_int
+        # U/V 字节序开关: twgmsl 上按 layout 读出的色度整体是 U/V 互换的
+        # (实测症状: 蓝→紫、橘黄→绿 —— BT.601 下 U/V 对调的标准结果)。
+        # 由 SP_CHROMA_SWAP=1 打开 (默认跟随 self.chroma_swap)。
+        self._packed.packed_to_nv12_set_chroma_swap.argtypes = [ctypes.c_int]
+        self._packed.packed_to_nv12_set_chroma_swap.restype = None
+        self._packed.packed_to_nv12_set_chroma_swap(1 if self.chroma_swap else 0)
         self.nv12_cpu = np.zeros(self.nv12_size, dtype=np.uint8)
         self._use_cuda = True
-        print(f"[CudaUyvyConverter] packed CUDA kernel OK: {width}x{height} layout={'UYVY' if self.layout else 'YUYV'}", flush=True)
+        print(f"[CudaUyvyConverter] packed CUDA kernel OK: {width}x{height} layout={'UYVY' if self.layout else 'YUYV'} chroma_swap={int(self.chroma_swap)}", flush=True)
         return
       except Exception as e:
         print(f"[CudaUyvyConverter] packed CUDA init failed: {e}, fallback", flush=True)

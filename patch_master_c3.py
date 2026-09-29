@@ -101,10 +101,16 @@ def hardware_h(text: str):
 
 
 def cameraview(text: str):
-  old = "vec2 uv = texture(texture1, fragTexCoord).ra - 0.5;"
-  if old not in text:
-    return None
-  return text.replace(old, "vec2 uv = texture(texture1, fragTexCoord).rg - 0.5;  // %s: NV12 通道顺序, .ra 会绿屏" % MARK, 1)
+  # 曾经把上游的 .ra 改成 .rg 并注释"AGX Orin 适配 / .ra 会绿屏" —— 那是错的。
+  # 本机 raylib 的色度纹理走 GL_LUMINANCE_ALPHA: .r 与 .g **都等于第一个字节(=U)**,
+  # 所以 .rg 取到的是 (U,U), 代进 BT.601 的后果是精确的
+  #   蓝 → 品红紫 (R/B 同涨、G 掉)  橘黄 → 绿 (R/B 同降、G 涨)
+  # 正确取法是 .r=U / .a=V, 即上游原版的 .ra。这条只做"把错的改回来",
+  # 上游本来就是 .ra 时返回 None(幂等)。
+  bad = "vec2 uv = texture(texture1, fragTexCoord).rg - 0.5;  // %s: NV12 通道顺序, .ra 会绿屏" % MARK
+  if bad in text:
+    return text.replace(bad, "vec2 uv = texture(texture1, fragTexCoord).ra - 0.5;", 1)
+  return None
 
 
 def process_config(text: str):

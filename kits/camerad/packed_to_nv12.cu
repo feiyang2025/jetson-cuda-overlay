@@ -38,7 +38,8 @@ __device__ __forceinline__ int _v_off(int layout, int chroma_swap) {
 
 __global__ void packed_to_nv12_kernel(const uint8_t* __restrict__ src,
                                       uint8_t* __restrict__ dst,
-                                      int width, int height, int layout, int src_stride) {
+                                      int width, int height, int layout, int src_stride,
+                                      int chroma_swap) {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
   int y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x >= width || y >= height) return;
@@ -54,10 +55,18 @@ __global__ void packed_to_nv12_kernel(const uint8_t* __restrict__ src,
   if ((y & 1) == 0 && (x & 1) == 0) {
     int c = x >> 1;
     uint8_t* uv = dst + width * height + (y >> 1) * width;
-    uv[c * 2]     = row[c * 4 + _u_off(layout, 0)];
-    uv[c * 2 + 1] = row[c * 4 + _v_off(layout, 0)];
+    uv[c * 2]     = row[c * 4 + _u_off(layout, chroma_swap)];
+    uv[c * 2 + 1] = row[c * 4 + _v_off(layout, chroma_swap)];
   }
 }
+
+// chroma_swap 的模块级开关。U/V 字节序在 twgmsl 上与"标准 4:2:2 命名"不一致时
+// (实测: 按 layout 读出的色度整体 U/V 互换 → 蓝变紫、橘黄变绿), 由 Python 侧在
+// 初始化时调用 packed_to_nv12_set_chroma_swap(1) 打开。用全局量而不是加参数,
+// 是为了不动这几个函数的 C ABI(树里/tools 下有别的调用方)。
+static int g_chroma_swap = 0;
+
+extern "C" void packed_to_nv12_set_chroma_swap(int v) { g_chroma_swap = v ? 1 : 0; }
 
 extern "C" int packed_to_nv12(const uint8_t* src_host, uint8_t* dst_host,
                               int width, int height, int layout, int src_stride) {
@@ -74,7 +83,7 @@ extern "C" int packed_to_nv12(const uint8_t* src_host, uint8_t* dst_host,
 
   dim3 block(32, 8);
   dim3 grid((width + 31) / 32, (height + 7) / 8);
-  packed_to_nv12_kernel<<<grid, block>>>(d_src, d_dst, width, height, layout, src_stride);
+  packed_to_nv12_kernel<<<grid, block>>>(d_src, d_dst, width, height, layout, src_stride, g_chroma_swap);
 
   cudaError_t err = cudaDeviceSynchronize();
   if (err != cudaSuccess) { cudaFree(d_src); cudaFree(d_dst); return 4; }
@@ -101,7 +110,7 @@ extern "C" int packed_to_nv12_device(const uint8_t* src_host, uint8_t* dst_devic
 
   dim3 block(32, 8);
   dim3 grid((width + 31) / 32, (height + 7) / 8);
-  packed_to_nv12_kernel<<<grid, block>>>(d_src, dst_device, width, height, layout, src_stride);
+  packed_to_nv12_kernel<<<grid, block>>>(d_src, dst_device, width, height, layout, src_stride, g_chroma_swap);
 
   cudaError_t err = cudaDeviceSynchronize();
   cudaFree(d_src);
@@ -114,7 +123,7 @@ extern "C" int packed_to_nv12_device_to_device(const uint8_t* src_device, uint8_
                                                int width, int height, int layout, int src_stride) {
   dim3 block(32, 8);
   dim3 grid((width + 31) / 32, (height + 7) / 8);
-  packed_to_nv12_kernel<<<grid, block>>>(src_device, dst_device, width, height, layout, src_stride);
+  packed_to_nv12_kernel<<<grid, block>>>(src_device, dst_device, width, height, layout, src_stride, g_chroma_swap);
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) return 6;
   err = cudaDeviceSynchronize();
