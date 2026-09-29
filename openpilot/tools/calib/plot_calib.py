@@ -35,6 +35,21 @@ EXPRESS_V = 60 / 3.6
 STRAIGHT_THRESH = 0.008
 
 
+def _lead_present(lead) -> bool:
+    """leadOne 是否有前车。
+
+    字段名在 cereal 里改过: 老 schema 是 `status`, 新 schema (openpilot master /
+    master-c3) 是 `present`。capnp 读不存在的字段会抛 AttributeError,
+    所以两个都试, 都不行就当没有 —— 标定脚本不该因为 schema 改名整段跑不起来。
+    """
+    for attr in ("present", "status"):
+        try:
+            return bool(getattr(lead, attr))
+        except Exception:
+            continue
+    return False
+
+
 def find_rlogs(base_dir):
     rlogs = []
     for entry in sorted(os.listdir(base_dir)):
@@ -64,7 +79,7 @@ def collect_all(paths):
                     yaw_rate = getattr(m.carState, 'yawRate', 0)
                 elif w == 'radarState':
                     rs = m.radarState
-                    radar_d = rs.leadOne.dRel if rs.leadOne.status else None
+                    radar_d = rs.leadOne.dRel if _lead_present(rs.leadOne) else None
                 elif w == 'modelV2':
                     md = m.modelV2
                     leads = md.leadsV3

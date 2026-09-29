@@ -72,7 +72,7 @@ def _rebuild_intrinsics():
 def _load_intrinsics():
     global ECAM_FL_CURRENT, FCAM_FL
     try:
-        from common.params import Params
+        from openpilot.common.params import Params
         _f = json.loads(Params().get("FcamIntrinsics") or "{}").get("fl")
         if _f: FCAM_FL = int(_f)
         _e = json.loads(Params().get("EcamIntrinsics") or "{}").get("fl")
@@ -282,7 +282,7 @@ def compute_and_save(matches: list, out_dir: str = None):
         json.dump(result, f, indent=2, ensure_ascii=False)
 
     try:
-        from common.params import Params
+        from openpilot.common.params import Params
         Params().put("WideCalibResult", json.dumps(result))
     except:
         pass
@@ -314,7 +314,7 @@ def _main():
     _load_intrinsics()
 
     try:
-        from common.params import Params
+        from openpilot.common.params import Params
     except Exception as e:
         log(f"Params import failed: {e}")
         return

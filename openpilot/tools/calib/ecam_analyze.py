@@ -23,6 +23,21 @@ from collections import Counter
 from openpilot.tools.lib.logreader import LogReader
 
 
+def _lead_present(lead) -> bool:
+    """leadOne 是否有前车。
+
+    字段名在 cereal 里改过: 老 schema 是 `status`, 新 schema (openpilot master /
+    master-c3) 是 `present`。capnp 读不存在的字段会抛 AttributeError,
+    所以两个都试, 都不行就当没有 —— 标定脚本不该因为 schema 改名整段跑不起来。
+    """
+    for attr in ("present", "status"):
+        try:
+            return bool(getattr(lead, attr))
+        except Exception:
+            continue
+    return False
+
+
 def find_rlogs(base_dir: str, route: str = None):
     rlogs = []
     if route:
@@ -85,7 +100,7 @@ def main():
         seg_name = os.path.basename(os.path.dirname(p))
         for m in LogReader(p):
             w = m.which()
-            if w == 'radarState' and m.radarState.leadOne.status:
+            if w == 'radarState' and _lead_present(m.radarState.leadOne):
                 radar_d = m.radarState.leadOne.dRel
             elif w == 'modelV2' and m.modelV2.leadsV3[0].prob > 0.5 and radar_d is not None:
                 d_v = float(m.modelV2.leadsV3[0].x[0])

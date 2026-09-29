@@ -236,7 +236,7 @@ class SelfCalibrator:
                 self._last_yaw = getattr(m.carState, 'yawRate', 0)
             elif w == 'radarState':
                 rs = m.radarState
-                if rs.leadOne.status:
+                if _lead_present(rs.leadOne):
                     self._last_radar_d = rs.leadOne.dRel
             elif w == 'modelV2':
                 frames_model += 1
@@ -503,10 +503,24 @@ class SelfCalibrator:
         return "\n".join(lines)
 
 
+def _lead_present(lead) -> bool:
+    """leadOne 是否有前车。
+
+    字段名在 cereal 里改过: 老 schema 是 `status`, 新 schema (openpilot master /
+    master-c3) 是 `present`。capnp 读不存在的字段会抛 AttributeError,
+    所以两个都试, 都不行就当没有 —— 标定脚本不该因为 schema 改名整段跑不起来。
+    """
+    for attr in ("present", "status"):
+        try:
+            return bool(getattr(lead, attr))
+        except Exception:
+            continue
+    return False
+
+
 def find_routes(base_dir: str = None) -> List[str]:
     if base_dir is None:
-        from openpilot.system.hardware.hw import Paths
-        base_dir = Paths.log_root()
+        base_dir = _default_realdata()
     routes = []
     if not os.path.isdir(base_dir):
         print(f"错误: 日志目录不存在: {base_dir}")
@@ -521,14 +535,32 @@ def find_routes(base_dir: str = None) -> List[str]:
 
 
 def _default_realdata():
-    from openpilot.system.hardware.hw import Paths
-    return Paths.log_root()
+    """Path::log_root() —— 布局自适应, 且绝不抛异常。
+
+    两点必须这样写:
+      1. hw 模块在 fork 间搬过家 (新布局 openpilot/common/hardware/hw,
+         老布局 openpilot/system/hardware/hw), 所以两个路径都试。
+      2. 它被当作 argparse 的 default 求值, 在解析 --base-dir 之前就执行;
+         一旦抛异常, 连显式传 --base-dir 都进不去 (master-c3 实测)。
+    """
+    for _mod in ("openpilot.common.hardware.hw", "openpilot.system.hardware.hw"):
+        try:
+            return __import__(_mod, fromlist=["Paths"]).Paths.log_root()
+        except Exception:
+            continue
+    return os.path.expanduser("~/.comma/media/0/realdata")
 
 
 def run_live(output_path: str, ecam: bool = False, fcam_fl: int = 2520):
     """Live collection mode: subscribe to messages, collect data, compute on exit."""
-    from common.params import Params
-    from cereal import messaging
+    # 导入要带 openpilot. 前缀: 本 fork 的源码在 <树根>/openpilot/ 子目录,
+    # 裸的 `from common.params import ...` 只在老布局 (树根即 openpilot) 才能解析。
+    try:
+        from openpilot.common.params import Params
+        from openpilot.cereal import messaging
+    except ImportError:
+        from common.params import Params
+        from cereal import messaging
 
     exit_now = False
     def _handler(sig, fr):
@@ -552,7 +584,7 @@ def run_live(output_path: str, ecam: bool = False, fcam_fl: int = 2520):
             cal._last_yaw = getattr(sm['carState'], 'yawRate', 0)
         if sm.updated['radarState']:
             rs = sm['radarState']
-            if rs.leadOne.status:
+            if _lead_present(rs.leadOne):
                 cal._last_radar_d = rs.leadOne.dRel
         if sm.updated['modelV2']:
             md = sm['modelV2']

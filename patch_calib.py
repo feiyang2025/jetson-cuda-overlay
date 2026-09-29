@@ -203,26 +203,62 @@ def patch_params_keys(path: str) -> list[str]:
 REALDATA_HELPER = '''
 
 def _default_realdata():
-  from openpilot.system.hardware.hw import Paths
-  return Paths.log_root()
+  """Path::log_root() —— 布局自适应, 且绝不抛异常。
+
+  hw 模块 fork 间搬过家 (新布局 openpilot/common/hardware/hw,
+  老布局 openpilot/system/hardware/hw), 所以两个路径都试;
+  它又被当 argparse 的 default 求值, 在解析 --base-dir 之前就执行 ——
+  一旦抛 ModuleNotFoundError, 连显式传 --base-dir 都进不去 (master-c3 实测)。
+  """
+  import os as _os
+  for _mod in ("openpilot.common.hardware.hw", "openpilot.system.hardware.hw"):
+    try:
+      return __import__(_mod, fromlist=["Paths"]).Paths.log_root()
+    except Exception:
+      continue
+  return _os.path.expanduser("~/.comma/media/0/realdata")
 '''
 HARDCODED_REALDATA = 'default="/home/dengjian/realdata"'
+
+# 老的坏 helper (硬编码 openpilot.system.hardware.hw): 新布局树上 ModuleNotFoundError。
+# 整块换掉, 这样对"已经 apply 过的树"也能修回来。
+OLD_HELPER = '''def _default_realdata():
+  from openpilot.system.hardware.hw import Paths
+  return Paths.log_root()'''
 
 
 def patch_calib_tool(path: str) -> list[str]:
     with open(path, encoding="utf-8") as f:
         s = f.read()
-    if HARDCODED_REALDATA not in s:
-        return []
-    if "_default_realdata" not in s:
-        m = re.search(r"^def ", s, re.M)
-        if not m:
-            return [f"!! {path}: no 'def' anchor for _default_realdata"]
-        s = s[:m.start()] + REALDATA_HELPER.lstrip("\n") + "\n\n" + s[m.start():]
-    s = s.replace(HARDCODED_REALDATA, 'default=_default_realdata()')
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(s)
-    return [f"{os.path.basename(path)}: --base-dir default -> device realdata (Paths.log_root())"]
+    orig = s
+    notes: list[str] = []
+
+    # (a) 老的坏 helper -> 布局自适应版
+    if OLD_HELPER in s:
+        s = s.replace(OLD_HELPER, REALDATA_HELPER.strip("\n"))
+        notes.append(f"{os.path.basename(path)}: _default_realdata 换布局自适应版")
+
+    # (b) 裸的旧 import 也修
+    bad_import = "from openpilot.system.hardware.hw import Paths"
+    if bad_import in s:
+        s = s.replace(bad_import, "from openpilot.common.hardware.hw import Paths")
+        notes.append(f"{os.path.basename(path)}: hw import 路径修正 (system/ -> common/)")
+
+    # (c) 源码里硬编码的作者路径 -> Paths.log_root()
+    if HARDCODED_REALDATA in s:
+        if "_default_realdata" not in s:
+            m = re.search(r"^def ", s, re.M)
+            if not m:
+                notes.append(f"!! {path}: no 'def' anchor for _default_realdata")
+                return notes
+            s = s[:m.start()] + REALDATA_HELPER.lstrip("\n") + "\n\n" + s[m.start():]
+        s = s.replace(HARDCODED_REALDATA, 'default=_default_realdata()')
+        notes.append(f"{os.path.basename(path)}: --base-dir default -> device realdata (Paths.log_root())")
+
+    if s != orig:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(s)
+    return notes
 
 
 def main() -> int:
