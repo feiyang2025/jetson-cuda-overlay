@@ -117,6 +117,42 @@ def process_config(text: str):
   return text.replace(old, new, 1)
 
 
+# ------------------------------------------------ developer 页的摄像头标定按钮
+
+CALIB_IMPORT_ANCHOR = "from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp\n"
+CALIB_IMPORT = ("from openpilot.selfdrive.ui.sunnypilot.calibration_panel import CalibrationPanel"
+                "  # %s: 摄像头标定 4 按钮\n" % MARK)
+
+CALIB_ITEMS_ANCHOR = ('    self.items: list = [self.show_advanced_controls, self.enable_github_runner_toggle, '
+                      'self.enable_copyparty_toggle, self.prebuilt_toggle, self.error_log_btn,]\n')
+CALIB_ITEMS = ('    # %s: 摄像头标定 (FCAM RUN / FCAM Live / Wide / VIEW)\n'
+               '    # 实现见 openpilot/selfdrive/ui/sunnypilot/calibration_panel.py\n'
+               '    self._calib_panel = CalibrationPanel(ui_state.params)\n'
+               '    self.items.extend(self._calib_panel.items.values())\n' % MARK)
+
+CALIB_UPDATE_ANCHOR = "    self.error_log_btn.set_visible(not self._is_release_branch)\n"
+CALIB_UPDATE = "    self._calib_panel.update()\n"
+
+
+def developer_py(text: str):
+  """把标定面板接进开发者页 (幂等)。"""
+  if "CalibrationPanel" in text:
+    return None
+  if CALIB_ITEMS_ANCHOR not in text or CALIB_UPDATE_ANCHOR not in text:
+    return None
+  out = text
+  if CALIB_IMPORT_ANCHOR in out:
+    out = out.replace(CALIB_IMPORT_ANCHOR, CALIB_IMPORT_ANCHOR + CALIB_IMPORT, 1)
+  else:
+    m = re.search(r"^(?:from|import) .*\n", out, re.M)
+    if not m:
+      return None
+    out = out[:m.start()] + CALIB_IMPORT + out[m.start():]
+  out = out.replace(CALIB_ITEMS_ANCHOR, CALIB_ITEMS_ANCHOR + CALIB_ITEMS, 1)
+  out = out.replace(CALIB_UPDATE_ANCHOR, CALIB_UPDATE_ANCHOR + CALIB_UPDATE, 1)
+  return out
+
+
 def main():
   root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
   print("[patch_master_c3] target=%s" % root)
@@ -128,6 +164,7 @@ def main():
     (root / "openpilot" / "common" / "hardware" / "pc" / "hardware.h", hardware_h),
     (root / "openpilot" / "selfdrive" / "ui" / "onroad" / "cameraview.py", cameraview),
     (root / "openpilot" / "system" / "manager" / "process_config.py", process_config),
+    (root / "openpilot" / "selfdrive" / "ui" / "sunnypilot" / "layouts" / "settings" / "developer.py", developer_py),
   ]
   for path, fn in targets:
     try:

@@ -49,11 +49,14 @@ source .venv/bin/activate && scons -j8 common/         # 标定组件改了 para
 | 5 | CH347 IMU | `openpilot/system/sensord/ch347t.{cc,py}`、`third_party/ch347/` | `system/sensord/` + `third_party/ch347/` | 外置 USB-I2C LSM6DS3（板载无 IMU 时用），带开机零偏自动校准，没插就自动退出 |
 | 6 | **相机标定工具链** | `openpilot/tools/calib/*`、`patch_calib.py` | `tools/calib/`、并打补丁到 `common/transformations/camera.py` + `common/params_keys.h` | FCAM/ECAM 内参 + ECAM 外参标定，结果按分辨率存 Params 供全栈使用 |
 | 7 | **Panda 固件/协议统一** | `/data/openpilot/panda_版本核对/`（设备侧脚本） | 不进 overlay，运行在 `/data/openpilot` | 让所有分支共用同一份 panda 固件与协议，**不再来回刷固件** |
-| 8 | **master-c3 收口补丁** | `patch_master_c3.py`（apply_cuda.sh 末尾自动调用） | SConstruct / `launch_chffrplus.sh` / `launch_env.sh` / `pc/hardware.h` / `ui/onroad/cameraview.py` / `manager/process_config.py` | apply 覆盖不到的 carrot 系 AGX 改动（HOME/PARAMS_ROOT、树内 .venv、AGX env 默认、get_voltage/current、NV12 `.rg`、webcamerad restart_if_crash）。**按锚点判断，锚点不在就 SKIP，对别的 fork 无副作用** |
+| 8 | **master-c3 收口补丁** | `patch_master_c3.py`（apply_cuda.sh 末尾自动调用） | SConstruct / `launch_chffrplus.sh` / `launch_env.sh` / `pc/hardware.h` / `ui/onroad/cameraview.py` / `manager/process_config.py` / `ui/sunnypilot/layouts/settings/developer.py` | apply 覆盖不到的 carrot 系 AGX 改动（HOME/PARAMS_ROOT、树内 .venv、AGX env 默认、get_voltage/current、NV12 `.rg`、webcamerad restart_if_crash、开发者页标定按钮接线）。**按锚点判断，锚点不在就 SKIP，对别的 fork 无副作用** |
+| 9 | **摄像头标定面板（UI 按钮）** | `kits/ui/calibration_panel.py` + `tools/patch_translations.py` | `selfdrive/ui/sunnypilot/calibration_panel.py`（4 个按钮接进开发者页；中文词条按 msgid 注入 `app_zh-CHS.po`） | 把 sp Qt 版的 4 个标定按钮搬到新 UI：FCAM 扫描标定 / FCAM 实时标定 / 宽角(Wide)标定 / 查看标定。配套 `kits/camerad/camerad.py` 的 WideCalibMode 换流 |
 
 > 6/7 是本轮新增。7 不落在 overlay 仓库里，因为它是"跨分支运维脚本"，作用于
 > `/data/openpilot/*` 三个仓库（panda 固件字节按 gitignore 属构建产物，不适合放进 overlay 仓库）。
 > 它的用法规格见 §5。
+> 9 是本轮新增（标定面板），第 6 项是它的**后端**（脚本+Params），第 9 项是**前端**（界面按钮）。
+
 
 ---
 
@@ -201,6 +204,41 @@ python3 tools/calib/plot_calib.py --dir <route目录> --output calib.png
 
 ---
 
+### 3.5 UI 按钮（开发者页 → 摄像头标定，2026-09-29 新增）
+
+`apply_cuda.sh` 会把 4 个按钮接进开发者页（`ui/sunnypilot/calibration_panel.py`）：
+
+| 按钮 | 行为 |
+|---|---|
+| FCAM Calibration [RUN] | 扫 `Paths.log_root()` 下的行车段，算完弹确认框，确认后写 `FcamIntrinsics` 并清 `CalibrationParams` |
+| FCAM Live Calibration [START/STOP] | 后台跑 `self_calibrator.py --live`，STOP 时 SIGTERM 触发收尾计算，结果写 `FcamCalibResult` 并应用 |
+| Wide Calibration [START/STOP] | 造 offroad 窗口清外参 → 翻 `WideCalibMode`（camerad ~2s 内把 ECAM 顶到 road 流）→ 跑 `--live --ecam`；STOP 时算 `WideCalibResult` 并写 `EcamIntrinsics` |
+| Camera Calibration [VIEW] | 弹框显示 FCAM/ECAM 内参与外参（roll/pitch/yaw/validBlocks） |
+
+三个自检脚本（前两个不需要 msgq，可以和别的树同时跑）：
+
+```bash
+cd <树根> && source .venv/bin/activate
+export PYTHONPATH=$PWD:$PWD/openpilot
+
+# 1) camerad 换流/内参互换的纯逻辑（不碰相机）
+python3 /data/openpilot/jetson-cuda-overlay/tools/check_widecalib_logic.py .
+
+# 2) 4 个按钮构建 + 渲染 + update()（需要一个 X display, 会闪一个窗口）
+DISPLAY=:0 XAUTHORITY=/run/user/1000/gdm/Xauthority \
+  python3 /data/openpilot/jetson-cuda-overlay/tools/check_calib_panel.py .
+
+# 3) CUDA 变换库 dlopen/init/execute（§4 第 2 步）
+python3 /data/openpilot/jetson-cuda-overlay/tools/check_cuda_transform.py .
+```
+
+> 换流实现要点：camerad **自己每 2s 轮询 `WideCalibMode`**（不需要重启 camerad），
+> 翻转时同时做两件事 —— (a) 互换 `Fcam/EcamIntrinsics`（进:备份后互换；出:`Fcam` 还原，
+> `Ecam` 若已被标定改过就保留新值），(b) 把物理相机的输出 msg/stream 打到对侧。
+> 因此 modeld/UI/标定脚本都不用改。
+
+---
+
 ## 4. 模型/相机/IMU 的运行验证顺序
 
 1. 原始后端能起：`DISABLE_CUDA_BACKEND=1` 跑一次。
@@ -251,11 +289,12 @@ bash /data/openpilot/panda_版本核对/panda_boot_check.sh
 
 ## 6. 未包含 / 待办（诚实清单）
 
-- **标定 UI**：`developer_panel` 的 4 个标定按钮、`annotated_camera` 动态内参重载、中文翻译
-  —— 未移植（各分支 UI 框架不同：ajouatom 是 Qt `developer_panel.cc`，dp 是新式 `ui/layouts/settings/developer.py`）。
-- **ECAM 流交换**：cuda 主版本在 `camerad_thread.cc` 里 `WideCalibMode` 交换 road/wide 流；
-  旧分支是 `camerad_usb.cc`、dp 是 `jetson_camerad.py`，结构不同，未移植 —— 因此"车上按按钮实时标
-  Wide"这条路暂不可用，但离线标定（§3.2）不受影响。
+- **标定 UI**：~~未移植~~ → **已移植**（§3.5，2026-09-29）。开发者页 4 个按钮 + 中文词条都进了 overlay。
+  仍未移植的两项：`annotated_camera` 的动态内参重载（改了内参需重启 UI 才生效）。
+- **ECAM 流交换**：~~未移植~~ → **已移植**（`kits/camerad/camerad.py`，2026-09-29）。
+  cuda 主版本在 `camerad_thread.cc` 里做，本树是 Python webcamerad，按同一语义重写：
+  轮询 `WideCalibMode` + 互换内参 + 输出 msg/stream 打到对侧。
+  **未实测**：换流的真机验证要有相机 + 独占 msgq（见 §4 第 1/3 步的前置条件）。
 - **模型引擎与 libcuda_transform.so**：属设备侧产物，overlay 不带，按 §2 自己编。
 - 运行 `wide_calibrator.py` 需要 `cv2`：dp 的 venv 和系统 python3 有，cuda/ajouatom 的 venv 没有
   （用系统 python3 跑，或自行 `pip install opencv-python`）。

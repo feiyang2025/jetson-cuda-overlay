@@ -252,9 +252,18 @@ fi
 # master-c3 (carrot 系) fork 的收口补丁: apply 覆盖不到的 6 处 AGX 改动
 # (SConstruct HOME/PARAMS_ROOT, launch 脚本 .venv/env, pc/hardware.h, cameraview, process_config)
 # 锚点不存在就 SKIP, 对别的 fork 无副作用。
+echo "Installing calibration panel (developer page)..."
+UI_SP_DIR="$REPO_ROOT/openpilot/selfdrive/ui/sunnypilot"
+if [ -d "$UI_SP_DIR" ]; then
+  install_file "$OVERLAY_DIR/kits/ui/calibration_panel.py" "$UI_SP_DIR/calibration_panel.py"
+else
+  echo "  - 无 sunnypilot UI 目录, 跳过标定面板"
+fi
+
 echo "Patching master-c3 (carrot) specifics..."
 set +e
 python3 "$OVERLAY_DIR/patch_master_c3.py" "$REPO_ROOT"
+python3 "$OVERLAY_DIR/tools/patch_translations.py" "$REPO_ROOT"
 set -e
 
 echo "[apply_cuda] done."

@@ -32,6 +32,11 @@ try:
 except ImportError:
   from cereal import log as _cereal_log
 
+try:
+  from openpilot.common.params import Params
+except ImportError:
+  from common.params import Params
+
 # 相机消息名按 cereal schema 自适应:
 #   sp 系: roadCameraState + wideRoadCameraState + driverCameraState
 #   master-c3 系: narrowRoadCameraState + wideRoadCameraState + cabinCameraState
@@ -145,6 +150,29 @@ def _build_cameras():
 
 
 CAMERAS = _build_cameras()
+
+
+# ---------------------------------------------------------------- WideCalibMode
+# road/wide 流互换 (Wide Calibration): 标 ECAM 时把宽角相机顶到 road 流上,
+# 这样 modeld/UI/标定脚本都按"road"消费宽角画面, 收集 rv/lw/cv 样本算 ECAM 内参。
+# 语义对齐 sp 的 camerad_thread.cc (swap_intrinsics_cpp + wide_swap_stream/msg)。
+_WC_OPPOSITE = {}
+if _MSG_WIDE:
+  _WC_OPPOSITE[_MSG_ROAD] = (_MSG_WIDE, _VST_WIDE_ROAD)
+  _WC_OPPOSITE[_MSG_WIDE] = (_MSG_ROAD, _VST_ROAD)
+
+
+def _wc_output_of(msg_name, stream_type):
+  """WideCalibMode 生效时返回物理相机的"对侧"输出 (msg, stream); 否则原样返回。"""
+  return _WC_OPPOSITE.get(msg_name, (msg_name, stream_type))
+
+
+def _pstr(p, key):
+  """Params.get 在不同 fork 有 str/bytes 两种返回, 统一成 str。"""
+  v = p.get(key)
+  if v is None:
+    return ""
+  return v.decode() if isinstance(v, bytes) else str(v)
 
 
 def _packed_yuv_to_nv12(yuv_data, width, height, pixel_format='UYVY'):
@@ -381,6 +409,13 @@ class Camerad:
   def __init__(self):
     self.pm = messaging.PubMaster([c.msg_name for c in CAMERAS])
     self.vipc_server = VisionIpcServer("camerad")
+    self.params = Params()
+    # WideCalibMode (road/wide 流互换) 状态: 由各相机线程轮询 param 后带锁翻转。
+    # _wc_swapped = 当前生效状态; _wc_intrinsics_done = 内参是否已跟着换过(防重复换)。
+    self._wc_swapped = False
+    self._wc_intrinsics_done = False
+    self._wc_lock = threading.Lock()
+    self._wc_last_poll = 0.0
     self.use_v4l2 = USE_V4L2
     self.use_nvmm = USE_NVMM
     self.cameras = []
@@ -484,11 +519,81 @@ class Camerad:
 
     self.vipc_server.start_listener()
 
-  def _send_nv12(self, nv12_data, frame_id, pub_type, yuv_type, timestamp_sof=0, timestamp_eof=0):
+  # -------------------------------------------------------------- WideCalibMode
+  def _output_of(self, cam):
+    """本帧的输出身份 (msg_name, stream_type)。
+
+    WideCalibMode 生效时物理 road 相机的画面打到 wide 的输出上、反之亦然 ——
+    这样"宽角相机顶到 road 流"就实现了, 而 model/UI 无需任何改动。
+    """
+    if self._wc_swapped:
+      return _wc_output_of(cam.cam_type_state, cam.stream_type)
+    return cam.cam_type_state, cam.stream_type
+
+  def _swap_calib_intrinsics(self, to_ecam: bool):
+    """换流时同步换内参, 否则 modeld 会拿 road 的内参去解 wide 的画面。
+
+    语义与 sp camerad_thread.cc 的 swap_intrinsics_cpp 一致:
+      进入: 备份 Fcam/Ecam, 然后互换两者
+      退出: 还原 Fcam; Ecam 若被标定改过(不再等于备份的 fcam)就保留新值
+    """
+    p = self.params
+    if to_ecam:
+      if _pstr(p, "WideCalibIntrinsicsFcamBackup"):
+        print("[WideCalib] Intrinsics already swapped, skipping", flush=True)
+        return
+      fcam = _pstr(p, "FcamIntrinsics")
+      ecam = _pstr(p, "EcamIntrinsics")
+      if fcam:
+        p.put("WideCalibIntrinsicsFcamBackup", fcam)
+      if ecam:
+        p.put("WideCalibIntrinsicsEcamBackup", ecam)
+      if ecam:
+        p.put("FcamIntrinsics", ecam)
+      if fcam:
+        p.put("EcamIntrinsics", fcam)
+      print("[WideCalib] Intrinsics swapped: road now uses ECAM", flush=True)
+    else:
+      fc = _pstr(p, "WideCalibIntrinsicsFcamBackup")
+      ec = _pstr(p, "WideCalibIntrinsicsEcamBackup")
+      if not fc or not ec:
+        print("[WideCalib] No backup found, cannot restore", flush=True)
+        return
+      p.put("FcamIntrinsics", fc)
+      if _pstr(p, "EcamIntrinsics") == fc:
+        p.put("EcamIntrinsics", ec)
+      else:
+        print("[WideCalib] EcamIntrinsics modified by calibration, keeping new value", flush=True)
+      p.remove("WideCalibIntrinsicsFcamBackup")
+      p.remove("WideCalibIntrinsicsEcamBackup")
+      print("[WideCalib] Intrinsics restored: road now uses FCAM", flush=True)
+
+  def _poll_wide_calib(self):
+    """每 ~2s 轮询一次 WideCalibMode (对齐 sp 的每 50 帧)。"""
+    now = time.monotonic()
+    if now - self._wc_last_poll < 2.0:
+      return
+    self._wc_last_poll = now
+    try:
+      want = bool(self.params.get_bool("WideCalibMode"))
+    except Exception:
+      return
+    with self._wc_lock:
+      if want == self._wc_swapped:
+        return
+      self._wc_swapped = want
+      if want != self._wc_intrinsics_done:
+        self._wc_intrinsics_done = want
+        self._swap_calib_intrinsics(want)
+      print(f"[WideCalib] {'Swap: ECAM -> road stream' if want else 'Restore: FCAM -> road stream'}", flush=True)
+
+  def _send_nv12(self, nv12_data, frame_id, pub_type, yuv_type, timestamp_sof=0, timestamp_eof=0, src_stream=None):
     if timestamp_eof <= 0:
       timestamp_eof = timestamp_sof if timestamp_sof > 0 else int(time.monotonic_ns())
     data = nv12_data
-    cv = self.converters.get(yuv_type)
+    # 转换器按"物理相机"取 (src_stream), 发送按"输出流"走 (yuv_type):
+    # WideCalibMode 换流时两者不同, 用 yuv_type 取会拿到对侧相机的尺寸。
+    cv = self.converters.get(src_stream if src_stream is not None else yuv_type)
     if _ALIGNED and cv is not None and cv.aligned_size is not None:
       # 紧密 NV12 → Venus 对齐布局 (master-c3 modeld 按 stride 读): 每行补 padding
       st, yr, h, w = cv.dst_stride, cv.y_plane_rows, cv.H, cv.W
@@ -549,12 +654,14 @@ class Camerad:
     self._src_devptr[dmabuf_fd] = dev.value
     return dev.value
 
-  def _send_nv12_nvbuf(self, vision_buf, converter, frame_id, pub_type, yuv_type, timestamp_sof=0, timestamp_eof=0):
+  def _send_nv12_nvbuf(self, vision_buf, converter, frame_id, pub_type, yuv_type, timestamp_sof=0, timestamp_eof=0, src_stream=None):
     if timestamp_eof <= 0:
       timestamp_eof = timestamp_sof if timestamp_sof > 0 else int(time.monotonic_ns())
-    staging = self._staging_devptr.get(yuv_type)
+    # staging 与相机 buffer 归属都按"物理相机"(src_stream); yuv_type 只用于输出流。
+    _src = src_stream if src_stream is not None else yuv_type
+    staging = self._staging_devptr.get(_src)
     if staging is None:
-      raise RuntimeError(f"no staging buffer for {yuv_type}")
+      raise RuntimeError(f"no staging buffer for {_src}")
     try:
       # 第一步：kernel 把相机 buffer 直接转换到独立暂存区（这是唯一读相机 buffer 的时刻）。
       src = self._import_nvbuf(vision_buf.fd, os.fstat(vision_buf.fd).st_size)
@@ -564,7 +671,7 @@ class Camerad:
       # 相机 buffer 用完立刻归还，不等 VisionIPC。
       if vision_buf.v4l2_index is not None:
         for cam in self.cameras:
-          if getattr(cam, "stream_type", None) == yuv_type and hasattr(getattr(cam, "cam", None), "_requeue_buffer"):
+          if getattr(cam, "stream_type", None) == _src and hasattr(getattr(cam, "cam", None), "_requeue_buffer"):
             cam.cam._requeue_buffer(vision_buf.v4l2_index)
             break
 
@@ -650,7 +757,11 @@ class Camerad:
         try:
           if in_count % 3 == 0:
             continue  # 丢弃第 3 帧: 不进 FrameSync, 不占 VisionIPC buffer(相机 buffer 由 finally 兜底归还)
+          # WideCalibMode: 轮询 param (内部 ~2s 节流), 决定本帧输出到哪条流
+          self._poll_wide_calib()
+          out_msg, out_stream = self._output_of(cam)
           # Frame sync: road 致密发号(丢帧统计依赖), wide 跟随 road 最新号
+          # 注意同步角色用"物理身份"(cam.cam_type_state) —— 换流只改输出, 不改谁发号
           if cam.cam_type_state == _MSG_ROAD:
             sync_frame_id = g_frame_sync.claim()
           elif g_frame_sync.n_cameras > 1:
@@ -661,7 +772,7 @@ class Camerad:
           sent = False
           if self._nvbuf_zerocopy and converter is not None and cam_nvbuf:
             try:
-              sent = self._send_nv12_nvbuf(vision_buf, converter, sync_frame_id, cam.cam_type_state, cam.stream_type, vision_buf.timestamp_sof, vision_buf.timestamp_eof)
+              sent = self._send_nv12_nvbuf(vision_buf, converter, sync_frame_id, out_msg, out_stream, vision_buf.timestamp_sof, vision_buf.timestamp_eof, src_stream=cam.stream_type)
               self._nvbuf_fail = 0
             except Exception as e:
               # staging 方案下失败极罕见(import/convert/memcpy), 单帧跳过重试即可,
@@ -676,7 +787,7 @@ class Camerad:
               requeued = True  # _send_nv12_nvbuf 的 finally 已归还(成功或异常都会执行)
           if (not sent) and self._zerocopy and converter is not None and converter._packed is not None and vision_buf is not None and vision_buf.data is not None:
             raw = np.frombuffer(vision_buf.data, dtype=np.uint8)
-            sent = self._send_nv12_zerocopy(raw, converter, sync_frame_id, cam.cam_type_state, cam.stream_type, vision_buf.timestamp_sof, vision_buf.timestamp_eof)
+            sent = self._send_nv12_zerocopy(raw, converter, sync_frame_id, out_msg, out_stream, vision_buf.timestamp_sof, vision_buf.timestamp_eof)
             if not sent and not getattr(self, '_zc_warned', False):
               print("[camerad] zerocopy send failed, falling back to host path", flush=True)
               self._zc_warned = True
@@ -684,7 +795,7 @@ class Camerad:
           if not sent:
             nv12 = self._vision_buf_to_nv12(cam, vision_buf)
             if nv12 is not None:
-              self._send_nv12(nv12, sync_frame_id, cam.cam_type_state, cam.stream_type, vision_buf.timestamp_sof, vision_buf.timestamp_eof)
+              self._send_nv12(nv12, sync_frame_id, out_msg, out_stream, vision_buf.timestamp_sof, vision_buf.timestamp_eof, src_stream=cam.stream_type)
         finally:
           # 相机 buffer 归还兜底: 丢帧/降级空转时 _send_nv12_nvbuf 未被调用, 靠这里补还;
           # 已走 _send_nv12_nvbuf 的帧不重复还(避免同一 index 双 QBUF 乱序)。
@@ -699,7 +810,9 @@ class Camerad:
     else:
       for yuv in cam.read_frames():
         sync_frame_id = g_frame_sync.wait() if g_frame_sync.n_cameras > 1 else cam.cur_frame_id
-        self._send_nv12(yuv, sync_frame_id, cam.cam_type_state, cam.stream_type)
+        self._poll_wide_calib()
+        out_msg, out_stream = self._output_of(cam)
+        self._send_nv12(yuv, sync_frame_id, out_msg, out_stream, src_stream=cam.stream_type)
         if g_frame_sync.n_cameras <= 1:
           cam.cur_frame_id += 1
 
