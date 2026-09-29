@@ -85,16 +85,39 @@ def _cam_dims(key: str) -> tuple[int, int]:
 
 
 def _pstr(p: Params, key: str) -> str:
+  """字符串/字节型 param 的读取 (CalibrationParams 这类二进制用 bytes, 别走这里)。"""
   v = p.get(key)
   if v is None:
     return ""
-  return v.decode() if isinstance(v, bytes) else str(v)
+  return v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
+
+
+def _pjson(p: Params, key: str) -> dict | None:
+  """JSON 型 param 的读取。
+
+  本 fork 的 Params 对 JSON 型键: get 直接返回 dict/list; 空键返回 None。
+  (旧 fork 可能返回 JSON 字符串, 所以两种都兜。)写入必须 put(dict), 传字符串会 TypeError;
+  而且 C++ 侧异步落盘, 写完要 block=True 才读得到。
+  """
+  v = p.get(key)
+  if v is None:
+    return None
+  if isinstance(v, (bytes, bytearray)):
+    v = v.decode(errors="replace")
+  if isinstance(v, str):
+    if not v.strip():
+      return None
+    try:
+      v = json.loads(v)
+    except Exception:
+      return None
+  return v if isinstance(v, dict) else None
 
 
 def _current_fl(p: Params, key: str, default_fl: int) -> int:
+  d = _pjson(p, key)
   try:
-    data = json.loads(_pstr(p, key) or "{}")
-    return int(data.get("fl", default_fl))
+    return int((d or {}).get("fl", default_fl))
   except Exception:
     return default_fl
 
@@ -110,24 +133,20 @@ def _extract_fl(obj: dict) -> int:
 
 
 def write_intrinsics(p: Params, key: str, fl: int, clear_calibration: bool = True) -> None:
-  """写内参: 顶层 fl/cx/cy + calibrations[<W>x<H>], 可选清 CalibrationParams。"""
+  """写内参: 顶层 fl/cx/cy + calibrations[<W>x<H>], 可选清 CalibrationParams。
+
+  本 fork 这些键是 JSON 型: 必须 put(dict) 且 block=True(python2cpp 只认 dict,
+  传 json 字符串直接 TypeError; 异步落盘不 block 会立刻读不到)。
+  """
   w, h = _cam_dims(key)
-  intr = {}
-  existing = _pstr(p, key)
-  if existing:
-    try:
-      doc = json.loads(existing)
-      if isinstance(doc, dict):
-        intr = doc
-    except Exception:
-      intr = {}
+  intr = dict(_pjson(p, key) or {})
   intr["fl"] = fl
   intr["cx"] = w / 2.0
   intr["cy"] = h / 2.0
-  calibs = intr.get("calibrations") or {}
+  calibs = dict(intr.get("calibrations") or {})
   calibs[f"{w}x{h}"] = {"fl": fl, "cx": w / 2.0, "cy": h / 2.0}
   intr["calibrations"] = calibs
-  p.put(key, json.dumps(intr))
+  p.put(key, intr, block=True)
 
   if clear_calibration:
     # 换了内参, 旧的俯仰/偏航外参不再成立, 清掉让 calibrationd 重新标
@@ -331,16 +350,11 @@ class CalibrationPanel:
   def on_view_calib(self) -> None:
     lines = []
     for key, name in (("FcamIntrinsics", "FCAM"), ("EcamIntrinsics", "ECAM")):
-      raw = _pstr(self.params, key)
-      if not raw:
+      d = _pjson(self.params, key)
+      if not d:
         lines.append(f"<b>{name}</b>: {tr('not calibrated')}")
       else:
-        try:
-          d = json.loads(raw)
-        except Exception:
-          d = {}
-        fl = d.get("fl", "-")
-        lines.append(f"<b>{name}</b>: fl={fl} cx={d.get('cx', '-')} cy={d.get('cy', '-')}")
+        lines.append(f"<b>{name}</b>: fl={d.get('fl', '-')} cx={d.get('cx', '-')} cy={d.get('cy', '-')}")
         calibs = d.get("calibrations") or {}
         for res, entry in calibs.items():
           lines.append(f"&nbsp;&nbsp;{res}: fl={entry.get('fl', '-')}")
@@ -366,13 +380,7 @@ class CalibrationPanel:
 
   # ------------------------------------------------------------------ 每帧刷新
   def _read_result_param(self, key: str) -> dict | None:
-    raw = _pstr(self.params, key)
-    if not raw:
-      return None
-    try:
-      return json.loads(raw)
-    except Exception:
-      return None
+    return _pjson(self.params, key)
 
   def _consume_finished(self) -> None:
     with self._lock:

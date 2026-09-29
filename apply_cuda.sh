@@ -217,6 +217,40 @@ else
   mkdir -p "$REPO_ROOT/third_party/ch347"
   cp -rf "$OVERLAY_DIR/openpilot/third_party/ch347/." "$REPO_ROOT/third_party/ch347/"
 fi
+
+# libch347.so 是厂商二进制, overlay 的 .gitignore 排除 *.so, 不能随仓库带 →
+# 装完 SDK 后按架构补 so, 找不到就明确报警(CH347 会静默退回 I2C 兜底, 很难察觉)。
+CH347_SDK="$(dirname "$SENSORD_DIR")/../third_party/ch347"
+[ -d "$CH347_SDK" ] || CH347_SDK="$REPO_ROOT/third_party/ch347"
+CH347_ARCH="$(uname -m)"
+case "$CH347_ARCH" in
+  aarch64) CH347_ARCH_DIR="aarch64" ;;
+  x86_64)  CH347_ARCH_DIR="x64" ;;
+  *)       CH347_ARCH_DIR="x64" ;;
+esac
+CH347_SO="$CH347_SDK/lib/$CH347_ARCH_DIR/dynamic/libch347.so"
+if [ ! -f "$CH347_SO" ]; then
+  for cand in \
+    "$OVERLAY_DIR/vendor/ch347/libch347.so" \
+    /data/usr-local/lib/libch347.so \
+    "$HOME/data/openpilot/deps/IMU/lib/libch347.so" \
+    /data/openpilot/deps/IMU/lib/libch347.so \
+    /data/openpilot/sunnypilot-cuda/third_party/ch347/lib/$CH347_ARCH_DIR/dynamic/libch347.so \
+    /data/openpilot/cp/openpilot/third_party/ch347/lib/$CH347_ARCH_DIR/dynamic/libch347.so; do
+    if [ -f "$cand" ]; then
+      mkdir -p "$(dirname "$CH347_SO")" && cp -f "$cand" "$CH347_SO"
+      echo "  + third_party/ch347/lib/$CH347_ARCH_DIR/dynamic/libch347.so (来自 $cand)"
+      break
+    fi
+  done
+fi
+if [ -f "$CH347_SO" ]; then
+  echo "  = CH347 so 就绪: $CH347_SO"
+else
+  echo "  [WARN] 找不到 libch347.so (架构 $CH347_ARCH_DIR) —— CH347 IMU 会在 detect 阶段判'设备不可用'"
+  echo "         然后静默退回 I2C 兜底(板载无 IMU 时就一直没数据)。请手动放到:"
+  echo "         $CH347_SO"
+fi
 chmod +x "$SENSORD_DIR/build_ch347t.sh" "$SENSORD_DIR/run_ch347t.sh" 2>/dev/null || true
 
 # Patch process_config to register sensord_ch347 as an optional daemon

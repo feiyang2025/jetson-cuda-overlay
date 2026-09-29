@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import threading
+import json
 import os
 import platform
 import time
@@ -168,11 +169,30 @@ def _wc_output_of(msg_name, stream_type):
 
 
 def _pstr(p, key):
-  """Params.get 在不同 fork 有 str/bytes 两种返回, 统一成 str。"""
+  """Params.get 在不同 fork 有 str/bytes/dict 三种返回, 统一成 str。
+
+  JSON 型 param(本 fork 的 FcamIntrinsics/备份键)读出来是 dict —— 直接 str() 会得到
+  Python repr(单引号)而不是合法 JSON, 再写回去 C++ 侧解析失败。所以:
+    写回时用 _praw 原样透传, 需要字符串时用 json.dumps 而不是 str()。
+  """
   v = p.get(key)
   if v is None:
     return ""
-  return v.decode() if isinstance(v, bytes) else str(v)
+  if isinstance(v, (bytes, bytearray)):
+    return v.decode()
+  if isinstance(v, (dict, list)):
+    return json.dumps(v)
+  return str(v)
+
+
+def _praw(p, key):
+  """读原始值用于跨键搬运 (dict 保持 dict, 免得 JSON 往返损坏)。"""
+  v = p.get(key)
+  if isinstance(v, (bytes, bytearray)):
+    v = v.decode()
+  if v is None or v == "":
+    return None
+  return v
 
 
 def _packed_yuv_to_nv12(yuv_data, width, height, pixel_format='UYVY'):
@@ -536,32 +556,35 @@ class Camerad:
     语义与 sp camerad_thread.cc 的 swap_intrinsics_cpp 一致:
       进入: 备份 Fcam/Ecam, 然后互换两者
       退出: 还原 Fcam; Ecam 若被标定改过(不再等于备份的 fcam)就保留新值
+
+    注意本 fork 这几个键是 JSON 型: get 返回 dict, put 必须传 dict(传字符串会 TypeError),
+    所以搬运用 _praw 原样透传、写入带 block=True。
     """
     p = self.params
     if to_ecam:
-      if _pstr(p, "WideCalibIntrinsicsFcamBackup"):
+      if _praw(p, "WideCalibIntrinsicsFcamBackup") is not None:
         print("[WideCalib] Intrinsics already swapped, skipping", flush=True)
         return
-      fcam = _pstr(p, "FcamIntrinsics")
-      ecam = _pstr(p, "EcamIntrinsics")
-      if fcam:
-        p.put("WideCalibIntrinsicsFcamBackup", fcam)
-      if ecam:
-        p.put("WideCalibIntrinsicsEcamBackup", ecam)
-      if ecam:
-        p.put("FcamIntrinsics", ecam)
-      if fcam:
-        p.put("EcamIntrinsics", fcam)
+      fcam = _praw(p, "FcamIntrinsics")
+      ecam = _praw(p, "EcamIntrinsics")
+      if fcam is not None:
+        p.put("WideCalibIntrinsicsFcamBackup", fcam, block=True)
+      if ecam is not None:
+        p.put("WideCalibIntrinsicsEcamBackup", ecam, block=True)
+      if ecam is not None:
+        p.put("FcamIntrinsics", ecam, block=True)
+      if fcam is not None:
+        p.put("EcamIntrinsics", fcam, block=True)
       print("[WideCalib] Intrinsics swapped: road now uses ECAM", flush=True)
     else:
-      fc = _pstr(p, "WideCalibIntrinsicsFcamBackup")
-      ec = _pstr(p, "WideCalibIntrinsicsEcamBackup")
-      if not fc or not ec:
+      fc = _praw(p, "WideCalibIntrinsicsFcamBackup")
+      ec = _praw(p, "WideCalibIntrinsicsEcamBackup")
+      if fc is None or ec is None:
         print("[WideCalib] No backup found, cannot restore", flush=True)
         return
-      p.put("FcamIntrinsics", fc)
-      if _pstr(p, "EcamIntrinsics") == fc:
-        p.put("EcamIntrinsics", ec)
+      p.put("FcamIntrinsics", fc, block=True)
+      if _praw(p, "EcamIntrinsics") == fc:
+        p.put("EcamIntrinsics", ec, block=True)
       else:
         print("[WideCalib] EcamIntrinsics modified by calibration, keeping new value", flush=True)
       p.remove("WideCalibIntrinsicsFcamBackup")

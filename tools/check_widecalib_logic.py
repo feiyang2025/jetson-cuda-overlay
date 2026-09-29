@@ -42,7 +42,7 @@ class FakeParams:
   def get_bool(self, k):
     return bool(self.d.get(k, False))
 
-  def put(self, k, v):
+  def put(self, k, v, block=False):
     self.d[k] = v
 
   def remove(self, k):
