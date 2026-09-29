@@ -108,6 +108,36 @@ class v4l2_control(ctypes.Structure):
   ]
 
 
+# tegra 的 exposure 是 **64 位(int64)** 控制: 走 32 位的 v4l2_control + VIDIOC_S_CTRL
+# 会被驱动判为 size 不匹配 → 恒定 EINVAL(实测 "设曝光失败 [Errno 22]"), 于是曝光
+# 一直停在驱动默认值上(表现: 画面过暗/发灰、白平衡看着不对)。
+# 正确做法: VIDIOC_S_EXT_CTRLS + v4l2_ext_control.size = 8。
+class v4l2_ext_control(ctypes.Structure):
+  # 内核里这个结构是 __attribute__((packed)): 4+4+4+8 = 20 字节 (union 只用到 value64)
+  _pack_ = 1
+  _fields_ = [
+    ("id", ctypes.c_uint32),
+    ("size", ctypes.c_uint32),
+    ("reserved2", ctypes.c_uint32),
+    ("value64", ctypes.c_int64),
+  ]
+
+
+class v4l2_ext_controls(ctypes.Structure):
+  _fields_ = [
+    ("ctrl_class", ctypes.c_uint32),
+    ("count", ctypes.c_uint32),
+    ("error_idx", ctypes.c_uint32),
+    ("reserved", ctypes.c_uint32 * 2),
+    ("controls", ctypes.POINTER(v4l2_ext_control)),
+  ]
+
+
+# _IOWR('V', 72, struct v4l2_ext_controls) = (3<<30)|(32<<16)|(0x56<<8)|72
+# (arm64 上该结构因含指针按 8 对齐 → sizeof=32, 故 size 位段是 32 不是 28)
+VIDIOC_S_EXT_CTRLS = 0xC0205648
+
+
 class NvBufSurfaceCreateParams(ctypes.Structure):
   _fields_ = [
     ("gpuId", ctypes.c_uint32),
@@ -365,6 +395,26 @@ class V4L2Camera:
     self.probed_layout = self._measure_packed_layout(keep, stable)
     return stable
 
+  def _set_exposure64(self, value: int) -> bool:
+    """用 VIDIOC_S_EXT_CTRLS 写 int64 曝光 (tegra 的 exposure 是 64 位控制)。
+
+    返回 True=成功。失败只返回 False 不抛, 由调用方决定是否走 32 位兜底。
+    """
+    try:
+      c = v4l2_ext_control()
+      c.id = V4L2_CID_EXPOSURE_TEGRA
+      c.size = 8  # sizeof(int64) —— 驱动按 size 判是不是 64 位控制
+      c.value64 = int(value)
+      ctrls = v4l2_ext_controls()
+      ctrls.ctrl_class = 0
+      ctrls.count = 1
+      ctrls.error_idx = 0
+      ctrls.controls = ctypes.pointer(c)
+      fcntl.ioctl(self.fd, VIDIOC_S_EXT_CTRLS, ctrls)
+      return ctrls.error_idx == 0
+    except OSError:
+      return False
+
   def _open(self):
     self.fd = os.open(self.device, os.O_RDWR | os.O_NONBLOCK)
 
@@ -446,14 +496,19 @@ class V4L2Camera:
       print(f"[V4L2Camera] {self.device}: WARNING 字节序实测失败, 沿用 G_FMT 的 {self.cam_format_name} (可能解错变绿)", flush=True)
 
     if self.exposure is not None:
-      ctrl = v4l2_control()
-      ctrl.id = V4L2_CID_EXPOSURE_TEGRA
-      ctrl.value = self.exposure
-      try:
-        fcntl.ioctl(self.fd, VIDIOC_S_CTRL, ctrl)
-        print(f"[V4L2Camera] {self.device}: exposure={self.exposure}", flush=True)
-      except OSError as e:
-        print(f"[V4L2Camera] {self.device}: 设曝光失败 {e}", flush=True)
+      # ① 正路: int64 扩展控制 (tegra 的 exposure 是 64 位)
+      if self._set_exposure64(self.exposure):
+        print(f"[V4L2Camera] {self.device}: exposure={self.exposure} (S_EXT_CTRLS/int64)", flush=True)
+      else:
+        # ② 兜底: 老写法 (32 位)。某些驱动/内核版本只认这个。
+        ctrl = v4l2_control()
+        ctrl.id = V4L2_CID_EXPOSURE_TEGRA
+        ctrl.value = self.exposure
+        try:
+          fcntl.ioctl(self.fd, VIDIOC_S_CTRL, ctrl)
+          print(f"[V4L2Camera] {self.device}: exposure={self.exposure} (S_CTRL/int32 兜底)", flush=True)
+        except OSError as e:
+          print(f"[V4L2Camera] {self.device}: 设曝光失败 {e} (两种写法都不行 → 曝光用驱动默认值)", flush=True)
 
     # 相机输出不是 NV12（或需要缩放）时，启用 VIC 硬件转换 UYVY→NV12
     # 注：taegra-camrtc 驱动不实现 G_FMT/S_FMT，G_FMT 失败时 cam_pixelformat 为 UYVY，
