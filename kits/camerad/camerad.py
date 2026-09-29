@@ -208,17 +208,15 @@ def _packed_yuv_to_nv12(yuv_data, width, height, pixel_format='UYVY'):
   uv_plane = nv12[height * width:].reshape(height // 2, width)
 
   if pixel_format == 'UYVY' and os.environ.get('GMSL_CHROMA_LAYOUT', 'twgmsl').lower() == 'twgmsl':
-    # 与 CP openpilot/tools/webcam/camera.py 完全一致：
-    # 实测 twgmsl packed 布局中，Y 在偶数字节；V/U 位于奇数字节的两条色度 lane。
-    # CP 原实现：y=a[0::2], u=a[3::4], v=a[1::4]。
+    # 2026-09-28 抓帧实测: video0 G_FMT pf=0x56595559 = YUYV, bytesused=4147200。
+    # 源就是标准 YUYV 4:2:2 (Y 在偶数字节), 按宏像素取真实色度;
+    # 曾误判成 "16bit LE / 无色度" 而写死 128, 导致画面全灰。
     for i in range(height):
       row = yuv[i]
       y_plane[i] = row[0::2]
       if i % 2 == 0:
-        # 当前 Qt shader 按标准 NV12: U 在偶数位、V 在奇数位。
-        # 实测原始 lane 与 CP 的历史命名相反；为恢复红/蓝正确方向，交换两条 lane。
-        uv_plane[i // 2, 0::2] = row[1::4]  # U
-        uv_plane[i // 2, 1::2] = row[3::4]  # V
+        uv_plane[i // 2, 0::2] = row[1::4]
+        uv_plane[i // 2, 1::2] = row[3::4]
     return nv12
 
   if pixel_format == 'UYVY':
@@ -239,7 +237,8 @@ def _packed_yuv_to_nv12(yuv_data, width, height, pixel_format='UYVY'):
 
 
 class CudaUyvyConverter:
-  def __init__(self, width, height, src_w=1920, src_h=1080, dst_stride=None, y_plane_rows=None):
+  def __init__(self, width, height, src_w=1920, src_h=1080, dst_stride=None, y_plane_rows=None,
+               layout=0, src_stride=None):
     self.W = width
     self.H = height
     self.dst_stride = dst_stride if dst_stride is not None else width
@@ -251,11 +250,18 @@ class CudaUyvyConverter:
       self.aligned_size = ((s + 4095) // 4096) * 4096
     else:
       self.aligned_size = None
-    self.src_w = src_w      # 源 packed 采集尺寸 (NvBufSurface, 1920x1080)
+    self.src_w = src_w      # 源 packed 有效区 (真实图像区, 1920x1080)
     self.src_h = src_h
+    # 源 packed 实际行距。twgmsl 4K 虚标画布状态下是 7680 (有效 1920px 在每行行首),
+    # 紧凑 1080p 状态是 3840; 写死 src_w*2 只在紧凑状态成立。
+    self.src_stride = src_stride if src_stride else src_w * 2
     # cp 适配开关 (env): SP_CAM_FLIP=1 180°翻转; SP_CHROMA_SWAP=1 色度 U/V 交换
     self.flip = os.environ.get('SP_CAM_FLIP', '0') == '1'
     self.chroma_swap = os.environ.get('SP_CHROMA_SWAP', '0') == '1'
+    # packed 4:2:2 字节序: 0=YUYV [Y U Y V], 1=UYVY [U Y V Y]。
+    # 用 v4l2_dmabuf_camera.py 在 open 时从真实帧实测出的值 (G_FMT 的 pf 字段在 4K
+    # 虚标画布状态下对所有节点都报 UYVY, 不可信; 同一节点在两种驱动状态间还会翻转)。
+    self.layout = 1 if layout else 0
     self.uyvy_size = width * height * 2
     self.nv12_size = width * height * 3 // 2
     self.stride = width * 2
@@ -273,23 +279,24 @@ class CudaUyvyConverter:
     if packed_so is not None and packed_so.exists() and os.environ.get('GMSL_CHROMA_LAYOUT', 'twgmsl').lower() == 'twgmsl':
       try:
         self._packed = ctypes.CDLL(str(packed_so))
-        self._packed.packed_to_nv12.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        self._packed.packed_to_nv12.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
         self._packed.packed_to_nv12.restype = ctypes.c_int
         # host 版 resize: 源采集尺寸 != 输出尺寸时 (CAM_WIDTH/HEIGHT 覆盖), 修复行距错位花屏
         self._packed.packed_to_nv12_resize.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
-                                                       ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+                                                       ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                                       ctypes.c_int, ctypes.c_int]
         self._packed.packed_to_nv12_resize.restype = ctypes.c_int
         # 零拷贝入口: 直接写到设备指针, 不 D2H
-        self._packed.packed_to_nv12_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        self._packed.packed_to_nv12_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
         self._packed.packed_to_nv12_device.restype = ctypes.c_int
-        self._packed.packed_to_nv12_device_to_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        self._packed.packed_to_nv12_device_to_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
         self._packed.packed_to_nv12_device_to_device.restype = ctypes.c_int
         # resize+flip 零拷贝 (cp 链路: 1920x1080 源 → 1344x760 输出, 双线性)
-        self._packed.packed_to_nv12_resize_device_to_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        self._packed.packed_to_nv12_resize_device_to_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
         self._packed.packed_to_nv12_resize_device_to_device.restype = ctypes.c_int
         self.nv12_cpu = np.zeros(self.nv12_size, dtype=np.uint8)
         self._use_cuda = True
-        print(f"[CudaUyvyConverter] packed CUDA kernel OK: {width}x{height}", flush=True)
+        print(f"[CudaUyvyConverter] packed CUDA kernel OK: {width}x{height} layout={'UYVY' if self.layout else 'YUYV'}", flush=True)
         return
       except Exception as e:
         print(f"[CudaUyvyConverter] packed CUDA init failed: {e}, fallback", flush=True)
@@ -345,11 +352,12 @@ class CudaUyvyConverter:
         ret = self._packed.packed_to_nv12_resize(ctypes.c_void_p(src.ctypes.data),
                                                  ctypes.c_void_p(self.nv12_cpu.ctypes.data),
                                                  self.src_w, self.src_h, self.W, self.H,
-                                                 1 if self.flip else 0, 1 if self.chroma_swap else 0)
+                                                 1 if self.flip else 0, 1 if self.chroma_swap else 0,
+                                                 self.layout, self.src_stride)
       else:
         ret = self._packed.packed_to_nv12(ctypes.c_void_p(src.ctypes.data),
                                           ctypes.c_void_p(self.nv12_cpu.ctypes.data),
-                                          self.W, self.H)
+                                          self.W, self.H, self.layout, self.src_stride)
       if ret != 0:
         print(f"[CUDA] packed_to_nv12 failed ret={ret}", flush=True)
         return None
@@ -380,7 +388,7 @@ class CudaUyvyConverter:
     src = np.ascontiguousarray(uyvy_data, dtype=np.uint8)
     ret = self._packed.packed_to_nv12_device(ctypes.c_void_p(src.ctypes.data),
                                              ctypes.c_void_p(dst_device_ptr),
-                                             self.W, self.H)
+                                             self.W, self.H, self.layout, self.src_stride)
     if ret != 0:
       print(f"[CUDA] packed_to_nv12_device failed ret={ret}", flush=True)
       return False
@@ -392,7 +400,7 @@ class CudaUyvyConverter:
       return False
     ret = self._packed.packed_to_nv12_device_to_device(ctypes.c_void_p(src_device_ptr),
                                                        ctypes.c_void_p(dst_device_ptr),
-                                                       self.W, self.H)
+                                                       self.W, self.H, self.layout, self.src_stride)
     if ret != 0:
       print(f"[CUDA] packed_to_nv12_device_to_device failed ret={ret}", flush=True)
       return False
@@ -400,9 +408,11 @@ class CudaUyvyConverter:
 
   def convert_resize_device_to_device(self, src_device_ptr, dst_device_ptr,
                                       src_w=None, src_h=None, dst_w=None, dst_h=None,
-                                      flip=None, chroma_swap=None, dst_stride=None, y_plane_rows=None):
-    """resize+flip 零拷贝: 源采集尺寸 → 目标输出尺寸 (cp 链路: 1920x1080 → 1344x760)。
+                                      flip=None, chroma_swap=None, dst_stride=None, y_plane_rows=None,
+                                      src_stride=None):
+    """resize+flip 零拷贝: 源有效区尺寸 → 目标输出尺寸 (1920x1080 → 1344x760)。
     参数缺省取 self 的构造值(env 可配)。flip=1 时 180°翻转, chroma_swap=1 时 U/V 交换。
+    src_stride: 源 packed 实际行距 (紧凑 1080p=3840, 4K 虚标画布=7680)。
     dst_stride/y_plane_rows: 对齐输出时传入 (Venus 布局), 缺省紧密 (stride=W, rows=H)。"""
     if self._packed is None:
       return False
@@ -414,11 +424,12 @@ class CudaUyvyConverter:
     cs = self.chroma_swap if chroma_swap is None else chroma_swap
     st = dst_stride if dst_stride is not None else self.dst_stride
     yr = y_plane_rows if y_plane_rows is not None else self.y_plane_rows
+    ss = src_stride if src_stride is not None else self.src_stride
     ret = self._packed.packed_to_nv12_resize_device_to_device(ctypes.c_void_p(src_device_ptr),
                                                               ctypes.c_void_p(dst_device_ptr),
                                                               sw, sh, dw, dh,
-                                                              1 if fl else 0, 1 if cs else 0,
-                                                              st, yr)
+                                                              1 if fl else 0, 1 if cs else 0, self.layout,
+                                                              st, yr, ss)
     if ret != 0:
       print(f"[CUDA] packed_to_nv12_resize_device_to_device failed ret={ret} {sw}x{sh}->{dw}x{dh}", flush=True)
       return False
@@ -518,11 +529,24 @@ class Camerad:
         self.vipc_server.create_buffers(c.stream_type, 20, out_w, out_h)
       vic_enabled = getattr(getattr(cam, 'cam', None), '_vic', False)
       use_dmabuf = getattr(getattr(cam, 'cam', None), '_use_dmabuf', False)
-      print(f"[camerad] camera={c.msg_name} device={cam_device} size={out_w}x{out_h} src={cam.W}x{cam.H} vic={vic_enabled} dmabuf={use_dmabuf}", flush=True)
+      # packed 4:2:2 字节序用 v4l2_dmabuf_camera.py 在 open 时从真实帧实测出的
+      # cam_format_name (G_FMT 的 pf 字段在 4K 虚标画布状态下对所有节点都报 UYVY,
+      # 不可信; 同一节点在两种驱动状态间还会翻转)。写死一种必然有一路变绿。
+      _fmt = getattr(getattr(cam, 'cam', None), 'cam_format_name', 'YUYV')
+      _layout = 1 if str(_fmt).upper() == 'UYVY' else 0
+      print(f"[camerad] camera={c.msg_name} device={cam_device} size={out_w}x{out_h} src={cam.W}x{cam.H} vic={vic_enabled} dmabuf={use_dmabuf} format={_fmt} layout={'UYVY' if _layout else 'YUYV'}", flush=True)
       if self.use_v4l2 and not vic_enabled:
-        # 源尺寸 = 相机实际采集尺寸, 输出尺寸 = CAM_WIDTH/CAM_HEIGHT (可配, 如 1344x760)
-        self.converters[c.stream_type] = CudaUyvyConverter(out_w, out_h, src_w=cam.W, src_h=cam.H,
-                                                           dst_stride=(_st if _ALIGNED else out_w), y_plane_rows=(_yh if _ALIGNED else out_h))
+        # 源尺寸 = 真实图像区 (cam_active_w/h; 4K 虚标画布下只是左上 1920x1080),
+        # 源行距 = src_w*2: 采集层(v4l2_dmabuf_camera._numpy_downsample)已经按画布行距
+        #   取行、再切成紧致的有效区, 交给这里的 buffer 一定是 tight 的 1920x1080 packed。
+        #   ⚠️ 不能传 cam_bytesperline(画布行距 7680): 那会让 kernel 按 1080x7680=8.3MB
+        #   去读一个只有 4.1MB 的 buffer → 越界读 → camerad SIGSEGV(实测踩过)。
+        # 输出尺寸 = CAM_WIDTH/CAM_HEIGHT (可配, 如 1344x760), 由 kernel resize。
+        _src_w = getattr(getattr(cam, 'cam', None), 'cam_active_w', cam.W)
+        _src_h = getattr(getattr(cam, 'cam', None), 'cam_active_h', cam.H)
+        self.converters[c.stream_type] = CudaUyvyConverter(out_w, out_h, src_w=_src_w, src_h=_src_h,
+                                                           dst_stride=(_st if _ALIGNED else out_w), y_plane_rows=(_yh if _ALIGNED else out_h),
+                                                           layout=_layout, src_stride=_src_w * 2)
       if self._nvbuf_zerocopy:
         stage = ctypes.c_void_p()
         nv12_size = out_w * out_h * 3 // 2

@@ -169,24 +169,28 @@ class CalibrationPanel:
     self._msg = ""
 
     self.items = {
+      # msgid 与 sp 的 qt developer_panel.cc 逐字一致, 直接复用它的官方中文翻译
+      # (长焦标定 / 长焦在线标定 / 广角标定 / 摄像头标定参数)
       "fcam": button_item(tr("FCAM Calibration"), tr("RUN"),
                           tr("Analyze radar-vision lead distance, lane width, and IMU-model curvature "
                              "to verify camera intrinsic calibration. Requires recent drive logs."),
                           callback=self.on_fcam_scan),
       "fcam_live": button_item(tr("FCAM Live Calibration"), tr("START"),
-                               tr("Toggle ON before driving: collects radar-vision lead distance, lane width "
-                                  "and IMU-model curvature during the drive. Computes FCAM calibration on "
-                                  "shutdown and saves the result."),
+                               tr("Toggle ON before driving: collects radar-vision lead distance, lane "
+                                  "width, and IMU-model curvature data during the drive. "
+                                  "Auto-computes FCAM calibration on shutdown and saves result."),
                                callback=self.on_fcam_live),
       "wide": button_item(tr("Wide Calibration"), tr("START"),
-                          tr("Switch the wide-angle camera onto the road stream for ECAM calibration. "
-                             "START resets extrinsic calibration and starts live sample collection "
-                             "(needs rv>=30 + lw>=10 + cv>=10). STOP computes ECAM intrinsics; "
-                             "if data is insufficient nothing is saved."),
+                          tr("Switch to wide-angle camera for ECAM calibration. "
+                             "START: resets extrinsic calibration, swaps ECAM to road stream, "
+                             "and runs live radar-vision data collection. Monitor collection "
+                             "status in the description (rv≥30 + lw≥10 + cv≥10 needed). "
+                             "STOP: computes ECAM intrinsics; if data is insufficient no "
+                             "save prompt will appear."),
                           callback=self.on_wide_calib),
       "view": button_item(tr("Camera Calibration"), tr("VIEW"),
-                          tr("View current FCAM and ECAM intrinsic focal lengths and the "
-                             "extrinsic calibration (roll/pitch/yaw)."),
+                          tr("View current FCAM and ECAM intrinsic focal lengths, "
+                             "and extrinsic calibration (roll/pitch/yaw)."),
                           callback=self.on_view_calib),
     }
 

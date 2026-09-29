@@ -15,7 +15,10 @@ def v4l2_fourcc(a, b, c, d):
 # V4L2 ioctl 常量
 VIDIOC_QUERYCAP    = 0x80685600
 VIDIOC_QUERYBUF    = 0xC0585609
-VIDIOC_G_FMT       = 0xC0CC5604
+# 本驱动 (twgmsl vi-output) 只接受 size=0xD0(208) 的 G_FMT; 旧值 0xC0CC5604(204)
+# 会让 ioctl 恒定返回 EINVAL, 于是 cam_pixelformat 退化成硬编码的 'UYVY' 兜底。
+# video0 真实是 YUYV, 被当 UYVY 解就是全绿 —— G_FMT 必须能读出真实格式。
+VIDIOC_G_FMT       = 0xC0D05604
 VIDIOC_REQBUFS     = 0xC0145608
 VIDIOC_QBUF        = 0xC058560F
 VIDIOC_DQBUF       = 0xC0585611
@@ -30,6 +33,7 @@ V4L2_MEMORY_DMABUF          = 4
 V4L2_CAP_STREAMING = 0x04000000
 V4L2_BUF_FLAG_ERROR = 0x00000040
 V4L2_PIX_FMT_UYVY = v4l2_fourcc('U', 'Y', 'V', 'Y')
+V4L2_PIX_FMT_YUYV = v4l2_fourcc('Y', 'U', 'Y', 'V')
 V4L2_PIX_FMT_NV12 = v4l2_fourcc('N', 'V', '1', '2')
 
 # tegra-video 驱动的 exposure 控制 ID（0x009a200a，无 auto_exposure）
@@ -243,8 +247,44 @@ class V4L2Camera:
     self._nv12_size = width * height * 3 // 2
     self._open()
 
+  def _measure_packed_layout(self, frame, bytesused):
+    """从真实帧判定 packed 4:2:2 字节序 (YUYV 还是 UYVY)。
+
+    必须实测, 不能信 G_FMT 的 pf 字段 —— twgmsl 在 4K 虚标画布状态下对所有节点
+    都报 UYVY, 但实测 video0 是 YUYV / video1 是 UYVY; 而且同一节点在两种驱动
+    状态间还会翻转 (紧凑 1080p 时 video0=YUYV, 4K 画布时 video0=UYVY)。
+
+    判据: 正确的字节序解出的亮度有明暗层次 (std ≈ 30); 解错则亮度被压平成常数
+    (std ≈ 7-10), 色度反而出现高方差。取 std 大的那个。
+    """
+    if frame is None or bytesused <= 0:
+      return None
+    # 4K 画布: 真实图在左上 ACTIVE_W x ACTIVE_H, 行距 7680; 其余全零
+    if bytesused == self.CAMERA_NATIVE_SIZE:
+      stride = self.CAMERA_NATIVE_WIDTH * 2
+      h = self.ACTIVE_HEIGHT
+    else:
+      stride = max(self.cam_bytesperline, 1)
+      h = min(self.cam_h, len(frame) // stride)
+    need = h * stride
+    if need <= 0 or need > len(frame):
+      return None
+    rows = np.frombuffer(frame[:need], dtype=np.uint8).reshape(h, stride)
+    # 只取每行前 ACTIVE_W*2 字节 (4K 画布下每行后半是全零 padding)
+    tight = np.ascontiguousarray(rows[:, :self.ACTIVE_WIDTH * 2])
+    best, best_sd = None, -1.0
+    for name, yo in (("YUYV", 0), ("UYVY", 1)):
+      y = tight[:, yo::2]
+      sd = float(y.std())
+      if sd > best_sd:
+        best, best_sd = name, sd
+    if best is None or best_sd < 5.0:
+      return None
+    return best, best_sd
+
   def _probe_frame_bytesused(self):
-    """open 阶段布局探测: 临时 MMAP 抓几帧, 返回稳定后的 bytesused。
+    """open 阶段布局探测: 临时 MMAP 抓几帧, 返回稳定后的 bytesused,
+    并顺手把 packed 字节序 (YUYV/UYVY) 实测出来存在 self.probed_layout。
     结束时 STREAMOFF + 释放全部临时资源 + munmap, 不留脏状态。"""
     probe = v4l2_requestbuffers()
     probe.count = 2
@@ -252,6 +292,7 @@ class V4L2Camera:
     probe.memory = V4L2_MEMORY_MMAP
     mms = []
     seen = []
+    keep = None
     try:
       fcntl.ioctl(self.fd, VIDIOC_REQBUFS, probe)
       if probe.count == 0:
@@ -285,6 +326,9 @@ class V4L2Camera:
           time.sleep(0.002)
           continue
         seen.append(buf.bytesused)
+        if keep is None:
+          mm, length = mms[buf.index]
+          keep = bytes(mm[:min(buf.bytesused, length)])
         rq = v4l2_buffer()
         rq.index = buf.index
         rq.type = V4L2_BUF_TYPE_VIDEO_CAPTURE
@@ -316,7 +360,10 @@ class V4L2Camera:
       return -1
     # 稳定值: 取众数 (前几帧可能有过渡)
     vals, counts = np.unique(np.array(seen), return_counts=True)
-    return int(vals[np.argmax(counts)])
+    stable = int(vals[np.argmax(counts)])
+    # 用稳定后的 bytesused 量字节序
+    self.probed_layout = self._measure_packed_layout(keep, stable)
+    return stable
 
   def _open(self):
     self.fd = os.open(self.device, os.O_RDWR | os.O_NONBLOCK)
@@ -330,7 +377,7 @@ class V4L2Camera:
 
     self._gfmt_ok = False
     try:
-      fmt = bytearray(204)
+      fmt = bytearray(208)
       struct.pack_into("I", fmt, 0, V4L2_BUF_TYPE_VIDEO_CAPTURE)
       fcntl.ioctl(self.fd, VIDIOC_G_FMT, fmt)
       # struct v4l2_format: type@0 (4B) → union 对齐到 8 → pix.width@8 height@12
@@ -340,8 +387,9 @@ class V4L2Camera:
       self.cam_pixelformat = struct.unpack_from("I", fmt, 16)[0]
       self.cam_bytesperline = struct.unpack_from("I", fmt, 24)[0]
       self.cam_sizeimage = struct.unpack_from("I", fmt, 28)[0]
-      self.cam_format_name = {V4L2_PIX_FMT_UYVY: 'UYVY', V4L2_PIX_FMT_NV12: 'NV12'}.get(self.cam_pixelformat, f"0x{self.cam_pixelformat:08x}")
+      self.cam_format_name = {V4L2_PIX_FMT_UYVY: 'UYVY', V4L2_PIX_FMT_YUYV: 'YUYV', V4L2_PIX_FMT_NV12: 'NV12'}.get(self.cam_pixelformat, f"0x{self.cam_pixelformat:08x}")
       self._gfmt_ok = True
+      self._gfmt_pixelformat = self.cam_pixelformat
       print(f"[V4L2Camera] {self.device}: G_FMT {self.cam_w}x{self.cam_h} {self.cam_format_name} stride={self.cam_bytesperline}")
     except OSError:
       self.cam_w = self.CAMERA_NATIVE_WIDTH
@@ -350,33 +398,52 @@ class V4L2Camera:
       self.cam_format_name = 'UYVY'
       self.cam_bytesperline = self.cam_w * 2
       self.cam_sizeimage = self.cam_h * self.cam_bytesperline
+      self._gfmt_pixelformat = None
       print(f"[V4L2Camera] {self.device}: G_FMT 失败 (twgmsl 不实现)，buffer 几何用 {self.cam_w}x{self.cam_h} UYVY")
 
     # G_FMT 失败 = twgmsl（驱动不实现 G_FMT）。布局用实测判定：驱动状态不同会发两种帧：
     #   ① 4K 画布: bytesused=16588800, 行距 7680, 真实 1920x1080 在左上（虚标状态）
     #   ② 紧凑 1080p: bytesused=4147200, 行距 3840, 整幅有效（真实状态，硬杀/重载后可能出现）
     # 靠猜会出 "1/4 画面" 或 "上半画面下半绿"，所以 open 时先抓一帧量 bytesused。
-    if self._gfmt_ok:
+    # twgmsl 驱动状态会变 (重启后回到 4K 虚标画布, 硬杀/重载后可能是紧凑 1080p),
+    # 而且真实图在 buffer 里的位置/行距、以及每个节点的 packed 字节序都会随之变化。
+    # G_FMT 的 pf 字段在 4K 画布状态下对所有节点都报 UYVY (实测 video0 其实是 YUYV),
+    # 几何也可能和真实 DMA 不一致 —— 所以一律以实测为准, G_FMT 只用来交叉印证。
+    probed = self._probe_frame_bytesused()
+    if probed == self.CAMERA_NATIVE_SIZE:
+      self.cam_w, self.cam_h = self.CAMERA_NATIVE_WIDTH, self.CAMERA_NATIVE_HEIGHT
+      self.cam_bytesperline = self.cam_w * 2
+      self.cam_sizeimage = self.CAMERA_NATIVE_SIZE
+      self.cam_active_w, self.cam_active_h = self.ACTIVE_WIDTH, self.ACTIVE_HEIGHT
+      print(f"[V4L2Camera] {self.device}: 实测 bytesused={probed} → 4K 画布布局, 行距 {self.cam_bytesperline}, 有效区 {self.cam_active_w}x{self.cam_active_h}", flush=True)
+    elif probed == self.ACTIVE_WIDTH * self.ACTIVE_HEIGHT * 2:
+      self.cam_w, self.cam_h = self.ACTIVE_WIDTH, self.ACTIVE_HEIGHT
+      self.cam_bytesperline = self.cam_w * 2
+      self.cam_sizeimage = probed
       self.cam_active_w, self.cam_active_h = self.cam_w, self.cam_h
+      print(f"[V4L2Camera] {self.device}: 实测 bytesused={probed} → 紧凑 1080p 布局, 整幅有效", flush=True)
     else:
-      probed = self._probe_frame_bytesused()
-      if probed == self.CAMERA_NATIVE_SIZE:
-        self.cam_w, self.cam_h = self.CAMERA_NATIVE_WIDTH, self.CAMERA_NATIVE_HEIGHT
-        self.cam_bytesperline = self.cam_w * 2
-        self.cam_sizeimage = self.CAMERA_NATIVE_SIZE
+      # 探测失败: 退回 G_FMT 报告的几何, 但不信任它的 pf (下面用实测覆盖)
+      self.cam_bytesperline = max(self.cam_bytesperline, self.cam_w * 2)
+      self.cam_sizeimage = max(self.cam_sizeimage, self.cam_h * self.cam_bytesperline)
+      if (self.cam_w, self.cam_h) == (self.CAMERA_NATIVE_WIDTH, self.CAMERA_NATIVE_HEIGHT):
         self.cam_active_w, self.cam_active_h = self.ACTIVE_WIDTH, self.ACTIVE_HEIGHT
-        print(f"[V4L2Camera] {self.device}: 实测 bytesused={probed} → 4K 画布布局, 有效区 {self.cam_active_w}x{self.cam_active_h}", flush=True)
-      elif probed == self.ACTIVE_WIDTH * self.ACTIVE_HEIGHT * 2:
-        self.cam_w, self.cam_h = self.ACTIVE_WIDTH, self.ACTIVE_HEIGHT
-        self.cam_bytesperline = self.cam_w * 2
-        self.cam_sizeimage = probed
-        self.cam_active_w, self.cam_active_h = self.cam_w, self.cam_h
-        print(f"[V4L2Camera] {self.device}: 实测 bytesused={probed} → 紧凑 1080p 布局, 整幅有效", flush=True)
       else:
-        self.cam_active_w = min(self.cam_w, self.ACTIVE_WIDTH)
-        self.cam_active_h = min(self.cam_h, self.ACTIVE_HEIGHT)
-        print(f"[V4L2Camera] {self.device}: 探测失败 (bytesused={probed})，按 4K 画布布局兜底", flush=True)
-      self._expected_bytesused = probed
+        self.cam_active_w, self.cam_active_h = self.cam_w, self.cam_h
+      print(f"[V4L2Camera] {self.device}: WARNING 实测 bytesused={probed} 不可用, 退回 G_FMT 几何 {self.cam_w}x{self.cam_h} stride={self.cam_bytesperline}", flush=True)
+    self._expected_bytesused = probed
+
+    # 字节序以实测为准 (G_FMT 的 pf 在 4K 画布状态下是假的)
+    if getattr(self, 'probed_layout', None):
+      _lay_name, _lay_sd = self.probed_layout
+      self.cam_format_name = _lay_name
+      self.cam_pixelformat = V4L2_PIX_FMT_UYVY if _lay_name == 'UYVY' else V4L2_PIX_FMT_YUYV
+      _gfmt_says = 'UYVY' if V4L2_PIX_FMT_UYVY == getattr(self, '_gfmt_pixelformat', None) else (
+        'YUYV' if V4L2_PIX_FMT_YUYV == getattr(self, '_gfmt_pixelformat', None) else '?')
+      note = '' if _gfmt_says == _lay_name else f" (G_FMT 报 {_gfmt_says}, 不采信)"
+      print(f"[V4L2Camera] {self.device}: packed 字节序实测={_lay_name} (Y.std={_lay_sd:.1f}){note}", flush=True)
+    else:
+      print(f"[V4L2Camera] {self.device}: WARNING 字节序实测失败, 沿用 G_FMT 的 {self.cam_format_name} (可能解错变绿)", flush=True)
 
     if self.exposure is not None:
       ctrl = v4l2_control()
@@ -426,11 +493,13 @@ class V4L2Camera:
         for i in range(self.num_buffers):
           src_params = NvBufSurfaceCreateParams()
           src_params.gpuId = 0
-          # 源尺寸 = 相机实际采集尺寸 (cam_active = 探测的有效区, 1920x1080) —
-          # 驱动按 sensor 真实尺寸写 DMA; 下游输出尺寸(target_w/h)可能不同(cp: 1344x760),
-          # 由 CUDA kernel resize, 不能拿输出尺寸建源 surface(会溢出/越界)。
-          src_params.width = self.cam_active_w
-          src_params.height = self.cam_active_h
+          # 源 surface 尺寸必须 = 驱动真实 DMA 的画布 (cam_w x cam_h), 不是 cam_active。
+          # 4K 虚标画布状态下驱动会往这个 fd DMABUF cam_h*cam_bytesperline = 16588800 字节;
+          # 若按 cam_active (1920x1080=4147200 字节) 建, 驱动写入量是缓冲的 4 倍 →
+          # 越界 + 错行, 下游表现为"左上 1/4 画面 + 其余绿色"。
+          # 真实图只占左上 cam_active 区域, 由 CUDA kernel 按 src_stride 裁 (不缩放整幅 4K)。
+          src_params.width = self.cam_w
+          src_params.height = self.cam_h
           src_params.size = 0
           src_params.isContiguous = True
           src_params.colorFormat = NVBUF_COLOR_FORMAT_UYVY
