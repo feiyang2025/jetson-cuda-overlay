@@ -4,21 +4,35 @@ set -euo pipefail
 # Build the CH347 (USB-I2C) IMU daemon for AGX Orin / Linux.
 # Produces  openpilot/system/sensord/ch347t
 #
-# Usage: bash build_ch347t.sh [repo-root]   (default: current dir)
+# Usage: bash build_ch347t.sh [hint-dir]   (从任意 cwd 都能跑)
 #
+# 布局自适应 (老布局 openpilot/ 是软链 / 新布局 openpilot/ 是真实子目录):
+#   SELF_DIR  = 本脚本所在目录 = 真实物理路径
+#   REPO_ROOT = 从 SELF_DIR 向上找到第一个含 msgq_repo/ 的目录
+#               (msgq_repo 在两种布局里都落在树根; 不要再靠 ../.. 数级数)
+#   SRC/OUT   = SELF_DIR 下的 ch347t.cc / ch347t, 与目录层级无关
 # Links only against libc/libstdc++/libdl + the CH347 vendor .so at runtime
 # (dlopen), so it does NOT need json11 or a full openpilot build.
 
-REPO_ROOT="${1:-$(pwd)}"
-REPO_ROOT="$(cd "$REPO_ROOT" && pwd -P)"
-# master-c3 新布局自适应: openpilot/ 是真实子目录时, run_ch347t.sh 的
-# REPO_ROOT=../.. 物理两级会落在 <树根>/openpilot (老布局 openpilot 是软链则落在树根)。
-# 若当前 REPO_ROOT 下找不到 ch347t.cc 但父目录有, 提升一级。
-if [ ! -f "$REPO_ROOT/openpilot/system/sensord/ch347t.cc" ] && [ -f "$REPO_ROOT/system/sensord/ch347t.cc" ]; then
-  REPO_ROOT="$(dirname "$REPO_ROOT")"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+if [ -n "${1:-}" ] && [ -d "${1}" ]; then
+  REPO_ROOT="$(cd "${1}" && pwd -P)"
+else
+  REPO_ROOT="$SELF_DIR"
 fi
-SRC="$REPO_ROOT/openpilot/system/sensord/ch347t.cc"
-OUT="$REPO_ROOT/openpilot/system/sensord/ch347t"
+
+# 若传入的不是树根 (比如 cwd/sensord 目录), 向上找到含 msgq_repo 的那一级
+while [ "$REPO_ROOT" != "/" ] && [ ! -d "$REPO_ROOT/msgq_repo" ]; do
+  REPO_ROOT="$(dirname "$REPO_ROOT")"
+done
+if [ ! -d "$REPO_ROOT/msgq_repo" ]; then
+  echo "ERROR: 从 $SELF_DIR 向上找不到含 msgq_repo/ 的树根 (is this an openpilot tree?)" >&2
+  exit 1
+fi
+
+SRC="$SELF_DIR/ch347t.cc"
+OUT="$SELF_DIR/ch347t"
 MSGQ="$REPO_ROOT/openpilot/cereal/messaging"
 
 echo "[build_ch347t] src=$SRC"

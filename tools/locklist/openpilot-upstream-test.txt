@@ -20,7 +20,11 @@ openpilot/selfdrive/modeld/transforms/cuda_transform.h
 # --- 构建与子模块 ---
 SConstruct
 msgq_repo
+openpilot/common/hardware/pc/hardware.h
 
-# --- 启动/其他适配 (按需增删) ---
-# launch_env.sh
-# launch_chffrplus.sh
+# --- 启动/其他适配 ---
+launch_env.sh
+launch_chffrplus.sh
+openpilot/selfdrive/ui/onroad/cameraview.py
+openpilot/system/manager/process_config.py
+openpilot/system/sensord/ch347t.cc

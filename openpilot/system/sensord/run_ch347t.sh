@@ -6,18 +6,19 @@ set -euo pipefail
 #
 # Launched by the manager as a NativeProcess with cwd = <repo>/openpilot/system/sensord
 
-# Resolve symlinks so REPO_ROOT lands in the real repo, not a symlink parent.
-# Physical path from sensord/ to repo root is 2 levels up (system → ajouatom),
-# but the logical path openpilot/system/sensord/ is 3 levels. Using pwd -P
-# resolves symlinks, so we need ../.. not ../../..
+# Resolve our own real directory. REPO_ROOT is *not* derived by counting
+# "../.." levels any more — the layout differs (old: openpilot/ is a symlink,
+# new: openpilot/ is a real subdir). build_ch347t.sh finds the repo root itself
+# by walking up to the first dir containing msgq_repo/.
 SELF_DIR="$(cd "$(dirname "$0")" && pwd -P)"
-REPO_ROOT="$(cd "$SELF_DIR/../.." && pwd -P)"
 
 BIN="$SELF_DIR/ch347t"
 
-if [ ! -x "$BIN" ]; then
+# Rebuild also when the source is newer than the binary: the cereal schema
+# changes across forks and a stale binary fails to publish / crashes manager.
+if [ ! -x "$BIN" ] || [ "$SELF_DIR/ch347t.cc" -nt "$BIN" ]; then
   echo "[ch347t] building..."
-  bash "$SELF_DIR/build_ch347t.sh" "$REPO_ROOT"
+  bash "$SELF_DIR/build_ch347t.sh"
 fi
 
 exec "$BIN"

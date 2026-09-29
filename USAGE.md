@@ -22,6 +22,20 @@ source .venv/bin/activate && scons -j8 common/         # 标定组件改了 para
 上传上游更新（`git pull`）之后**再跑一次**即可恢复全部改动。跑完用
 `bash tools/self_check.sh <树根>` 做 kit 完整性自检（相机链路/推理兜底/msgq 零拷贝/SCC 散改）。
 
+> **上游更新走脚本，别手动 `git pull`**：
+> ```bash
+> bash tools/sync_upstream.sh <你的树根>
+> ```
+> 它会 fetch 上游 → 对比"适配基线 SHA"是否被改写 → 上游动了锁定清单里的文件就 STOP 报警 →
+> 干净时才 merge + 重跑 apply_cuda.sh + panda_维护.sh + self_check.sh，最后把基线刷成新上游 HEAD。
+> 基线记在 `<树根>/.overlay_baseline`，上游地址/分支记在 `<树根>/.overlay_sync.conf`，
+> 锁定清单在 `tools/locklist/<仓库名>.txt`。
+>
+> **上游强推/重写过历史时**（基线不再是新上游 HEAD 的祖先），脚本会先 STOP 并打印重放步骤；
+> 确认本地改动都在 overlay 里可重放后，用 `--accept-rewrite` 让它自动做：
+> 建 backup 分支 → `reset --hard 上游HEAD` → 同步子模块 → 重跑 overlay → 自检。
+> 未跟踪的产物（.plan 引擎、.so、模型目录）不受 `reset --hard` 影响。
+
 ---
 
 ## 1. 组件清单（能给你什么）
@@ -35,6 +49,7 @@ source .venv/bin/activate && scons -j8 common/         # 标定组件改了 para
 | 5 | CH347 IMU | `openpilot/system/sensord/ch347t.{cc,py}`、`third_party/ch347/` | `system/sensord/` + `third_party/ch347/` | 外置 USB-I2C LSM6DS3（板载无 IMU 时用），带开机零偏自动校准，没插就自动退出 |
 | 6 | **相机标定工具链** | `openpilot/tools/calib/*`、`patch_calib.py` | `tools/calib/`、并打补丁到 `common/transformations/camera.py` + `common/params_keys.h` | FCAM/ECAM 内参 + ECAM 外参标定，结果按分辨率存 Params 供全栈使用 |
 | 7 | **Panda 固件/协议统一** | `/data/openpilot/panda_版本核对/`（设备侧脚本） | 不进 overlay，运行在 `/data/openpilot` | 让所有分支共用同一份 panda 固件与协议，**不再来回刷固件** |
+| 8 | **master-c3 收口补丁** | `patch_master_c3.py`（apply_cuda.sh 末尾自动调用） | SConstruct / `launch_chffrplus.sh` / `launch_env.sh` / `pc/hardware.h` / `ui/onroad/cameraview.py` / `manager/process_config.py` | apply 覆盖不到的 carrot 系 AGX 改动（HOME/PARAMS_ROOT、树内 .venv、AGX env 默认、get_voltage/current、NV12 `.rg`、webcamerad restart_if_crash）。**按锚点判断，锚点不在就 SKIP，对别的 fork 无副作用** |
 
 > 6/7 是本轮新增。7 不落在 overlay 仓库里，因为它是"跨分支运维脚本"，作用于
 > `/data/openpilot/*` 三个仓库（panda 固件字节按 gitignore 属构建产物，不适合放进 overlay 仓库）。

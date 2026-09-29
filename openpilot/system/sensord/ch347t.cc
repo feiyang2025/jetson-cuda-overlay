@@ -604,9 +604,9 @@ static void publish_accelerometer(PubMaster &pm,
   MessageBuilder msg;
   auto evt = msg.initEvent();
   auto se = evt.initAccelerometer();
-  se.setVersion(1);
-  se.setSensor(1);
-  se.setType(1);
+  // setVersion removed in master-c3 schema
+  // setSensor removed in master-c3 schema
+  // setType removed in master-c3 schema
   se.setSource(source);
   se.setTimestamp(evt.getLogMonoTime());
   auto acc = se.initAcceleration();
@@ -614,7 +614,7 @@ static void publish_accelerometer(PubMaster &pm,
   v.set(0, v0);
   v.set(1, v1);
   v.set(2, v2);
-  acc.setStatus(1);
+  // setStatus removed in master-c3 schema
   pm.send("accelerometer", msg);
 }
 
@@ -624,9 +624,9 @@ static void publish_gyroscope(PubMaster &pm,
   MessageBuilder msg;
   auto evt = msg.initEvent();
   auto se = evt.initGyroscope();
-  se.setVersion(2);
-  se.setSensor(5);
-  se.setType(16);
+  // setVersion removed in master-c3 schema
+  // setSensor removed in master-c3 schema
+  // setType removed in master-c3 schema
   se.setSource(source);
   se.setTimestamp(evt.getLogMonoTime());
   auto gyro = se.initGyroUncalibrated();
@@ -634,7 +634,7 @@ static void publish_gyroscope(PubMaster &pm,
   v.set(0, v0);
   v.set(1, v1);
   v.set(2, v2);
-  gyro.setStatus(1);
+  // setStatus removed in master-c3 schema
   pm.send("gyroscope", msg);
 }
 
@@ -645,7 +645,7 @@ static void publish_temperature(PubMaster &pm,
   MessageBuilder msg;
   auto evt = msg.initEvent();
   auto se = evt.initTemperatureSensor();
-  se.setVersion(1);
+  // setVersion removed in master-c3 schema
   se.setSource(source);
   se.setTimestamp(evt.getLogMonoTime());
   se.setTemperature(25.0f + raw_t / tscale);

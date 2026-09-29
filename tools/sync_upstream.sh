@@ -21,11 +21,13 @@ OVERLAY_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 REPO_ROOT="$(cd "${1:-$(pwd)}" && pwd -P)"
 LOCKFILE=""
 BASELINE_OVERRIDE=""
+ACCEPT_REWRITE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --lockfile) LOCKFILE="$2"; shift 2 ;;
     --baseline) BASELINE_OVERRIDE="$2"; shift 2 ;;
+    --accept-rewrite) ACCEPT_REWRITE=1; shift ;;
     *) shift ;;
   esac
 done
@@ -89,6 +91,53 @@ echo "  fetching upstream/$UPSTREAM_BRANCH ..."
 git fetch upstream "$UPSTREAM_BRANCH" || fail "fetch 失败 (网络? 代理没 unset?)"
 UPSTREAM_HEAD="$(git rev-parse "upstream/$UPSTREAM_BRANCH")"
 echo "  上游 HEAD: ${UPSTREAM_HEAD:0:12}"
+
+# --- 4.5 上游历史被强推/改写? ---
+# 基线必须是上游 HEAD 的祖先。不是的话 "diff 基线..上游" 反映的是两条线的差异,
+# merge 会退化成几十处冲突的大杂烩 (master-c3 2026-09-29 实例: 56 处冲突)。
+if ! git merge-base --is-ancestor "$BASELINE" "$UPSTREAM_HEAD" 2>/dev/null; then
+  REWRITE_MB="$(git merge-base "$BASELINE" "$UPSTREAM_HEAD" 2>/dev/null || echo '')"
+  echo
+  echo "  [STOP] 上游历史被改写: 基线 ${BASELINE:0:12} 不是上游 HEAD ${UPSTREAM_HEAD:0:12} 的祖先" >&2
+  echo "         共同祖先: ${REWRITE_MB:0:12}" >&2
+  echo "         本地独有: $(git rev-list --count "$UPSTREAM_HEAD..$BASELINE") 条 / 上游独有: $(git rev-list --count "$BASELINE..$UPSTREAM_HEAD") 条" >&2
+  echo >&2
+  echo "  推荐做法 (以新上游为基准重放 overlay, 而不是 merge):" >&2
+  echo "    git -C $REPO_ROOT branch backup-\$(date +%Y%m%d%H%M%S) HEAD   # 留退路" >&2
+  echo "    git -C $REPO_ROOT reset --hard upstream/$UPSTREAM_BRANCH" >&2
+  echo "    git -C $REPO_ROOT submodule sync --recursive && git -C $REPO_ROOT submodule update --init --recursive" >&2
+  echo "    bash $OVERLAY_DIR/apply_cuda.sh $REPO_ROOT" >&2
+  echo "    bash $OVERLAY_DIR/tools/self_check.sh $REPO_ROOT" >&2
+  echo "  前提: 本地改动都在 overlay 里可重放 (untracked 产物不受 reset 影响)。" >&2
+  echo "  要脚本自动做完上面这套, 加 --accept-rewrite 重跑 (会先建 backup 分支)。" >&2
+  echo >&2
+  if [ "$ACCEPT_REWRITE" != "1" ]; then
+    exit 1
+  fi
+
+  BK="backup-$(git rev-parse --abbrev-ref HEAD)-$(date +%Y%m%d%H%M%S)"
+  echo "  --accept-rewrite: 建备份分支 $BK, 然后 reset --hard 到上游 HEAD"
+  git branch "$BK" HEAD || fail "建备份分支失败"
+  git reset --hard "$UPSTREAM_HEAD" || fail "reset --hard 失败"
+  echo "  + 备份分支: $BK (回退: git reset --hard $BK)"
+  echo "  syncing submodules ..."
+  git submodule sync --recursive >/dev/null 2>&1 || true
+  git submodule update --init --recursive || echo "  [WARN] submodule update 非零退出, 见上"
+  git rev-parse "$UPSTREAM_HEAD" > .overlay_baseline
+  echo "  + 基线已更新: $(git rev-parse --short "$UPSTREAM_HEAD")"
+  echo "  re-applying overlay ..."
+  bash "$OVERLAY_DIR/apply_cuda.sh" "$REPO_ROOT" || echo "  [WARN] apply_cuda.sh 有非零退出, 见上"
+  for PM in /data/openpilot/panda_版本核对/panda_维护.sh "$REPO_ROOT/panda/panda_维护.sh"; do
+    [ -f "$PM" ] && { echo "  running $PM"; bash "$PM" || echo "  [WARN] panda_维护.sh 非零退出"; break; }
+  done
+  echo "  self-check ..."
+  bash "$OVERLAY_DIR/tools/self_check.sh" "$REPO_ROOT" || fail "self_check 不通过, 升级未完成! 检查上面 FAIL 项"
+  echo
+  echo "== 改写同步完成: $(git -C "$REPO_ROOT" log --oneline -1) =="
+  echo "  提醒: 设备侧产物 (.plan 引擎 / .so) 不随 reset 变化;"
+  echo "        SConstruct / params_keys.h 变了要重编: source .venv/bin/activate && scons -j8 openpilot/common/"
+  exit 0
+fi
 
 # --- 5. 交集检测: 上游动了锁定文件? ---
 U="$(git diff --name-only "$BASELINE..$UPSTREAM_HEAD" | sort -u)"
