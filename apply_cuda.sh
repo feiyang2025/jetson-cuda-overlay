@@ -92,10 +92,13 @@ else
   MODELD_KIT_DST="$REPO_ROOT/selfdrive/modeld"
 fi
 mkdir -p "$MODELD_KIT_DST/runners" "$MODELD_KIT_DST/transforms"
-for f in modeld.py modeld_bigcombo.py; do
+for f in modeld.py modeld_bigcombo.py fill_model_msg.py; do
   # 按文件分开检测; 文件不存在 → 直接装 kit 版 (sunnypilot 新 master 无 modeld_bigcombo.py)
+  # fill_model_msg.py: 上游 9月新同步版是 11 参(+ fill_driving_model_data), 而两个调用点仍是 13 参
+  # 老写法 → 树内半同步必崩 TypeError; kit 版=新 API + get_action_from_plan 共享 helper
   marker="TRT_LOAD_ATTEMPTS"
   [ "$f" = "modeld_bigcombo.py" ] && marker="BigComboTrtUnavailable"
+  [ "$f" = "fill_model_msg.py" ] && marker="get_action_from_plan"
   if [ -f "$MODELD_KIT_DST/$f" ] && grep -q "$marker" "$MODELD_KIT_DST/$f" 2>/dev/null; then
     echo "  - $f 已是兜底闭环版, 不动"
   else

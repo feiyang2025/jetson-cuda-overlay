@@ -58,7 +58,8 @@ from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.system import sentry
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
-from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState
+from openpilot.selfdrive.modeld.fill_model_msg import (fill_model_msg, fill_pose_msg, fill_driving_model_data,
+                                                       get_action_from_plan, PublishState)
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 
 # TRT 加载兜底闭环参数(可用环境变量覆盖)
@@ -422,7 +423,11 @@ def main(demo=False):
   # BigCombo dispatch: merged single-engine model runs its own module (FiletOFish path untouched).
   # NOTE: manager 的 launcher 直接调用 mod.main()，不经过 __main__，所以分流必须放在 main() 里。
   if _read_model_param() == "BigCombo":
-    import selfdrive.modeld.modeld_bigcombo as _bigcombo
+    # 本树是 openpilot/selfdrive/... 新布局: 顶层 `selfdrive.*` 导入不存在, 需用 openpilot.*
+    try:
+      import openpilot.selfdrive.modeld.modeld_bigcombo as _bigcombo
+    except ImportError:
+      import selfdrive.modeld.modeld_bigcombo as _bigcombo
     _bigcombo.main(demo=demo)
     raise SystemExit(0)
 
@@ -606,9 +611,10 @@ def main(demo=False):
       modelv2_send = messaging.new_message('modelV2')
       drivingdata_send = messaging.new_message('drivingModelData')
       posenet_send = messaging.new_message('cameraOdometry')
-      fill_model_msg(drivingdata_send, modelv2_send, model_output, v_ego, steer_delay,
-                     publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
-                     frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen)
+      # action: 本树走 plan 回退路径(与移植前语义一致), 每帧只算一次 → 热路径零额外开销
+      action = get_action_from_plan(model_output)
+      fill_model_msg(modelv2_send, model_output, action, publish_state, meta_main.frame_id, meta_extra.frame_id,
+                     frame_id, frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen)
 
       desire_state = modelv2_send.modelV2.meta.desireState
       l_lane_change_prob = desire_state[log.Desire.laneChangeLeft]
@@ -617,8 +623,8 @@ def main(demo=False):
       DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob)
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
       modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction
-      drivingdata_send.drivingModelData.meta.laneChangeState = DH.lane_change_state
-      drivingdata_send.drivingModelData.meta.laneChangeDirection = DH.lane_change_direction
+      # drivingModelData 由 modelV2 派生(新 API): laneChange* 已落在 modelV2 上, 统一拷贝一次
+      fill_driving_model_data(drivingdata_send, modelv2_send)
 
       fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
       pm.send('modelV2', modelv2_send)

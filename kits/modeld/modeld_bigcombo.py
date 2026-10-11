@@ -62,6 +62,16 @@ try:
   _VST_WIDE_ROAD = VisionStreamType.VISION_STREAM_WIDE_ROAD
 except ImportError:
   _VST_ROAD, _VST_WIDE_ROAD = 0, 2
+try:
+  from openpilot.cereal import log as _cereal_log
+except ImportError:
+  from cereal import log as _cereal_log
+# cereal schema 自适应 (master-c3: roadCameraState 已改名 narrowRoadCameraState)
+_EV_FIELDS = set(_cereal_log.Event.schema.fields.keys())
+_MSG_ROAD = 'roadCameraState' if 'roadCameraState' in _EV_FIELDS else 'narrowRoadCameraState'
+_MSG_LIVECAL = 'liveCalibration' if 'liveCalibration' in _EV_FIELDS else None
+_MSG_DELAY = 'liveDelay' if 'liveDelay' in _EV_FIELDS else 'lateralDelay'
+
 from opendbc.car.car_helpers import get_demo_car_params
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.params import Params
@@ -77,13 +87,14 @@ def _get_lat_delay(sm) -> float:
   # 本地 params 白名单无 LagdValueCache 键(上游专用), 直接用 lagd 实时发布的 lateralDelay;
   # 无效/未就绪时回退 0.2s 经验值
   try:
-    v = float(sm["liveDelay"].lateralDelay)
+    v = float(sm[_MSG_DELAY].lateralDelay)
   except Exception:
     return 0.2
   return v if (np.isfinite(v) and v > 0.0) else 0.2
 
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
-from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState
+from openpilot.selfdrive.modeld.fill_model_msg import (fill_model_msg, fill_pose_msg, fill_driving_model_data,
+                                                       get_action_from_plan, PublishState)
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot.models.split_model_constants import SplitModelConstants
 
@@ -105,6 +116,10 @@ VISION_SLICES = {
   'pose': slice(887, 899),
   'wide_from_device_euler': slice(899, 905),
   'road_transform': slice(905, 917),
+  # parse_vision_outputs 还要读 lead / lead_prob (本版解析器把 lead 归在 vision 阶段);
+  # 范围与 POLICY_SLICES 里的一致, 同一个 2580 数组切两次互不影响。
+  'lead': slice(1907, 2051),
+  'lead_prob': slice(2051, 2054),
 }
 POLICY_SLICES = {
   'plan': slice(917, 1907),
@@ -366,7 +381,11 @@ class ModelState:
     policy_outs = {k: self.output[v][np.newaxis] for k, v in POLICY_SLICES.items()}
     vision_dict = self.parser.parse_vision_outputs(vision_outs)
     policy_dict = self.parser.parse_policy_outputs(policy_outs)
-    combined = {**vision_dict, **policy_dict}
+    # 注意合并顺序: POLICY_SLICES 里冗余带了 lane_lines/lane_lines_prob/road_edges(与 vision 重叠),
+    # 而 parse_policy_outputs 只解析 plan/desire_state → policy 侧这些键仍是 1-D 原始切片,
+    # 若 policy 覆盖 vision 会把解析好的 4-D 车道线打回 2-D, fill_model_msg 随即 IndexError。
+    # 因此让"已解析的 vision 结果"最后合并(获胜); hidden_state/action/pad 是 policy 独有, 不受影响。
+    combined = {**policy_dict, **vision_dict}
     if SEND_RAW_PRED:
       combined['raw_pred'] = self.output.copy()
 
@@ -432,7 +451,11 @@ def main(demo=False):
 
   # messaging
   pm = PubMaster(["modelV2", "drivingModelData", "cameraOdometry"])
-  sm = SubMaster(["deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carControl", "liveDelay"])
+  _svc = (["deviceState", "carState", _MSG_ROAD] + ([_MSG_LIVECAL] if _MSG_LIVECAL else [])
+          + ["driverMonitoringState", "carControl"])
+  if _MSG_DELAY in _EV_FIELDS:
+    _svc.append(_MSG_DELAY)
+  sm = SubMaster(_svc)
 
   publish_state = PublishState()
   params = Params()
@@ -498,11 +521,11 @@ def main(demo=False):
     sm.update(0)
     desire = DH.desire
     is_rhd = sm["driverMonitoringState"].isRHD
-    frame_id = sm["roadCameraState"].frameId
+    frame_id = sm[_MSG_ROAD].frameId
     v_ego = max(sm["carState"].vEgo, 0.)
-    if sm.updated["liveCalibration"] and sm.seen['roadCameraState'] and sm.seen['deviceState']:
-      device_from_calib_euler = np.array(sm["liveCalibration"].rpyCalib, dtype=np.float32)
-      dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['roadCameraState'].sensor))]
+    if _MSG_LIVECAL and sm.updated[_MSG_LIVECAL] and sm.seen[_MSG_ROAD] and sm.seen['deviceState']:
+      device_from_calib_euler = np.array(sm[_MSG_LIVECAL].rpyCalib, dtype=np.float32)
+      dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm[_MSG_ROAD].sensor))]
       model_transform_main = get_warp_matrix(device_from_calib_euler, dc.ecam.intrinsics if main_wide_camera else dc.fcam.intrinsics, False).astype(np.float32)
       model_transform_extra = get_warp_matrix(device_from_calib_euler, dc.ecam.intrinsics, True).astype(np.float32)
       live_calib_seen = True
@@ -549,9 +572,10 @@ def main(demo=False):
       modelv2_send = messaging.new_message('modelV2')
       drivingdata_send = messaging.new_message('drivingModelData')
       posenet_send = messaging.new_message('cameraOdometry')
-      fill_model_msg(drivingdata_send, modelv2_send, model_output, v_ego, steer_delay,
-                     publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
-                     frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen)
+      # action: 本树走 plan 回退路径(与移植前语义一致), 每帧只算一次 → 热路径零额外开销
+      action = get_action_from_plan(model_output)
+      fill_model_msg(modelv2_send, model_output, action, publish_state, meta_main.frame_id, meta_extra.frame_id,
+                     frame_id, frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen)
 
       desire_state = modelv2_send.modelV2.meta.desireState
       l_lane_change_prob = desire_state[log.Desire.laneChangeLeft]
@@ -560,8 +584,8 @@ def main(demo=False):
       DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob)
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
       modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction
-      drivingdata_send.drivingModelData.meta.laneChangeState = DH.lane_change_state
-      drivingdata_send.drivingModelData.meta.laneChangeDirection = DH.lane_change_direction
+      # drivingModelData 由 modelV2 派生(新 API): laneChange* 已落在 modelV2 上, 统一拷贝一次
+      fill_driving_model_data(drivingdata_send, modelv2_send)
 
       fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
       pm.send('modelV2', modelv2_send)
