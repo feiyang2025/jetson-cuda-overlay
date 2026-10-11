@@ -43,6 +43,29 @@ EXPRESS_SPEED_MS = 60 / 3.6   # 16.7 m/s
 STRAIGHT_THRESHOLD = 0.008    # rad/m max |curv| for "straight road" filter
 LANE_MARKING_WIDTH = 0.15     # m; standard Chinese lane marking width (inner-edge to center)
 
+# --- 曲率法 (第三票) 参数 ---
+# 直线样本 (|κ|<STRAIGHT_THRESHOLD) 只用来诊断偏置: 那里 κ≈0, 对 fl 的尺度完全没信息量。
+# 要给 fl 提供尺度, 必须用**弯道**样本: 模型曲率与 IMU 曲率的比值就是 fl 的真实倍率。
+CURVED_THRESHOLD = 0.002      # rad/m; |κ_imu| 超过它才算"弯道样本" (半径 ≲500m)
+CURVED_MIN_SPEED_MS = 8.0     # m/s; 低速时 yawRate/vEgo 噪声大, 且轮胎侧偏不可忽略
+CURVED_MIN_SAMPLES = 30
+CURVED_RATIO_CLIP = (0.5, 2.0)  # 只接受 0.5x-2x 的 fl 修正, 之外当样本被污染
+
+# --- 融合 (三方法加权 + 一致性门限) ---
+# 每个方法背后的"真值"不同 (雷达测距 / 3.5-3.75m 车道标准 / IMU 偏航率), 系统偏差互相独立,
+# 加权融合能把各自的系统偏差摊薄; 单用任何一个 = 把它的偏差 100% 吃进来。
+METHOD_RELIABILITY = {
+    "radar_vision_ratio": 1.0,   # 雷达测距最可信, 但受安装偏移与雷达噪声影响
+    "radar_vision": 1.0,
+    "lane_width": 0.8,           # 依赖"标准车道宽"假设, 假设错 1:1 传到 fl
+    "curvature": 0.6,            # 依赖 IMU 偏置与车辆实际循迹 (侧偏)
+}
+FUSION_MIN_SAMPLES = 50          # 总样本下限
+FUSION_SPREAD_LIMIT = 0.03       # 方法间相对离散上限 (FCAM)
+FUSION_SPREAD_LIMIT_ECAM = 0.02  # ECAM 更严: 广角畸变使边缘测量有系统偏差
+FUSION_MAD_K = 3.0               # MAD 离群剔除倍数
+
+
 
 class RadarVisionCalibrator:
     def __init__(self, fl_current: float = 2520):
@@ -179,8 +202,19 @@ class LaneWidthCalibrator:
 
 
 class CurvatureCalibrator:
-    def __init__(self):
-        self.pairs = []
+    """IMU-模型曲率一致性。
+
+    两种样本:
+      * 直线 (|κ_imu| < STRAIGHT_THRESHOLD): 只做偏置诊断 (κ≈0, 对 fl 尺度无信息量);
+      * 弯道 (|κ_imu| ≥ CURVED_THRESHOLD): 才是 fl 的第三票 ——
+        模型物理量按 1/fl 缩放, 所以 κ_model/κ_imu = fl_true/fl_assumed,
+        于是 fl_true = fl_assumed × median(κ_model/κ_imu)。
+    """
+
+    def __init__(self, fl_current: float = 2520):
+        self.pairs = []          # 直线样本 (诊断)
+        self.curved = []         # 弯道样本 (尺度)
+        self._fl = fl_current
 
     def add(self, yaw_rate: float, v_ego: float, model_curv: float):
         if v_ego < 5:
@@ -188,26 +222,49 @@ class CurvatureCalibrator:
         curv_imu = yaw_rate / v_ego
         if abs(curv_imu) < STRAIGHT_THRESHOLD and abs(model_curv) < 0.02:
             self.pairs.append((curv_imu, model_curv, v_ego))
+            return
+        if v_ego < CURVED_MIN_SPEED_MS or abs(curv_imu) < CURVED_THRESHOLD:
+            return
+        # 只在同号时取比值: 反向说明这一帧的模型曲率被别的东西污染了
+        if model_curv * curv_imu <= 0:
+            return
+        ratio = model_curv / curv_imu
+        if CURVED_RATIO_CLIP[0] <= ratio <= CURVED_RATIO_CLIP[1]:
+            self.curved.append((curv_imu, model_curv, v_ego, ratio))
 
     @property
     def count(self) -> int:
-        return len(self.pairs)
+        return len(self.pairs) + len(self.curved)
 
     def compute(self) -> Dict:
-        if len(self.pairs) < 30:
-            return {"valid": False, "samples": len(self.pairs), "error": "不足30个样本"}
+        out: Dict = {"samples": self.count, "samples_straight": len(self.pairs),
+                     "samples_curved": len(self.curved)}
+        if len(self.pairs) >= 10:
+            c_imu = np.array([p[0] for p in self.pairs])
+            c_model = np.array([p[1] for p in self.pairs])
+            bias = c_model - c_imu
+            out.update({
+                "bias_mean": float(np.mean(bias)),
+                "bias_std": float(np.std(bias)),
+                "bias_max_abs": float(np.max(np.abs(bias))),
+            })
 
-        c_imu = np.array([p[0] for p in self.pairs])
-        c_model = np.array([p[1] for p in self.pairs])
-        bias = c_model - c_imu
+        if len(self.curved) < CURVED_MIN_SAMPLES:
+            out["valid"] = False
+            out["error"] = f"弯道样本不足{CURVED_MIN_SAMPLES} ({len(self.curved)})"
+            return out
 
-        return {
+        ratios = np.array([p[3] for p in self.curved])
+        med = float(np.median(ratios))
+        mad = float(np.median(np.abs(ratios - med)))
+        out.update({
             "valid": True,
-            "samples": len(self.pairs),
-            "bias_mean": float(np.mean(bias)),
-            "bias_std": float(np.std(bias)),
-            "bias_max_abs": float(np.max(np.abs(bias))),
-        }
+            "ratio_median": med,
+            "ratio_spread": mad,                      # MAD, 用于一致性判定
+            "fl_factor": med,
+            "fl_suggested": self._fl * med,
+        })
+        return out
 
 
 class SelfCalibrator:
@@ -215,11 +272,16 @@ class SelfCalibrator:
         # ECAM mode uses a different reference fl; both fallback algorithms must
         # base their fl_suggested on it (module-global FL_CURRENT is unreliable).
         ref_fl = 605 if ecam else fcam_fl
+        # ECAM: 调用方 (main --ecam) 会把 EcamIntrinsics 的当前 fl 当 fcam_fl 传进来,
+        # 用它做参考; 只有没传时才退回 605 默认。
+        if ecam and fcam_fl:
+            ref_fl = fcam_fl
         self.rv = RadarVisionCalibrator(fl_current=ref_fl)
         self.lw = LaneWidthCalibrator(fl_current=ref_fl)
-        self.cv = CurvatureCalibrator()
+        self.cv = CurvatureCalibrator(fl_current=ref_fl)
         self._ecam = ecam
         self._fcam_fl = fcam_fl
+        self._ref_fl = ref_fl      # 本次要标定的那台相机的当前 fl
         self._last_v = 0
         self._last_yaw = 0
         self._last_radar_d = 0
@@ -333,55 +395,129 @@ class SelfCalibrator:
             "stratified": strata,
         }
 
+    # ---------------------------------------------------------------- 融合
+    def _fuse_methods(self, cands: List[Dict]) -> Dict:
+        """三方法加权融合 + 一致性门限。
+
+        cands: [{name, fl, samples}] —— 每项都是"这台相机"的绝对 fl 建议值。
+        返回 fused 字典, 含 accepted 标志 (只有 accepted 才允许写 Params)。
+        """
+        valid = [c for c in cands if c.get("fl") and c["fl"] > 0 and c.get("samples", 0) > 0]
+        total_samples = sum(int(c.get("samples", 0)) for c in valid)
+        info = {"contributors": [], "rejected": [], "spread_pct": None, "accepted": False}
+
+        if not valid:
+            info.update({"reason": "没有任何方法产出 fl 建议值", "confidence": "low",
+                         "fl_suggested": None, "total_observations": total_samples})
+            return info
+
+        # 1) 加权中位数 (权重 = 样本数 × 方法可靠度)
+        for c in valid:
+            c["weight"] = int(c.get("samples", 0)) * METHOD_RELIABILITY.get(c["name"], 0.5)
+        ordered = sorted(valid, key=lambda c: c["fl"])
+        wsum = sum(c["weight"] for c in ordered) or 1.0
+        acc = 0.0
+        fused_fl = ordered[-1]["fl"]
+        for c in ordered:
+            acc += c["weight"]
+            if acc >= wsum * 0.5:
+                fused_fl = c["fl"]
+                break
+
+        # 2) MAD 离群剔除: 偏离中位数超过 max(3*MAD, 3%) 的方法不参与定值
+        fls = np.array([c["fl"] for c in valid], dtype=float)
+        med = float(np.median(fls))
+        mad = float(np.median(np.abs(fls - med)))
+        tolerance = max(FUSION_MAD_K * mad, FUSION_SPREAD_LIMIT * med)
+        kept, dropped = [], []
+        for c in valid:
+            (kept if abs(c["fl"] - med) <= tolerance else dropped).append(c)
+        if not kept:                      # 全被剔了说明离散极大, 只保留最接近中位数的那个
+            kept = [min(valid, key=lambda c: abs(c["fl"] - med))]
+            dropped = [c for c in valid if c is not kept[0]]
+        for c in dropped:
+            info["rejected"].append({"name": c["name"], "fl": round(c["fl"], 1),
+                                     "samples": c["samples"],
+                                     "delta_pct": round((c["fl"] / med - 1) * 100, 2),
+                                     "reason": "MAD 离群"})
+
+        # 3) 保留集内取加权平均 —— 这一步才是"结合"的意义所在:
+        #    各方法的系统偏差互相独立, 加权平均把偏差摊薄 (中位数只会挑中某一个方法,
+        #    等于还是单一真值)。离群已由上面的 MAD 剔除承担。
+        kept_sorted = sorted(kept, key=lambda c: c["fl"])
+        kept_fls = [c["fl"] for c in kept_sorted]
+        wsum = sum(c["weight"] for c in kept_sorted) or 1.0
+        fused_fl = sum(c["fl"] * c["weight"] for c in kept_sorted) / wsum
+        spread = (max(kept_fls) - min(kept_fls)) / (fused_fl or 1.0)
+        limit = FUSION_SPREAD_LIMIT_ECAM if self._ecam else FUSION_SPREAD_LIMIT
+        for c in kept_sorted:
+            info["contributors"].append({"name": c["name"], "fl": round(c["fl"], 1),
+                                         "samples": c["samples"], "weight": round(c["weight"], 1),
+                                         "delta_pct": round((c["fl"] / fused_fl - 1) * 100, 2)})
+
+        accepted = len(kept) >= 2 and spread <= limit and total_samples >= FUSION_MIN_SAMPLES
+        if accepted:
+            confidence = "high" if (spread <= limit * 0.67 and total_samples >= 200) else "medium"
+        else:
+            confidence = "low"
+        if self._ecam and confidence == "high":
+            confidence = "medium"      # 广角无畸变校正, 不判 high
+
+        reason = ""
+        if not accepted:
+            if len(kept) < 2:
+                reason = f"有效方法不足2个 (仅 {len(kept)}): 需≥2种独立真值交叉验证"
+            elif spread > limit:
+                reason = f"方法间分歧 {spread * 100:.1f}% 超过 {limit * 100:.0f}%"
+            elif total_samples < FUSION_MIN_SAMPLES:
+                reason = f"总样本 {total_samples} < {FUSION_MIN_SAMPLES}"
+
+        info.update({
+            "accepted": accepted,
+            "fl_current": self._ref_fl,
+            "fl_suggested": round(fused_fl) if accepted else None,
+            "fl_suggested_raw": round(fused_fl),
+            "fl_factor": round(fused_fl / self._ref_fl, 4) if self._ref_fl else 1.0,
+            "fl_delta_pct": round((fused_fl / self._ref_fl - 1) * 100, 1) if self._ref_fl else 0.0,
+            "confidence": confidence,
+            "total_observations": total_samples,
+            "spread_pct": round(spread * 100, 2),
+            "spread_limit_pct": round(limit * 100, 1),
+            "n_methods": len(kept),
+            "method": "fusion",
+            "reason": reason,
+        })
+        return info
+
     def compute(self) -> Dict:
-        # Unified ratio-based method — robust to extrinsics for both FCAM and ECAM
+        """三方法 (=三套独立真值) 加权融合。
+
+        修正史: 旧实现只取"雷达-视觉比率"一个方法 (主路径), 车道宽仅在该方法无效时
+        参与, 曲率法任何路径都不使用 —— 等于把单一方法的系统偏差 100% 吃进来。
+        """
         rv_r = self._compute_ratio()
         lw_r = self.lw.compute()
         cv_r = self.cv.compute()
 
         result = {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "camera": "ECAM" if self._ecam else "FCAM",
             "methods": {"radar_vision_ratio": rv_r, "lane_width": lw_r, "curvature": cv_r},
             "fused": {},
         }
 
-        if rv_r.get("valid"):
-            n = rv_r["samples"]
-            conf = "high" if n > 200 else "medium" if n > 50 else "low"
-            ratio = rv_r["ratio_median"]
-            label = "ECAM" if ratio > 1.5 else "FCAM"
-            suggested = rv_r["fl_suggested"]
-            result["fused"] = {
-                "fl_current": self._fcam_fl,
-                "fl_suggested": suggested,
-                "fl_factor": round(self._fcam_fl / suggested if suggested > 0 else 1.0, 4),
-                "fl_delta_pct": round((suggested / self._fcam_fl - 1) * 100, 1),
-                "confidence": conf,
-                "total_observations": len(self.rv.pairs),
-                "method": f"ratio_{label}",
-                "ratio_median": round(ratio, 2),
-            }
-        else:
-            # Fallback: linear regression
-            rv_lin = self.rv.compute()
-            lw_r = self.lw.compute()
-            fl_factors, weights = [], []
-            if rv_lin.get("valid"):
-                fl_factors.append(rv_lin["fl_factor"]); weights.append(rv_lin["samples"] * 2)
-            if lw_r.get("valid"):
-                fl_factors.append(lw_r["fl_factor"]); weights.append(lw_r["samples"])
-            combined = float(np.average(fl_factors, weights=weights)) if fl_factors else 1.0
-            total = self.rv.count + self.lw.count + self.cv.count
-            conf = "high" if (rv_lin.get("valid") and total > 200) else "medium" if total > 50 else "low"
-            result["fused"] = {
-                "fl_current": self._fcam_fl,
-                "fl_suggested": round(self._fcam_fl * combined),
-                "fl_factor": round(combined, 4),
-                "fl_delta_pct": round((combined - 1) * 100, 1),
-                "confidence": conf,
-                "total_observations": total,
-            }
+        cands = []
+        if rv_r.get("valid") and rv_r.get("fl_suggested"):
+            cands.append({"name": "radar_vision_ratio", "fl": float(rv_r["fl_suggested"]),
+                          "samples": int(rv_r.get("samples", 0))})
+        if lw_r.get("valid") and lw_r.get("fl_suggested"):
+            cands.append({"name": "lane_width", "fl": float(lw_r["fl_suggested"]),
+                          "samples": int(lw_r.get("samples", 0))})
+        if cv_r.get("valid") and cv_r.get("fl_suggested"):
+            cands.append({"name": "curvature", "fl": float(cv_r["fl_suggested"]),
+                          "samples": int(cv_r.get("samples_curved", cv_r.get("samples", 0)))})
 
+        result["fused"] = self._fuse_methods(cands)
         return result
 
     def report(self, result: Dict = None) -> str:
@@ -452,53 +588,45 @@ class SelfCalibrator:
         lines.append("─" * 58)
         lines.append("  方法3: IMU-模型曲率一致性")
         lines.append("─" * 58)
-        if cv.get("valid"):
-            lines.append(f"  样本: {cv['samples']}")
+        lines.append(f"  直线样本(偏置诊断): {cv.get('samples_straight', 0)}  弯道样本(尺度): {cv.get('samples_curved', 0)}")
+        if "bias_mean" in cv:
             lines.append(f"  偏置 (模型-IMU): {cv['bias_mean']:.6f} ± {cv['bias_std']:.6f} rad/m")
             lines.append(f"  最大偏置: {cv['bias_max_abs']:.6f} rad/m")
+        if cv.get("valid"):
+            lines.append(f"  弯道 κ_model/κ_imu 中位数: {cv['ratio_median']:.4f} (MAD {cv['ratio_spread']:.4f})")
+            lines.append(f"  → 推算fl: {cv['fl_suggested']:.0f}")
         else:
-            lines.append(f"  {cv.get('error', '数据不足')} (n={cv['samples']})")
+            lines.append(f"  {cv.get('error', '数据不足')} — 该票不参与融合")
+
+        lines.append("")
+        lines.append("─" * 58)
+        lines.append("  融合 (三真值加权平均 + MAD 剔除 + 一致性门限)")
+        lines.append("─" * 58)
+        if f.get("contributors"):
+            for c in f["contributors"]:
+                lines.append(f"  {c['name']}: fl={c['fl']} n={c['samples']} 权重={c['weight']} "
+                             f"(相对融合值 {c['delta_pct']:+.2f}%)")
+        for c in f.get("rejected", []):
+            lines.append(f"  [剔除] {c['name']}: fl={c['fl']} ({c['delta_pct']:+.2f}%) — {c['reason']}")
+        if f.get("spread_pct") is not None:
+            lines.append(f"  方法间离散: {f['spread_pct']:.2f}% (上限 {f.get('spread_limit_pct')}%) "
+                         f"有效方法数: {f.get('n_methods')}")
 
         lines.append("")
         lines.append("═" * 58)
-        method = f.get("method", "linear")
-        if "ratio" in method:
-            is_ecam = "ECAM" in method
-            rv = result["methods"].get("radar_vision_ratio", {})
-            fcam_fl = rv.get("fcam_fl", f["fl_current"])
-            fl_suggested = f["fl_suggested"]
-            if is_ecam:
-                # Compare against current ECAM setting
-                ecam_current = 605
-                try:
-                    from params_json import params_json_get
-                    _e = (params_json_get("EcamIntrinsics") or {}).get("fl")
-                    if _e: ecam_current = int(_e)
-                except: pass
-                delta = (fl_suggested / ecam_current - 1) * 100
-                lines.append(f"  检测到: ECAM 模式")
-                lines.append(f"  FCAM参考fl: {fcam_fl}")
-                if abs(delta) > 2:
-                    lines.append(f"  建议: ECAM fl {ecam_current} → {fl_suggested} ({delta:+.1f}%)")
-                else:
-                    lines.append(f"  结论: ECAM fl = {ecam_current} 合理")
-            else:
-                lines.append(f"  检测到: FCAM 模式")
-                if abs(f["fl_delta_pct"]) > 2:
-                    lines.append(f"  建议: fl {f['fl_current']} → {fl_suggested} ({f['fl_delta_pct']:+.1f}%)")
-                    lines.append(f"  警告: 建议确认后再修改 camera.py")
-                else:
-                    lines.append(f"  结论: 内参在合理范围内 (偏差 {f['fl_delta_pct']:+.1f}%)")
+        if not f.get("accepted"):
+            lines.append("  结果: 未通过门限 -> 不写入 Params (继续采集)")
+            lines.append(f"  原因: {f.get('reason') or '未知'}")
+            if f.get("fl_suggested_raw"):
+                lines.append(f"  参考值 (仅供判断, 未采纳): fl {f.get('fl_current')} → "
+                             f"{f['fl_suggested_raw']} ({f.get('fl_delta_pct'):+.1f}%)")
+        elif abs(f.get("fl_delta_pct", 0.0)) > 2:
+            lines.append(f"  建议: fl {f['fl_current']} → {f['fl_suggested']} "
+                         f"({f['fl_delta_pct']:+.1f}%) 置信={f['confidence']}")
+            lines.append("  通过门限, 可由面板确认写入内参; 建议多趟数据交叉验证")
         else:
-            if abs(f["fl_delta_pct"]) > 2 and f["confidence"] != "low":
-                lines.append(f"  建议: fl {f['fl_current']} → {f['fl_suggested']} ({f['fl_delta_pct']:+.1f}%)")
-                lines.append(f"  警告: 建议确认后再修改 camera.py")
-            elif f["confidence"] == "low":
-                lines.append(f"  数据不足, 继续收集...")
-                lines.append(f"  fl当前: {f['fl_current']}, 建议: {f['fl_suggested']}")
-            else:
-                lines.append(f"  结论: 内参在合理范围内 (偏差 {f['fl_delta_pct']:+.1f}%)")
-                lines.append(f"  fl = {f['fl_current']} 无需调整")
+            lines.append(f"  结论: 内参在合理范围内 (偏差 {f.get('fl_delta_pct'):+.1f}%)")
+            lines.append(f"  fl = {f.get('fl_current')} 无需调整")
         lines.append("=" * 58)
         return "\n".join(lines)
 
@@ -570,7 +698,7 @@ def run_live(output_path: str, ecam: bool = False, fcam_fl: int = 2520):
     signal.signal(signal.SIGINT, _handler)
 
     params = Params()
-    cal = SelfCalibrator(fcam_fl=fcam_fl)
+    cal = SelfCalibrator(ecam=ecam, fcam_fl=fcam_fl)
     sm = messaging.SubMaster(['carState', 'radarState', 'modelV2'])
 
     print("实时采集已启动，等待数据...", flush=True)
@@ -624,21 +752,34 @@ def run_live(output_path: str, ecam: bool = False, fcam_fl: int = 2520):
     print(cal.report(result))
     f = result["fused"]
     label = "ECAM" if ecam else "FCAM"
-    if f.get("fl_suggested"):
+    if f.get("accepted"):
         fl_c = f["fl_current"]
         fl_s = f["fl_suggested"]
         pct = (fl_s / fl_c - 1) * 100
-        print(f"结果 {label} fl={fl_c}→{fl_s} ({pct:+.1f}%) 置信={f['confidence']} 样本={f['total_observations']}", flush=True)
+        print(f"结果 {label} fl={fl_c}→{fl_s} ({pct:+.1f}%) 置信={f['confidence']} "
+              f"方法数={f.get('n_methods')} 离散={f.get('spread_pct')}% 样本={f['total_observations']}", flush=True)
+    else:
+        print(f"结果 {label}: 未通过一致性门限, 不写入 Params — {f.get('reason')}", flush=True)
+        if f.get("fl_suggested_raw"):
+            print(f"  (参考值 未采纳: fl {f.get('fl_current')} → {f['fl_suggested_raw']})", flush=True)
 
     # Save to Params for UI to read
-    # 必须走 params_json: 本 fork 的 FcamCalibResult/WideCalibResult 是 JSON 型键,
-    # put(key, json.dumps(x)) 会 TypeError 被下面这个裸 except 吞掉 -> UI 永远读不到结果。
+    # 两道关:
+    #   1. 必须走 params_json: 本 fork 的 FcamCalibResult/WideCalibResult 是 JSON 型键,
+    #      put(key, json.dumps(x)) 会 TypeError 被裸 except 吞掉 -> UI 永远读不到结果。
+    #   2. 只有通过融合门限 (≥2 个方法一致 + 样本够) 才允许写入 —— fl 直接影响视觉测距,
+    #      不合格宁可让面板显示"无数据", 也不能把一个可疑值送进内参。
     try:
         from params_json import params_json_put
         result_key = "WideCalibResult" if ecam else "FcamCalibResult"
-        params_json_put(result_key, result, params)
-    except:
-        pass
+        if f.get("accepted"):
+            params_json_put(result_key, result, params)
+            print(f"已写入 Params: {result_key}", flush=True)
+        else:
+            params.remove(result_key)      # 清掉上一轮的旧结果, 免得面板拿着老值让你确认
+            print(f"未采纳: 已清空 {result_key}", flush=True)
+    except Exception as e:
+        print(f"写入 Params 失败: {e}", flush=True)
 
 
 def main():
@@ -674,7 +815,9 @@ def main():
         except: pass
 
     if args.live:
-        run_live(args.output, ecam=args.ecam, fcam_fl=fcam_fl)
+        # ECAM 模式下要标定的是 ECAM, 参考 fl 必须传 ECAM 的当前值; 否则融合会把
+        # 建议值算到 FCAM 的 2520 上 (面板随后按 EcamIntrinsics 比对, 直接错位)。
+        run_live(args.output, ecam=args.ecam, fcam_fl=(FL_CURRENT if args.ecam else fcam_fl))
         return
 
     if args.json and args.route and args.route.endswith(".json"):
