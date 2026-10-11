@@ -69,6 +69,41 @@ def _rebuild_intrinsics():
     F = K2_inv_T @ t_skew @ R_F2E @ K1_inv
 
 
+def _load_extrinsics(path: str = "ecam_extrinsics.json") -> bool:
+    """读 FCAM→ECAM 相对外参 (基线), 三角化必须要有它。
+
+    格式 (JSON, 单位 m / rad):
+      {"t": [x, y, z], "rpy": [roll, pitch, yaw]}          # 推荐
+      {"t": [x, y, z], "R": [9 个数, 行主序]}               # 直接给旋转矩阵也行
+
+    没有这个文件时 t_F2E 保持 0 —— 两台相机共光心, 三角化退化,
+    compute() 会明确返回 valid=False 而不是给一个看上去像结果的当前值。
+    """
+    global R_F2E, t_F2E
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        t = np.asarray(d.get("t", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
+        if "R" in d:
+            R = np.asarray(d["R"], dtype=np.float64).reshape(3, 3)
+        else:
+            r, p, y = [float(x) for x in d.get("rpy", [0.0, 0.0, 0.0])]
+            Rx = np.array([[1, 0, 0], [0, np.cos(r), -np.sin(r)], [0, np.sin(r), np.cos(r)]])
+            Ry = np.array([[np.cos(p), 0, np.sin(p)], [0, 1, 0], [-np.sin(p), 0, np.cos(p)]])
+            Rz = np.array([[np.cos(y), -np.sin(y), 0], [np.sin(y), np.cos(y), 0], [0, 0, 1]])
+            R = Rz @ Ry @ Rx
+        t_F2E = t
+        R_F2E = R
+        _rebuild_intrinsics()
+        log(f"外参: 已加载 {path} t={t.tolist()} |t|={float(np.linalg.norm(t)):.4f}m")
+        return True
+    except Exception as e:
+        log(f"外参: 读取 {path} 失败 ({e}), 继续用零基线 (三角化会退化)")
+        return False
+
+
 def _load_intrinsics():
     global ECAM_FL_CURRENT, FCAM_FL
     try:
@@ -81,6 +116,7 @@ def _load_intrinsics():
         if _e: ECAM_FL_CURRENT = int(_e)
     except Exception:
         pass
+    _load_extrinsics()
     _rebuild_intrinsics()
 
 
@@ -93,36 +129,37 @@ FLAG_PENDING = "wide_calib_pending.flag"
 
 
 class StereoMatcher:
-    def __init__(self):
-        import cv2
-        self.orb = cv2.ORB_create(nfeatures=2000)
-        self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    """FCAM/ECAM 点对应 + 极线(Sampson)过滤。
+
+    原先用 cv2.ORB + BFMatcher; 本机 venv 装不了 opencv (系统 cv2 是 numpy1.x ABI,
+    venv 是 numpy2 -> ImportError, 且无网 pip), 而这里只需要窄基线对应点,
+    所以改用纯 numpy 的金字塔 NCC 匹配 (numpy_stereo.py), 精度实测亚像素级。
+    """
+
+    def __init__(self, max_features: int = 800):
+        from numpy_stereo import NumpyStereoMatcher
+        self._matcher = NumpyStereoMatcher(max_features=max_features, log=log)
 
     def match(self, img1: np.ndarray, img2: np.ndarray) -> List[Tuple[float, float, float, float]]:
-        import cv2
-        kp1, des1 = self.orb.detectAndCompute(img1, None)
-        kp2, des2 = self.orb.detectAndCompute(img2, None)
-        if des1 is None or des2 is None or len(kp1) < 10 or len(kp2) < 10:
-            log(f"match: too few features fcam={len(kp1) if kp1 else 0} ecam={len(kp2) if kp2 else 0}")
-            return []
-        matches = self.bf.match(des1, des2)
-        log(f"match: bf found {len(matches)} matches")
-        if len(matches) < 10:
-            return []
-        pts1 = np.array([kp1[m.queryIdx].pt for m in matches], dtype=np.float32)
-        pts2 = np.array([kp2[m.trainIdx].pt for m in matches], dtype=np.float32)
-        h1 = np.hstack([pts1, np.ones((len(pts1), 1))])
-        h2 = np.hstack([pts2, np.ones((len(pts2), 1))])
-        Fx1 = (F @ h1.T).T
-        Ftx2 = (h2 @ F).T
-        d = np.sum(h2 * Fx1.T, axis=1)
-        sampson = d ** 2 / np.maximum(Fx1[:, 0] ** 2 + Fx1[:, 1] ** 2 + Ftx2[0, :] ** 2 + Ftx2[1, :] ** 2, 1e-10)
+        filtered = self._matcher.match(img1, img2)
+        if len(filtered) < 10:
+            return filtered
+        pts = np.asarray(filtered, dtype=np.float32)
+        pts1, pts2 = pts[:, :2], pts[:, 2:]
+        h1 = np.hstack([pts1, np.ones((len(pts1), 1))]).T     # (3, N)
+        h2 = np.hstack([pts2, np.ones((len(pts2), 1))]).T     # (3, N)
+        Fx1 = F @ h1                                          # (3, N)
+        Ftx2 = F.T @ h2                                       # (3, N)
+        # 原来的写法把 Fx1 转置成了 (N,3) 再与 h2(N,3) 相乘, 只在 N==3 时能广播 ->
+        # 实际运行时要么报错要么给出无意义的 d。这里按 Sampson 距离的定义重写:
+        d = np.sum(h2 * Fx1, axis=0)
+        sampson = d ** 2 / np.maximum(Fx1[0] ** 2 + Fx1[1] ** 2 + Ftx2[0] ** 2 + Ftx2[1] ** 2, 1e-10)
         mask = sampson < 3.0
         if sum(mask) < 10:
             mask = sampson < 8.0
-        filtered = [(p1[0], p1[1], p2[0], p2[1]) for p1, p2 in zip(pts1[mask], pts2[mask])]
-        log(f"match: after F filter {len(filtered)}")
-        return filtered
+        out = [(float(p1[0]), float(p1[1]), float(p2[0]), float(p2[1])) for p1, p2 in zip(pts1[mask], pts2[mask])]
+        log(f"match: after F filter {len(out)}")
+        return out
 
 
 class WideCalibComputer:
@@ -147,10 +184,12 @@ class WideCalibComputer:
 
         pts = np.array(self.matches)
         u1, v1, u2, v2 = pts[:, 0], pts[:, 1], pts[:, 2], pts[:, 3]
-        x1n = (u1 - K1[0, 2]) / K1[0, 0]
-        y1n = (v1 - K1[1, 2]) / K1[1, 1]
-        x2n = (u2 - K2[0, 2]) / K2[0, 0]
-        y2n = (v2 - K2[1, 2]) / K2[1, 1]
+        # 基线为零时 (t_F2E == 0) 两台相机共光心, 三角化完全退化: err_for 恒为 inf,
+        # "最优解"就等于当前值 —— 出来的数字没有任何意义。宁可明确报无效。
+        if float(np.linalg.norm(t_F2E)) < 1e-6:
+            return {"valid": False, "samples": len(self.matches), "fl_current": ECAM_FL_CURRENT,
+                    "reason": "FCAM→ECAM 基线未配置 (t_F2E=0, 三角化退化); "
+                              "提供 ecam_extrinsics.json 或改用 self_calibrator.py --ecam"}
         P1 = K1 @ np.hstack([np.eye(3), np.zeros((3, 1))])
         n_samp = min(len(self.matches), 500)
 
@@ -161,9 +200,15 @@ class WideCalibComputer:
             errs = []
             for i in range(n_samp):
                 try:
+                    # DLT 必须用**像素坐标**配 x*P[2]-P[0]/y*P[2]-P[1]:
+                    # 原实现混用了归一化坐标 (x1n) 与像素级 P, 第 3 列被主点 960/540 压住,
+                    # A 对所有点几乎相同 -> 解退化 (所有点给出同一个 X3), 重投影误差 ~1000px,
+                    # 于是每个 fl 都被当成 inf, 标定永远给不出修正量。
                     A = np.zeros((4, 4))
-                    A[0] = x1n[i] * P1[2] - P1[0]; A[1] = y1n[i] * P1[2] - P1[1]
-                    A[2] = x2n[i] * P2[2] - P2[0]; A[3] = y2n[i] * P2[2] - P2[1]
+                    A[0] = u1[i] * P1[2] - P1[0]
+                    A[1] = v1[i] * P1[2] - P1[1]
+                    A[2] = u2[i] * P2[2] - P2[0]
+                    A[3] = v2[i] * P2[2] - P2[1]
                     _, _, Vt = np.linalg.svd(A); X = Vt[-1]
                     if abs(X[3]) < 1e-6: continue
                     X3 = X[:3] / X[3]
@@ -237,7 +282,7 @@ def collect_matches() -> List[Tuple]:
     if attr["_state"] != "ready":
         return None
 
-    import cv2
+    from numpy_stereo import y_plane_from_buf
     try:
         fcam_buf = attr["_fcam"].recv()
         ecam_buf = attr["_ecam"].recv()
@@ -254,8 +299,9 @@ def collect_matches() -> List[Tuple]:
         return []
 
     try:
-        fcam_img = cv2.cvtColor(fcam_buf.data.reshape(fcam_buf.height * 3 // 2, fcam_buf.width), cv2.COLOR_YUV2GRAY_I420)
-        ecam_img = cv2.cvtColor(ecam_buf.data.reshape(ecam_buf.height * 3 // 2, ecam_buf.width), cv2.COLOR_YUV2GRAY_I420)
+        # I420/NV12 的 Y 平面就是灰度, 不需要 cv2.cvtColor (也不用 opencv)
+        fcam_img = y_plane_from_buf(fcam_buf)
+        ecam_img = y_plane_from_buf(ecam_buf)
     except Exception as e:
         log(f"collect img convert error: {e}")
         return []
