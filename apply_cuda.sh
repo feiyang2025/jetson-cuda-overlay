@@ -346,6 +346,13 @@ python3 "$OVERLAY_DIR/patch_launcher_camera.py" "$REPO_ROOT"
 echo "Making the web UI report the local GPU / local big model + enabling Bluetooth..."
 python3 "$OVERLAY_DIR/patch_webui_local_gpu.py" "$REPO_ROOT"
 
+# 上游模型体系只给 tinygrad 的预编译 pkl(runner=="tinygrad"), TRT 路线必须多一步"编译":
+# 拿 bundle 里的 ONNX 在本机 trtexec 编成 .plan(幂等 + 自检)。执行器整文件安装, 其余接线靠补丁脚本。
+echo "Installing the model compile pipeline (ONNX -> TensorRT .plan)..."
+install_file "$OVERLAY_DIR/openpilot/sunnypilot/models/engine_build.py" \
+             "$REPO_ROOT/openpilot/sunnypilot/models/engine_build.py"
+python3 "$OVERLAY_DIR/patch_models_compile.py" "$REPO_ROOT"
+
 echo "[apply_cuda] done."
 echo
 echo "Next on-device steps:"
