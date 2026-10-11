@@ -211,6 +211,20 @@ install_file "$OVERLAY_DIR/openpilot/system/sensord/ch347t.cc" "$SENSORD_DIR/ch3
 install_file "$OVERLAY_DIR/openpilot/system/sensord/ch347t.py" "$SENSORD_DIR/ch347t.py"
 install_file "$OVERLAY_DIR/openpilot/system/sensord/build_ch347t.sh" "$SENSORD_DIR/build_ch347t.sh"
 install_file "$OVERLAY_DIR/openpilot/system/sensord/run_ch347t.sh" "$SENSORD_DIR/run_ch347t.sh"
+# IMU 标定工具链 (生成 ch347t 读的 imu_calibration.json)。安装位置必须落在
+# ch347t 的 get_project_root() 上溯 3 级 = {新布局}<root>/openpilot、{旧布局}<root> 之下,
+# JSON 才会落到它默认读取的 <project_root>/imu_calibration.json。
+IMU_CALIB_KIT="$OVERLAY_DIR/kits/imu_calib"
+if [ "$LAYOUT" = "new" ]; then
+  IMU_CALIB_DST="$REPO_ROOT/openpilot/tools/imu_calib"
+else
+  IMU_CALIB_DST="$REPO_ROOT/tools/imu_calib"
+fi
+mkdir -p "$IMU_CALIB_DST/reference"
+for f in "$IMU_CALIB_KIT"/*.py; do install_file "$f" "$IMU_CALIB_DST/$(basename "$f")"; done
+for f in "$IMU_CALIB_KIT"/reference/*; do install_file "$f" "$IMU_CALIB_DST/reference/$(basename "$f")"; done
+IMU_JSON_DIR="$(dirname "$(dirname "$IMU_CALIB_DST")")"
+echo "  -> imu_calib 已安装到 $IMU_CALIB_DST (JSON 落点: $IMU_JSON_DIR/imu_calibration.json)"
 if [ "$LAYOUT" = "new" ]; then
   install "openpilot/third_party/ch347"
 else
@@ -299,6 +313,21 @@ set +e
 python3 "$OVERLAY_DIR/patch_master_c3.py" "$REPO_ROOT"
 python3 "$OVERLAY_DIR/tools/patch_translations.py" "$REPO_ROOT"
 set -e
+
+# panda 只走 USB: 关掉 SPI 探测。Orin 上 /dev/spidev* 属 gpio 组, 裸 PermissionError 会
+# 越过 dfu.py 的 PandaSpiException 守卫把 pandad 打死; 且探测本身可能把 Tegra 的 spidev
+# 控制器卡进不可中断的 D 状态。需要强制探测时 PANDA_SPI_ENABLE=1。
+echo "Patching panda SPI handling (USB-only)..."
+python3 "$OVERLAY_DIR/patch_panda_spi.py" "$REPO_ROOT"
+
+# loggerd 的清理只按剩余空间触发(5GB/10%), 大盘上等于几个月不清 → 加“按天保留”。
+# 默认 7 天, LOGGERD_MAX_ROUTE_AGE_DAYS 可调, 0 恢复上游行为。
+echo "Adding loggerd age-based route retention..."
+python3 "$OVERLAY_DIR/patch_deleter_retention.py" "$REPO_ROOT"
+
+# manager 每轮(~1Hz)打印进程清单会刷屏; 改成只在变化(启动/崩溃/存活色变化)时打印。
+echo "Quieting the manager process-list spam..."
+python3 "$OVERLAY_DIR/patch_manager_proclist.py" "$REPO_ROOT"
 
 echo "[apply_cuda] done."
 echo

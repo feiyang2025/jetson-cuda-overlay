@@ -60,7 +60,6 @@ from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
-from openpilot.selfdrive.modeld.models.commonmodel_pyx import DrivingModelFrame, CLContext
 
 # TRT 加载兜底闭环参数(可用环境变量覆盖)
 TRT_LOAD_ATTEMPTS = int(os.getenv("TRT_LOAD_ATTEMPTS", "3"))
@@ -75,8 +74,21 @@ LAT_SMOOTH_SECONDS = 0.0
 DEFAULT_MODEL_DIR = Path(__file__).parent / 'models'
 
 
+def _read_model_param(params=None):
+  """Active model name. Tolerates this tree's Params API (no `encoding` kwarg) and a
+  missing 'Model' key, both of which differ from the API this file was written against."""
+  p = params if params is not None else Params()
+  try:
+    v = p.get("Model")
+  except Exception:
+    v = None
+  if isinstance(v, (bytes, bytearray)):
+    v = bytes(v).decode("utf-8", "replace")
+  return v or "FiletOFish"
+
+
 def get_model_name():
-  return Params().get("Model", encoding='utf-8') or "FiletOFish"
+  return _read_model_param()
 
 
 def get_model_dir():
@@ -93,12 +105,12 @@ class FrameMeta:
       self.frame_id, self.timestamp_sof, self.timestamp_eof = vipc.frame_id, vipc.timestamp_sof, vipc.timestamp_eof
 
 class ModelState:
-  frames: dict[str, DrivingModelFrame]
+  frames: dict
   inputs: dict[str, np.ndarray]
   output: np.ndarray
   prev_desire: np.ndarray  # for tracking the rising edge of the pulse
 
-  def __init__(self, context: CLContext):
+  def __init__(self, context=None):
     model_dir = get_model_dir()
 
     vision_metadata_path = model_dir / 'driving_vision_metadata.pkl'
@@ -121,7 +133,7 @@ class ModelState:
 
     # Derive all dimensions dynamically from metadata shapes
     # (different models use different key names, so search by pattern)
-    self.temporal_skip = ModelConstants.TEMPORAL_SKIP
+    self.temporal_skip = ModelConstants.MODEL_RUN_FREQ // ModelConstants.MODEL_CONTEXT_FREQ  # == 4
     _temporal_key = next((k for k in ['desire', 'desire_pulse', 'features_buffer'] if k in self.policy_input_shapes), None)
     _temporal_shape = self.policy_input_shapes[_temporal_key]
     self.input_history_buffer_len = _temporal_shape[1]
@@ -138,10 +150,9 @@ class ModelState:
     self._model_w = _model_w * 2
     self._model_h = _model_h * 2
 
-    self.frames = {
-      'input_imgs': DrivingModelFrame(context, self.temporal_skip),
-      'big_input_imgs': DrivingModelFrame(context, self.temporal_skip)
-    }
+    # CUDA-only build: OpenCL frames are created lazily further down, and only
+    # when the CUDA transform is unavailable (see the guard after the CUDA init).
+    self.frames = {}
     self.prev_desire = np.zeros(self.desire_len, dtype=np.float32)
 
     self.full_features_buffer = np.zeros((1, self.full_history_buffer_len, self.feature_len), dtype=np.float32)
@@ -180,7 +191,7 @@ class ModelState:
           self._cu_transform.cuda_transform_destroy.restype = None
 
           self._cuda_states = {}
-          for key in self.frames:
+          for key in ('input_imgs', 'big_input_imgs'):
             state = ctypes.create_string_buffer(128)
             self._cu_transform.cuda_transform_init(
               ctypes.byref(state), self._model_w, self._model_h, self.temporal_skip
@@ -200,6 +211,15 @@ class ModelState:
       except Exception as e:
         cloudlog.warning(f"CUDA transform not available: {e}")
         self._cuda_transform = False
+
+    # OpenCL frame fallback. This tree ships no OpenCL model stack, so it is only
+    # usable where a CL context exists (TICI); elsewhere fail loudly rather than
+    # importing a module that no longer exists.
+    if TICI or not self._cuda_transform:
+      if context is None:
+        raise RuntimeError("modeld is CUDA-only in this tree: OpenCL frames need a CL context")
+      from openpilot.selfdrive.modeld.models.commonmodel_pyx import DrivingModelFrame
+      self.frames = {k: DrivingModelFrame(context, self.temporal_skip) for k in ('input_imgs', 'big_input_imgs')}
 
     # ── Force tinygrad CUDA device init BEFORE TRT ──
     # TRT will piggyback on tinygrad's context so they share the same CUDA context.
@@ -388,7 +408,7 @@ class ModelState:
 def main(demo=False):
   # BigCombo dispatch: merged single-engine model runs its own module (FiletOFish path untouched).
   # NOTE: manager 的 launcher 直接调用 mod.main()，不经过 __main__，所以分流必须放在 main() 里。
-  if (Params().get("Model", encoding='utf-8') or "FiletOFish") == "BigCombo":
+  if _read_model_param() == "BigCombo":
     import selfdrive.modeld.modeld_bigcombo as _bigcombo
     _bigcombo.main(demo=demo)
     raise SystemExit(0)
@@ -400,9 +420,11 @@ def main(demo=False):
   setproctitle(PROCESS_NAME)
   config_realtime_process(7, 54)
 
-  cloudlog.warning("setting up CL context")
-  cl_context = CLContext()
-  cloudlog.warning("CL context ready; loading model")
+  cl_context = None
+  if TICI:
+    from openpilot.selfdrive.modeld.models.commonmodel_pyx import CLContext
+    cl_context = CLContext()
+  cloudlog.warning("loading model (CUDA/TensorRT path)")
   model = ModelState(cl_context)
   cloudlog.warning("models loaded, modeld starting")
   cloudlog.warning(f"backend: vision_trt={model.use_trt} policy_trt={model.use_trt_policy} "
@@ -418,8 +440,8 @@ def main(demo=False):
     time.sleep(.1)
 
   vipc_client_main_stream = _VST_WIDE_ROAD if main_wide_camera else _VST_ROAD
-  vipc_client_main = VisionIpcClient("camerad", vipc_client_main_stream, True, cl_context)
-  vipc_client_extra = VisionIpcClient("camerad", _VST_WIDE_ROAD, True, cl_context)
+  vipc_client_main = VisionIpcClient("camerad", vipc_client_main_stream, True)
+  vipc_client_extra = VisionIpcClient("camerad", _VST_WIDE_ROAD, True)
   cloudlog.warning(f"vision stream set up, main_wide_camera: {main_wide_camera}, use_extra_client: {use_extra_client}")
 
   while not vipc_client_main.connect(False):
@@ -442,7 +464,7 @@ def main(demo=False):
   model_check_counter = 0
 
   # setup filter to track dropped frames
-  frame_dropped_filter = FirstOrderFilter(0., 10., 1. / ModelConstants.MODEL_FREQ)
+  frame_dropped_filter = FirstOrderFilter(0., 10., 1. / ModelConstants.MODEL_RUN_FREQ)
   frame_id = 0
   last_vipc_frame_id = 0
   run_count = 0
@@ -470,7 +492,7 @@ def main(demo=False):
     # Check if model was changed via params
     model_check_counter += 1
     if model_check_counter % 100 == 0:
-      current_model_name = params.get("Model", encoding='utf-8') or "FiletOFish"
+      current_model_name = _read_model_param(params)
       if current_model_name != loaded_model_name:
         cloudlog.warning(f"Model changed from {loaded_model_name} to {current_model_name}, restarting")
         raise SystemExit(0)

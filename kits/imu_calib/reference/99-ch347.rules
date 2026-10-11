@@ -1,0 +1,5 @@
+# CH347 hidraw device permissions (Mode 2 / HID, VID:PID 1A86:55DC)
+# Copy to /etc/udev/rules.d/ then: sudo udevadm control --reload && sudo udevadm trigger
+#
+# Allow users in the "i2c" or "dialout" group (create group if needed), or world rw:
+KERNEL=="hidraw*", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55dc", MODE="0666", TAG+="uaccess"

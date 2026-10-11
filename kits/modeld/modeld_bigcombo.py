@@ -29,7 +29,11 @@ import time
 import numpy as np
 from pathlib import Path
 
-from openpilot.system.hardware import TICI
+try:
+  from openpilot.system.hardware import TICI
+except ImportError:
+  # master-c3 系硬件抽象无 TICI 常量: 非 TICI 平台 → 走 CUDA 路径
+  TICI = False
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 from tinygrad.device import Device
@@ -81,7 +85,7 @@ def _get_lat_delay(sm) -> float:
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState
 from openpilot.selfdrive.modeld.constants import ModelConstants
-from openpilot.selfdrive.modeld.models.commonmodel_pyx import DrivingModelFrame, CLContext
+from openpilot.sunnypilot.models.split_model_constants import SplitModelConstants
 
 PROCESS_NAME = "selfdrive.modeld.modeld_bigcombo"
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
@@ -123,8 +127,21 @@ TRT_LOAD_RETRY_INTERVAL = float(os.getenv("TRT_LOAD_RETRY_INTERVAL", "2.0"))
 METADATA_NAME = 'big_driving_supercombo_metadata.pkl'
 
 
+def _read_model_param(params=None):
+  """Active model name. Tolerates this tree's Params API (no `encoding` kwarg) and a
+  missing 'Model' key, both of which differ from the API this file was written against."""
+  p = params if params is not None else Params()
+  try:
+    v = p.get("Model")
+  except Exception:
+    v = None
+  if isinstance(v, (bytes, bytearray)):
+    v = bytes(v).decode("utf-8", "replace")
+  return v or "FiletOFish"
+
+
 def get_model_name():
-  return Params().get("Model", encoding='utf-8') or "FiletOFish"
+  return _read_model_param()
 
 
 def is_bigcombo():
@@ -146,12 +163,12 @@ class BigComboTrtUnavailable(Exception):
 
 
 class ModelState:
-  frames: dict[str, DrivingModelFrame]
+  frames: dict
   inputs: dict[str, np.ndarray]
   output: np.ndarray
   prev_desire: np.ndarray  # for tracking the rising edge of the pulse
 
-  def __init__(self, context: CLContext):
+  def __init__(self, context=None):
     model_dir = DEFAULT_MODEL_DIR / "BigCombo"
     metadata_path = model_dir / METADATA_NAME
 
@@ -166,12 +183,12 @@ class ModelState:
     self.vision_input_names = [n for n in self.input_names if n in ('img', 'big_img')]
 
     # ── dimensions derived from metadata ──
-    self.temporal_skip = ModelConstants.TEMPORAL_SKIP  # 4
+    self.temporal_skip = ModelConstants.MODEL_RUN_FREQ // ModelConstants.MODEL_CONTEXT_FREQ  # 4
     self.desire_len = self.input_shapes['desire_pulse'][2]           # 8
     self.desire_slots = self.input_shapes['desire_pulse'][1]         # 25 (incl current)
     self.feature_len = self.input_shapes['features_buffer'][2]       # 512
     self.feature_slots = self.input_shapes['features_buffer'][1]     # 24 (excl current — graph concats hidden in-graph)
-    self.full_history_buffer_len = ModelConstants.FULL_HISTORY_BUFFER_LEN  # 100
+    self.full_history_buffer_len = SplitModelConstants.FULL_HISTORY_BUFFER_LEN  # 100
     self.full_features_buffer = np.zeros((1, self.full_history_buffer_len, self.feature_len), dtype=np.float32)
     self.full_desire = np.zeros((1, self.full_history_buffer_len, self.desire_len), dtype=np.float32)
     # desire: 25 slots incl current  → idxs -1-(4*24) step 4
@@ -180,7 +197,7 @@ class ModelState:
     self.features_idxs = slice(-1 - (self.temporal_skip * (self.feature_slots - 1)), None, self.temporal_skip)
 
     # ── frame pipeline (two streams, same as modeld.py) ──
-    self.frames = {name: DrivingModelFrame(context, self.temporal_skip) for name in ('input_imgs', 'big_input_imgs')}
+    self.frames = {}  # CUDA-only build; OpenCL frames built lazily below if needed
     self.prev_desire = np.zeros(self.desire_len, dtype=np.float32)
 
     self.numpy_inputs = {name: np.zeros(shape, dtype=np.float32) for name, shape in self.input_shapes.items()}
@@ -213,7 +230,7 @@ class ModelState:
           _model_h, _model_w = _model_input_shape[2], _model_input_shape[3]
           self._model_w = _model_w * 2
           self._model_h = _model_h * 2
-          for key in self.frames:
+          for key in ('input_imgs', 'big_input_imgs'):
             state = ctypes.create_string_buffer(128)
             self._cu_transform.cuda_transform_init(
               ctypes.byref(state), self._model_w, self._model_h, self.temporal_skip
@@ -224,6 +241,12 @@ class ModelState:
       except Exception as e:
         cloudlog.warning(f"[BigCombo] CUDA transform not available: {e}")
         self._cuda_transform = False
+
+    if TICI or not self._cuda_transform:
+      if context is None:
+        raise RuntimeError("BigCombo is CUDA-only in this tree: OpenCL frames need a CL context")
+      from openpilot.selfdrive.modeld.models.commonmodel_pyx import DrivingModelFrame
+      self.frames = {k: DrivingModelFrame(context, self.temporal_skip) for k in ('input_imgs', 'big_input_imgs')}
 
     # ── Force tinygrad CUDA device init BEFORE TRT (context sharing, same as modeld.py) ──
     _ = Device['CUDA']
@@ -362,15 +385,20 @@ def main(demo=False):
   # core 7 是原版 modeld 惯例位(camerad/webcamerad 同在 0-7 抢核), 用 8 隔离更稳
   config_realtime_process(8, 54)
 
-  cloudlog.warning("[BigCombo] setting up CL context")
-  cl_context = CLContext()
-  cloudlog.warning("[BigCombo] CL context ready; loading model")
+  cl_context = None
+  if TICI:
+    from openpilot.selfdrive.modeld.models.commonmodel_pyx import CLContext
+    cl_context = CLContext()
+  cloudlog.warning("[BigCombo] loading model (CUDA/TensorRT path)")
   try:
     model = ModelState(cl_context)
   except BigComboTrtUnavailable as e:
     # 降级闭环: 合并引擎 TRT 不可用 → 切 Params Model=FiletOFish 并退出,
     # manager 重启 modeld → modeld.py dispatch 走 FiletOFish 路径
-    Params().put("Model", "FiletOFish")
+    try:
+      Params().put("Model", "FiletOFish")
+    except Exception as _e:
+      cloudlog.warning(f"[BigCombo] cannot persist Model=FiletOFish ({_e})")
     cloudlog.warning(f"[BigCombo] TRT unavailable, switched Model=FiletOFish, restarting modeld ({e})")
     print(f"[WARN] [BigCombo] TRT unavailable, switched Model=FiletOFish, restarting modeld: {e}")
     raise SystemExit(0)
@@ -386,8 +414,8 @@ def main(demo=False):
     time.sleep(.1)
 
   vipc_client_main_stream = _VST_WIDE_ROAD if main_wide_camera else _VST_ROAD
-  vipc_client_main = VisionIpcClient("camerad", vipc_client_main_stream, True, cl_context)
-  vipc_client_extra = VisionIpcClient("camerad", _VST_WIDE_ROAD, True, cl_context)
+  vipc_client_main = VisionIpcClient("camerad", vipc_client_main_stream, True)
+  vipc_client_extra = VisionIpcClient("camerad", _VST_WIDE_ROAD, True)
   cloudlog.warning(f"[BigCombo] vision stream set up, main_wide_camera: {main_wide_camera}, use_extra_client: {use_extra_client}")
 
   while not vipc_client_main.connect(False):
@@ -410,7 +438,7 @@ def main(demo=False):
   model_check_counter = 0
 
   # setup filter to track dropped frames
-  frame_dropped_filter = FirstOrderFilter(0., 10., 1. / ModelConstants.MODEL_FREQ)
+  frame_dropped_filter = FirstOrderFilter(0., 10., 1. / ModelConstants.MODEL_RUN_FREQ)
   frame_id = 0
   last_vipc_frame_id = 0
   run_count = 0
@@ -437,7 +465,7 @@ def main(demo=False):
     # Check if model was changed via params (same hot-switch mechanism as modeld.py)
     model_check_counter += 1
     if model_check_counter % 100 == 0:
-      current_model_name = params.get("Model", encoding='utf-8') or "FiletOFish"
+      current_model_name = _read_model_param(params)
       if current_model_name != loaded_model_name:
         cloudlog.warning(f"[BigCombo] Model changed from {loaded_model_name} to {current_model_name}, restarting")
         raise SystemExit(0)

@@ -834,21 +834,25 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
       } catch (...) {}
     }
 
-    // Periodic debug log to stderr (every 1 second)
+    // Periodic debug log to stderr (every 1 second). The accel/gyro stream is
+    // quiet by default — set CH347_VERBOSE=1 to stream it. The "waiting" line is
+    // kept so a stalled sensor is still visible at startup.
     {
       static uint64_t last_log_t = 0;
+      static const bool verbose = std::getenv("CH347_VERBOSE") != nullptr;
       uint64_t now = nanos_since_boot();
       if (now - last_log_t > 1e9) {
         last_log_t = now;
-        if (cache.valid) {
+        if (!cache.valid) {
+          fprintf(stderr, "[%s] Waiting for sensor data...\n", backend_name.c_str());
+          fflush(stderr);
+        } else if (verbose) {
           fprintf(stderr, "[%s] ACC: [%7.2f, %7.2f, %7.2f] m/s²  GYRO: [%7.3f, %7.3f, %7.3f] rad/s\n",
               backend_name.c_str(),
               cache.acc_v[0], cache.acc_v[1], cache.acc_v[2],
               cache.gyro_v[0], cache.gyro_v[1], cache.gyro_v[2]);
-        } else {
-          fprintf(stderr, "[%s] Waiting for sensor data...\n", backend_name.c_str());
+          fflush(stderr);
         }
-        fflush(stderr);
       }
     }
 
