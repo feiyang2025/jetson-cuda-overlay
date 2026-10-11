@@ -337,6 +337,12 @@ python3 "$OVERLAY_DIR/patch_manager_proclist.py" "$REPO_ROOT"
 echo "Binding camera-driver lifecycle to the launcher..."
 python3 "$OVERLAY_DIR/patch_launcher_camera.py" "$REPO_ROOT"
 
+# webui 要如实报告"本地 GPU / 本机已有的大模型": eGPU 那张卡片原本只认 Chestnut, 在 Jetson 上
+# 直接落成"未激活/未检测到硬件"; 同时放开 carrot_bluetooth 的 COMMA_HARDWARE 门控 ——
+# 不放开时守护进程不启动, 网页永远报"未检测到蓝牙射频硬件"(而系统侧蓝牙完全正常)。
+echo "Making the web UI report the local GPU / local big model + enabling Bluetooth..."
+python3 "$OVERLAY_DIR/patch_webui_local_gpu.py" "$REPO_ROOT"
+
 echo "[apply_cuda] done."
 echo
 echo "Next on-device steps:"
