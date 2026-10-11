@@ -323,9 +323,12 @@ class V4L2Camera:
     mms = []
     seen = []
     keep = None
+    eagain = 0
     try:
       fcntl.ioctl(self.fd, VIDIOC_REQBUFS, probe)
       if probe.count == 0:
+        print(f"[V4L2Camera] {self.device}: 布局探测失败: REQBUFS 返回 0 个 buffer "
+              f"(驱动未就绪/链路脏) -> 几何与字节序都测不到", flush=True)
         return -1
       qbufs = []
       mms = []
@@ -353,6 +356,7 @@ class V4L2Camera:
         try:
           fcntl.ioctl(self.fd, VIDIOC_DQBUF, buf)
         except BlockingIOError:
+          eagain += 1
           time.sleep(0.002)
           continue
         seen.append(buf.bytesused)
@@ -387,6 +391,9 @@ class V4L2Camera:
       except OSError:
         pass
     if not seen:
+      print(f"[V4L2Camera] {self.device}: 布局探测失败: STREAMON 后 2s 内一帧都没 DQBUF 到 "
+            f"(EAGAIN 空转 {eagain} 次) -> 驱动当时没在出帧。典型原因: 强杀采集进程后 V4L2 链路变脏; "
+            f"恢复: sudo rmmod twgmsl && sudo modprobe twgmsl && sleep 4", flush=True)
       return -1
     # 稳定值: 取众数 (前几帧可能有过渡)
     vals, counts = np.unique(np.array(seen), return_counts=True)
@@ -481,6 +488,9 @@ class V4L2Camera:
       else:
         self.cam_active_w, self.cam_active_h = self.cam_w, self.cam_h
       print(f"[V4L2Camera] {self.device}: WARNING 实测 bytesused={probed} 不可用, 退回 G_FMT 几何 {self.cam_w}x{self.cam_h} stride={self.cam_bytesperline}", flush=True)
+      print(f"[V4L2Camera] {self.device}: WARNING 布局探测失败 -> 几何和字节序只能按 G_FMT 猜, "
+            f"本路可能绿屏/错位/无画面。先确认相机驱动已就绪(服务模式: sudo tw_camera_cfg, 不带 bring; 须早于 camerad); "
+            f"若刚强杀过采集进程/崩溃过, 链路可能已脏, 恢复: sudo rmmod twgmsl && sudo modprobe twgmsl && sleep 4", flush=True)
     self._expected_bytesused = probed
 
     # 字节序以实测为准 (G_FMT 的 pf 在 4K 画布状态下是假的)

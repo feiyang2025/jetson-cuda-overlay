@@ -329,6 +329,14 @@ python3 "$OVERLAY_DIR/patch_deleter_retention.py" "$REPO_ROOT"
 echo "Quieting the manager process-list spam..."
 python3 "$OVERLAY_DIR/patch_manager_proclist.py" "$REPO_ROOT"
 
+# launcher 层面的相机驱动生命周期: 起 op 时拉起 tw_camera_cfg(服务模式, 不带 bring --
+# bring 是 GStreamer 预览模式会 spawn 管道占住 /dev/videoN), 退出时 trap 收掉; 并在启动前
+# 强关本机其它 op 实例(崩溃残留会占住 /dev/videoN、VisionIPC socket、ZMQ 端口)。
+# 缺这一层时: 驱动缺失/新鲜度不足 -> camerad 布局探测失败(-1) -> 退回猜 G_FMT 照跑 ->
+# UI 黑屏而日志里没有任何 error。
+echo "Binding camera-driver lifecycle to the launcher..."
+python3 "$OVERLAY_DIR/patch_launcher_camera.py" "$REPO_ROOT"
+
 echo "[apply_cuda] done."
 echo
 echo "Next on-device steps:"
