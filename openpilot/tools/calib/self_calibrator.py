@@ -711,6 +711,104 @@ def _default_realdata():
     return os.path.expanduser("~/.comma/media/0/realdata")
 
 
+class CalibSession:
+    """采样会话: 把 SubMaster 的每一帧喂给三个方法, 并负责收尾计算/写结果。
+
+    --live (手动按钮) 与 calibd (常驻自动) 共用 —— 采样口径只有这一份, 免得两条路径
+    对同一份数据给出不同结论 (那种分歧最难查)。
+    """
+
+    def __init__(self, ecam: bool = False, fcam_fl: float = 0.0):
+        self.ecam = ecam
+        self.cal = SelfCalibrator(ecam=ecam, fcam_fl=fcam_fl)
+        self.frames = 0
+        self.t0 = time.monotonic()
+        self._last_v = 0.0
+        self._last_yaw = 0.0
+        self._last_radar_d = 0.0
+        self._last_vision_x = 0.0
+
+    @property
+    def counts(self) -> tuple:
+        return self.cal.rv.count, self.cal.lw.count, self.cal.cv.count
+
+    @property
+    def total(self) -> int:
+        return sum(self.counts)
+
+    def feed(self, sm) -> bool:
+        """喂一帧 (sm 需已 update); 返回本帧是否产出了新样本。"""
+        produced = False
+        if sm.updated['carState']:
+            self._last_v = sm['carState'].vEgo
+            self._last_yaw = getattr(sm['carState'], 'yawRate', 0)
+        if sm.updated['radarState']:
+            rs = sm['radarState']
+            if _lead_present(rs.leadOne):
+                self._last_radar_d = rs.leadOne.dRel
+        if sm.updated['modelV2']:
+            md = sm['modelV2']
+            leads = md.leadsV3
+            if leads[0].prob > 0.5:
+                self._last_vision_x = leads[0].x[0]
+                n0 = self.cal.rv.count
+                self.cal.rv.add(self._last_radar_d, self._last_vision_x, self._last_v)
+                produced = produced or self.cal.rv.count > n0
+            probs = list(md.laneLineProbs)
+            if len(probs) >= 3 and probs[1] > 0.5 and probs[2] > 0.5:
+                try:
+                    l1 = md.laneLines[1]
+                    l2 = md.laneLines[2]
+                    x1, y1 = np.array(list(l1.x)), np.array(list(l1.y))
+                    x2, y2 = np.array(list(l2.x)), np.array(list(l2.y))
+                    y1_0 = np.interp(0, x1, y1)
+                    y2_0 = np.interp(0, x2, y2)
+                    n1 = self.cal.lw.count
+                    self.cal.lw.add(y2_0 - y1_0, self._last_v)
+                    produced = produced or self.cal.lw.count > n1
+                except Exception:
+                    pass
+            try:
+                mu = md.action
+                n2 = self.cal.cv.count
+                self.cal.cv.add(self._last_yaw, self._last_v, mu.desiredCurvature)
+                produced = produced or self.cal.cv.count > n2
+            except Exception:
+                pass
+        self.frames += 1
+        return produced
+
+    def finish(self, ecam: bool | None = None, params=None, write_params: bool = True,
+               output_path: str | None = None) -> Dict:
+        """收尾: 计算 + (通过门限时) 写结果参数。
+
+        只有通过融合门限 (≥2 个方法一致 + 样本够) 才允许写 —— fl 直接影响视觉测距,
+        不合格宁可让面板显示"无数据", 也不能把一个可疑值送进内参。
+        """
+        ecam = self.ecam if ecam is None else ecam
+        result = self.cal.compute()
+        if output_path:
+            os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+            with open(output_path, "w") as f:
+                json.dump(result, f, indent=2, ensure_ascii=False, default=str)
+        if not write_params:
+            return result
+        f = result.get("fused", {})
+        try:
+            if params is None:
+                from openpilot.common.params import Params
+                params = Params()
+            from params_json import params_json_put
+            result_key = "WideCalibResult" if ecam else "FcamCalibResult"
+            if f.get("accepted"):
+                params_json_put(result_key, result, params)
+            else:
+                params.remove(result_key)   # 清掉旧结果, 免得面板拿着老值让人确认
+        except Exception as e:
+            print(f"[calib] 写结果参数失败: {e}", flush=True)
+        return result
+
+
 def run_live(output_path: str, ecam: bool = False, fcam_fl: float = 0.0):
     """Live collection mode: subscribe to messages, collect data, compute on exit."""
     # 导入要带 openpilot. 前缀: 本 fork 的源码在 <树根>/openpilot/ 子目录,
@@ -730,58 +828,29 @@ def run_live(output_path: str, ecam: bool = False, fcam_fl: float = 0.0):
     signal.signal(signal.SIGINT, _handler)
 
     params = Params()
-    cal = SelfCalibrator(ecam=ecam, fcam_fl=fcam_fl)
+    sess = CalibSession(ecam=ecam, fcam_fl=fcam_fl)
     sm = messaging.SubMaster(['carState', 'radarState', 'modelV2'])
 
     print("实时采集已启动，等待数据...", flush=True)
     tick = 0
-    start_time = time.time()
+    t0 = time.monotonic()
     active_key = "WideCalibActive" if ecam else "FcamLiveActive"
     while not exit_now and params.get_bool(active_key):
         sm.update()
-        if sm.updated['carState']:
-            cal._last_v = sm['carState'].vEgo
-            cal._last_yaw = getattr(sm['carState'], 'yawRate', 0)
-        if sm.updated['radarState']:
-            rs = sm['radarState']
-            if _lead_present(rs.leadOne):
-                cal._last_radar_d = rs.leadOne.dRel
-        if sm.updated['modelV2']:
-            md = sm['modelV2']
-            leads = md.leadsV3
-            if leads[0].prob > 0.5:
-                cal._last_vision_x = leads[0].x[0]
-                cal.rv.add(cal._last_radar_d, cal._last_vision_x, cal._last_v)
-            probs = list(md.laneLineProbs)
-            if len(probs) >= 3 and probs[1] > 0.5 and probs[2] > 0.5:
-                try:
-                    l1 = md.laneLines[1]; l2 = md.laneLines[2]
-                    x1, y1 = np.array(list(l1.x)), np.array(list(l1.y))
-                    x2, y2 = np.array(list(l2.x)), np.array(list(l2.y))
-                    y1_0 = np.interp(0, x1, y1); y2_0 = np.interp(0, x2, y2)
-                    cal.lw.add(y2_0 - y1_0, cal._last_v)
-                except:
-                    pass
-            try:
-                mu = md.action
-                cal.cv.add(cal._last_yaw, cal._last_v, mu.desiredCurvature)
-            except:
-                pass
+        sess.feed(sm)
         tick += 1
         if tick % 50 == 0:
-            elapsed = time.time() - start_time
-            print(f"收集 rv={cal.rv.count} lw={cal.lw.count} cv={cal.cv.count} 时间={elapsed:.0f}s", flush=True)
+            rv, lw, cv = sess.counts
+            print(f"收集 rv={rv} lw={lw} cv={cv} 时间={time.monotonic() - t0:.0f}s", flush=True)
 
     print(f"计算 进度=0%", flush=True)
-    print(f"\n采集结束，共 {cal.rv.count + cal.lw.count + cal.cv.count} 个样本，开始计算...")
-    result = cal.compute()
+    print(f"\n采集结束，共 {sess.total} 个样本，开始计算...")
+    result = sess.finish(ecam=ecam, params=params, output_path=output_path,
+                         write_params=False)     # 结果 param 由下面显式写 (要打印日志)
     if output_path:
-        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-        with open(output_path, "w") as f:
-            json.dump(result, f, indent=2, ensure_ascii=False, default=str)
         print(f"结果已保存: {output_path}")
     print()
-    print(cal.report(result))
+    print(sess.cal.report(result))
     f = result["fused"]
     label = "ECAM" if ecam else "FCAM"
     if f.get("accepted"):
@@ -795,12 +864,8 @@ def run_live(output_path: str, ecam: bool = False, fcam_fl: float = 0.0):
         if f.get("fl_suggested_raw"):
             print(f"  (参考值 未采纳: fl {f.get('fl_current')} → {f['fl_suggested_raw']})", flush=True)
 
-    # Save to Params for UI to read
-    # 两道关:
-    #   1. 必须走 params_json: 本 fork 的 FcamCalibResult/WideCalibResult 是 JSON 型键,
-    #      put(key, json.dumps(x)) 会 TypeError 被裸 except 吞掉 -> UI 永远读不到结果。
-    #   2. 只有通过融合门限 (≥2 个方法一致 + 样本够) 才允许写入 —— fl 直接影响视觉测距,
-    #      不合格宁可让面板显示"无数据", 也不能把一个可疑值送进内参。
+    # 结果写 Params: 只有通过融合门限 (≥2 个方法一致 + 样本够) 才写 —— fl 直接影响视觉测距,
+    # 不合格宁可让面板显示"无数据", 也不能把一个可疑值送进内参。
     try:
         from params_json import params_json_put
         result_key = "WideCalibResult" if ecam else "FcamCalibResult"

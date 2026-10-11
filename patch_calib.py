@@ -169,6 +169,11 @@ CALIB_KEYS = [
     ("FcamLiveActive", "PERSISTENT", "BOOL"),
     ("WideCalibIntrinsicsFcamBackup", "CLEAR_ON_MANAGER_START", "JSON"),
     ("WideCalibIntrinsicsEcamBackup", "CLEAR_ON_MANAGER_START", "JSON"),
+    # ---- calibd (常驻自动标定) ----
+    ("AutoCalib", "PERSISTENT", "BOOL"),            # 自动写入内参开关
+    ("AutoCalibHistory", "PERSISTENT", "JSON"),     # 每趟结果与动作
+    ("AutoCalibBackup", "PERSISTENT", "JSON"),      # 写前旧内参备份 (回滚用)
+    ("AutoCalibRollback", "PERSISTENT", "BOOL"),    # 置 1 -> 回滚
 ]
 ENTRY_RE = re.compile(r'^\s*\{"([A-Za-z0-9_]+)",')
 
@@ -251,6 +256,24 @@ OLD_HELPER = '''def _default_realdata():
   return Paths.log_root()'''
 
 
+CALIBD_LINE = '  PythonProcess("calibd", "openpilot.sunnypilot.calib.calibd", always_run),'
+PC_ANCHOR = 'PythonProcess("mapd_manager", "openpilot.sunnypilot.mapd.mapd_manager", always_run),'
+
+
+def patch_process_config(path: str) -> list[str]:
+    """注册 calibd (常驻自动标定)。幂等: 已有 calibd 就跳过。"""
+    with open(path, encoding="utf-8") as f:
+        s = f.read()
+    if '"calibd"' in s:
+        return []
+    if PC_ANCHOR not in s:
+        return [f"!! {path}: anchor '{PC_ANCHOR[:40]}...' not found (needs manual merge)"]
+    s = s.replace(PC_ANCHOR, PC_ANCHOR + "\n" + CALIBD_LINE, 1)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(s)
+    return ["process_config.py: calibd registered (always_run)"]
+
+
 def patch_calib_tool(path: str) -> list[str]:
     with open(path, encoding="utf-8") as f:
         s = f.read()
@@ -301,7 +324,7 @@ def main() -> int:
                 return p
         return None
     targets = []
-    for rel in ("common/transformations/camera.py", "common/params_keys.h"):
+    for rel in ("common/transformations/camera.py", "common/params_keys.h", "system/manager/process_config.py"):
         p = _resolve(rel)
         if p is not None:
             targets.append(p)
@@ -314,7 +337,12 @@ def main() -> int:
             out.append(f"!! missing {t}")
             continue
         try:
-            out += patch_camera_py(t) if t.endswith("camera.py") else patch_params_keys(t)
+            if t.endswith("camera.py"):
+                out += patch_camera_py(t)
+            elif t.endswith("process_config.py"):
+                out += patch_process_config(t)
+            else:
+                out += patch_params_keys(t)
         except Exception as e:  # noqa: BLE001
             out.append(f"!! {t}: {type(e).__name__}: {e}")
 
@@ -335,8 +363,10 @@ def main() -> int:
         print("[patch_calib] " + line)
     if any(l.startswith("!!") for l in out):
         return 1
-    print("[patch_calib] done -> REBUILD the params module now:")
-    print(f"[patch_calib]   cd {root} && source .venv/bin/activate && scons -j8 common/")
+    print("[patch_calib] done -> REBUILD the params module now (改了 params_keys.h 就必须重编):")
+    print(f"[patch_calib]   cd {root} && export PATH=\"$PWD/.venv/bin:$PATH\" && "
+          f"PYTHONPATH=\"$PWD\" .venv/bin/scons -j$(nproc) openpilot/common/libparams_c.so")
+    print("[patch_calib]   (目标名不是 params_c/params_pyx; 且 capnpc 在 .venv/bin, 必须先进 PATH)")
     return 2
 
 
