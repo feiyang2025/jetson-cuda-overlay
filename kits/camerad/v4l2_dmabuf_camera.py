@@ -277,16 +277,81 @@ class V4L2Camera:
     self._nv12_size = width * height * 3 // 2
     self._open()
 
-  def _measure_packed_layout(self, frame, bytesused):
-    """从真实帧判定 packed 4:2:2 字节序 (YUYV 还是 UYVY)。
+  # ---- packed 字节序实测 (判据出自 文档/相机链路_绿色与撕裂) ----
+  LAYOUT_CACHE_PATH = os.path.join(os.path.expanduser("~/.comma"), "cam_packed_layout.json")
 
-    必须实测, 不能信 G_FMT 的 pf 字段 —— twgmsl 在 4K 虚标画布状态下对所有节点
-    都报 UYVY, 但实测 video0 是 YUYV / video1 是 UYVY; 而且同一节点在两种驱动
-    状态间还会翻转 (紧凑 1080p 时 video0=YUYV, 4K 画布时 video0=UYVY)。
+  @staticmethod
+  def _layout_stat(y, c):
+    """一组 (亮度样本, 色度样本) 的统计量 (只用于日志/诊断)。
 
-    判据: 正确的字节序解出的亮度有明暗层次 (std ≈ 30); 解错则亮度被压平成常数
-    (std ≈ 7-10), 色度反而出现高方差。取 std 大的那个。
+    y_sd 亮度层次, c_sd 色度层次, y_hf/c_hf 相邻样本差分均值 (= 行内高频能量)。
+    真实图像的纹理在亮度里, 色度是 2x 下采样 + 低通。
     """
+    yt = y.astype(np.int16)
+    ct = c.astype(np.int16)
+    y_hf = float(np.abs(np.diff(yt, axis=1)).mean()) if y.shape[1] > 1 else 0.0
+    c_hf = float(np.abs(np.diff(ct, axis=1)).mean()) if c.shape[1] > 1 else 0.0
+    return float(y.std()), float(c.std()), y_hf, c_hf
+
+  @staticmethod
+  def _layout_pair_scores(tight):
+    """按 CP 参考实现 (openpilot_cp_egpucp/openpilot/tools/webcam/camera.py::detect_layout)
+    的口径给两个候选字节对打分, 返回 (even 对分数, odd 对分数)。
+
+    一个 4 字节组是 (Y,U,Y,V) 或 (U,Y,V,Y)。**色度恒居中于 128 且方差小, 亮度离 128 远、
+    方差大**, 所以 分数 = |mean-128| + |mean-128| + std + std, 分**小**的那一对是色度。
+
+    为什么必须换成这个口径: 旧判据只比 "哪一组的 std 大" (即亮的当亮度), 夜间近乎全黑的
+    画面里真实亮度方差被压得比色度噪声还小 → 判据翻转 → 按错布局解码 → 整幅变绿。
+    新口径的主项是"离 128 的距离": 夜里亮度均值 ≈22 (偏离上百), 色度仍贴着 128, 所以照样
+    判得对。CP 那套画面正常, 用的就是这个口径。
+    """
+    a = tight.reshape(-1)
+    def pair(o1, o2):
+      b1 = a[o1::4].astype(np.int32)
+      b2 = a[o2::4].astype(np.int32)
+      return (abs(float(b1.mean()) - 128.0) + abs(float(b2.mean()) - 128.0)
+              + float(b1.std()) + float(b2.std()))
+    return pair(0, 2), pair(1, 3)
+
+  def _layout_fingerprint(self, bytesused):
+    return f"{os.path.basename(self.device)}:{bytesused}:{self.cam_bytesperline}"
+
+  def _remember_layout(self, name, bytesused):
+    try:
+      import json
+      d = {}
+      if os.path.exists(self.LAYOUT_CACHE_PATH):
+        with open(self.LAYOUT_CACHE_PATH) as f:
+          d = json.load(f)
+      d[self._layout_fingerprint(bytesused)] = name
+      os.makedirs(os.path.dirname(self.LAYOUT_CACHE_PATH), exist_ok=True)
+      with open(self.LAYOUT_CACHE_PATH, "w") as f:
+        json.dump(d, f)
+    except Exception:
+      pass
+
+  def _recall_layout(self, bytesused):
+    try:
+      import json
+      with open(self.LAYOUT_CACHE_PATH) as f:
+        return json.load(f).get(self._layout_fingerprint(bytesused))
+    except Exception:
+      return None
+
+  def _measure_packed_layout(self, frame, bytesused):
+    """从真实帧判定 packed 4:2:2 字节序 (YUYV / UYVY)。多判据 + 置信度 + 三级回退。
+
+    必须实测, 不能只信 G_FMT 的 pf: twgmsl 在 4K 虚标画布状态下对所有节点都报 UYVY。
+    但也**不能只靠单帧统计**: 判据本身在夜间失效 —— 2026-10-12 凌晨实测, 车库近乎全黑
+    (Y≈22.6) 时色度字节的方差(9.8)反而超过真实亮度方差, 于是 video0 被判成 UYVY
+    (真值 YUYV, G_FMT 也报 YUYV) → 按错布局解码 → 亮度被压平 → **整幅变绿**。
+
+    所以: 统计判据要有明显优势才采信; 不明确时按"紧凑状态下 G_FMT 可信"(§1.3),
+    再退到"同一几何指纹的上一轮确定结果"; 都不行才返回 None 并由上层沿用 G_FMT。
+    现场排障可用 CAM_PACKED_LAYOUT=YUYV|UYVY 直接强制。
+    """
+    forced = (os.environ.get("CAM_PACKED_LAYOUT") or "").upper()
     if frame is None or bytesused <= 0:
       return None
     # 4K 画布: 真实图在左上 ACTIVE_W x ACTIVE_H, 行距 7680; 其余全零
@@ -302,15 +367,48 @@ class V4L2Camera:
     rows = np.frombuffer(frame[:need], dtype=np.uint8).reshape(h, stride)
     # 只取每行前 ACTIVE_W*2 字节 (4K 画布下每行后半是全零 padding)
     tight = np.ascontiguousarray(rows[:, :self.ACTIVE_WIDTH * 2])
-    best, best_sd = None, -1.0
-    for name, yo in (("YUYV", 0), ("UYVY", 1)):
-      y = tight[:, yo::2]
-      sd = float(y.std())
-      if sd > best_sd:
-        best, best_sd = name, sd
-    if best is None or best_sd < 5.0:
+
+    s_even, s_odd = self._layout_pair_scores(tight)
+    # 分数小的一对是色度: even 对是色度 -> 亮度落在奇数位 -> UYVY; 反之 YUYV
+    if s_even < s_odd:
+      best_name, chroma_score, luma_score = "UYVY", s_even, s_odd
+    else:
+      best_name, chroma_score, luma_score = "YUYV", s_odd, s_even
+    yo = 1 if best_name == "UYVY" else 0
+    y_sd, c_sd, y_hf, c_hf = self._layout_stat(tight[:, yo::2], tight[:, (1 - yo)::2])
+    detail = (f"选定={best_name} 色度对分={chroma_score:.1f} 亮度对分={luma_score:.1f} "
+              f"Y.sd={y_sd:.1f} C.sd={c_sd:.1f} hf={y_hf:.2f}/{c_hf:.2f}")
+
+    # 0) 环境变量强制 (现场排障用; 仍然实测打印数值, 便于对比判据)
+    #    两个名字都收: 本树的 CAM_PACKED_LAYOUT, 以及 CP 参考实现的 CAM_YUV_LAYOUT
+    forced = forced or (os.environ.get("CAM_YUV_LAYOUT") or "").upper()
+    if forced in ("YUYV", "UYVY"):
+      print(f"[V4L2Camera] {self.device}: packed 布局被 {forced} 强制指定 ({detail})", flush=True)
+      return forced, y_sd
+
+    # 1) 判据明确 (色度对的分显著小于亮度对, 且色度确实贴着 128 附近) -> 采信实测
+    if (luma_score - chroma_score) >= 8.0 and chroma_score <= 40.0:
+      self._remember_layout(best_name, bytesused)
+      return best_name, y_sd
+
+    # 2) 不明确 -> G_FMT (紧凑状态下可信) / 记忆值
+    gfmt = ("UYVY" if self._gfmt_pixelformat == V4L2_PIX_FMT_UYVY else
+            "YUYV" if self._gfmt_pixelformat == V4L2_PIX_FMT_YUYV else None)
+    compact = bytesused != self.CAMERA_NATIVE_SIZE
+    remembered = self._recall_layout(bytesused)
+    if compact and gfmt:
+      chosen, why = gfmt, "G_FMT(紧凑状态可信)"
+    elif remembered:
+      chosen, why = remembered, "同几何指纹的上一轮确定结果"
+    elif gfmt:
+      chosen, why = gfmt, "G_FMT(4K 虚标状态下仅供参考)"
+    else:
+      print(f"[V4L2Camera] {self.device}: WARNING 字节序判定不了 ({detail}) "
+            f"-> 返回 None, 上层沿用 G_FMT 的 {self.cam_format_name} (可能解错变绿)", flush=True)
       return None
-    return best, best_sd
+    print(f"[V4L2Camera] {self.device}: 统计判据不明确({detail}) -> 取 {chosen} ({why}); "
+          f"若画面偏绿可用 CAM_PACKED_LAYOUT=YUYV|UYVY 强制", flush=True)
+    return chosen, y_sd
 
   def _probe_frame_bytesused(self):
     """open 阶段布局探测: 临时 MMAP 抓几帧, 返回稳定后的 bytesused,

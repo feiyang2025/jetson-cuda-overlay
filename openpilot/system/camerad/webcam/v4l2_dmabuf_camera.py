@@ -15,7 +15,10 @@ def v4l2_fourcc(a, b, c, d):
 # V4L2 ioctl 常量
 VIDIOC_QUERYCAP    = 0x80685600
 VIDIOC_QUERYBUF    = 0xC0585609
-VIDIOC_G_FMT       = 0xC0CC5604
+# 本驱动 (twgmsl vi-output) 只接受 size=0xD0(208) 的 G_FMT; 旧值 0xC0CC5604(204)
+# 会让 ioctl 恒定返回 EINVAL, 于是 cam_pixelformat 退化成硬编码的 'UYVY' 兜底。
+# video0 真实是 YUYV, 被当 UYVY 解就是全绿 —— G_FMT 必须能读出真实格式。
+VIDIOC_G_FMT       = 0xC0D05604
 VIDIOC_REQBUFS     = 0xC0145608
 VIDIOC_QBUF        = 0xC058560F
 VIDIOC_DQBUF       = 0xC0585611
@@ -30,6 +33,7 @@ V4L2_MEMORY_DMABUF          = 4
 V4L2_CAP_STREAMING = 0x04000000
 V4L2_BUF_FLAG_ERROR = 0x00000040
 V4L2_PIX_FMT_UYVY = v4l2_fourcc('U', 'Y', 'V', 'Y')
+V4L2_PIX_FMT_YUYV = v4l2_fourcc('Y', 'U', 'Y', 'V')
 V4L2_PIX_FMT_NV12 = v4l2_fourcc('N', 'V', '1', '2')
 
 # tegra-video 驱动的 exposure 控制 ID（0x009a200a，无 auto_exposure）
@@ -104,6 +108,36 @@ class v4l2_control(ctypes.Structure):
   ]
 
 
+# tegra 的 exposure 是 **64 位(int64)** 控制: 走 32 位的 v4l2_control + VIDIOC_S_CTRL
+# 会被驱动判为 size 不匹配 → 恒定 EINVAL(实测 "设曝光失败 [Errno 22]"), 于是曝光
+# 一直停在驱动默认值上(表现: 画面过暗/发灰、白平衡看着不对)。
+# 正确做法: VIDIOC_S_EXT_CTRLS + v4l2_ext_control.size = 8。
+class v4l2_ext_control(ctypes.Structure):
+  # 内核里这个结构是 __attribute__((packed)): 4+4+4+8 = 20 字节 (union 只用到 value64)
+  _pack_ = 1
+  _fields_ = [
+    ("id", ctypes.c_uint32),
+    ("size", ctypes.c_uint32),
+    ("reserved2", ctypes.c_uint32),
+    ("value64", ctypes.c_int64),
+  ]
+
+
+class v4l2_ext_controls(ctypes.Structure):
+  _fields_ = [
+    ("ctrl_class", ctypes.c_uint32),
+    ("count", ctypes.c_uint32),
+    ("error_idx", ctypes.c_uint32),
+    ("reserved", ctypes.c_uint32 * 2),
+    ("controls", ctypes.POINTER(v4l2_ext_control)),
+  ]
+
+
+# _IOWR('V', 72, struct v4l2_ext_controls) = (3<<30)|(32<<16)|(0x56<<8)|72
+# (arm64 上该结构因含指针按 8 对齐 → sizeof=32, 故 size 位段是 32 不是 28)
+VIDIOC_S_EXT_CTRLS = 0xC0205648
+
+
 class NvBufSurfaceCreateParams(ctypes.Structure):
   _fields_ = [
     ("gpuId", ctypes.c_uint32),
@@ -115,6 +149,32 @@ class NvBufSurfaceCreateParams(ctypes.Structure):
     ("colorFormat", ctypes.c_uint32),
     ("layout", ctypes.c_uint32),
     ("memType", ctypes.c_uint32),
+  ]
+
+
+class _NvBufSurfaceParamsLite(ctypes.Structure):
+  _fields_ = [
+    ("width", ctypes.c_uint32),
+    ("height", ctypes.c_uint32),
+    ("pitch", ctypes.c_uint32),
+    ("colorFormat", ctypes.c_uint32),
+    ("layout", ctypes.c_uint32),
+    ("bufferDesc", ctypes.c_uint64),
+    ("dataSize", ctypes.c_uint32),
+    ("_pad", ctypes.c_uint32),
+    ("dataPtr", ctypes.c_void_p),
+  ]
+
+
+class _NvBufSurfaceLite(ctypes.Structure):
+  _fields_ = [
+    ("gpuId", ctypes.c_uint32),
+    ("batchSize", ctypes.c_uint32),
+    ("numFilled", ctypes.c_uint32),
+    ("isContiguous", ctypes.c_bool),
+    ("_pad", ctypes.c_uint8 * 3),
+    ("memType", ctypes.c_uint32),
+    ("surfaceList", ctypes.POINTER(_NvBufSurfaceParamsLite)),
   ]
 
 
@@ -149,7 +209,7 @@ class NvBufSurfTransformConfigParams(ctypes.Structure):
 
 
 class VisionBuf:
-  def __init__(self, dmabuf_fd, width, height, stride, data_size, frame_id, pixel_format='NV12', data=None, timestamp_sof=0, timestamp_eof=0):
+  def __init__(self, dmabuf_fd, width, height, stride, data_size, frame_id, pixel_format='NV12', data=None, timestamp_sof=0, timestamp_eof=0, v4l2_index=None):
     self.fd = dmabuf_fd
     self.width = width
     self.height = height
@@ -166,6 +226,7 @@ class VisionBuf:
     self.data = data
     self.timestamp_sof = timestamp_sof
     self.timestamp_eof = timestamp_eof
+    self.v4l2_index = v4l2_index
 
 
 class V4L2Camera:
@@ -181,13 +242,18 @@ class V4L2Camera:
   ACTIVE_WIDTH = 1920             # buffer 内真实图像区 (传感器有效像素)
   ACTIVE_HEIGHT = 1080
 
-  OUTPUT_WIDTH = 1920             # VIC 输出 NV12 (openpilot 消费端契约, modeld/UI 全动态尺寸)
-  OUTPUT_HEIGHT = 1080
+  OUTPUT_WIDTH = 1920             # 下游输出 NV12 宽 (env CAM_WIDTH/SP_CAM_OUT_W 可覆盖, cp 用 1344)
+  OUTPUT_HEIGHT = 1080            # 下游输出 NV12 高 (env CAM_HEIGHT/SP_CAM_OUT_H 可覆盖, cp 用 760)
   OUTPUT_STRIDE = 1920
   OUTPUT_SIZE = 3110400           # 1920*1080*3//2
 
-  def __init__(self, device, width=OUTPUT_WIDTH, height=OUTPUT_HEIGHT, fps=20, num_buffers=4, exposure=33334):
+  def __init__(self, device, width=None, height=None, fps=20, num_buffers=4, exposure=33334):
     self.device = device
+    # 输出尺寸: 优先显式参数, 其次 CAM_WIDTH/CAM_HEIGHT (cp 兼容), 最后默认 1920x1080
+    if width is None:
+      width = int(os.environ.get("CAM_WIDTH", os.environ.get("SP_CAM_OUT_W", str(self.OUTPUT_WIDTH))))
+    if height is None:
+      height = int(os.environ.get("CAM_HEIGHT", os.environ.get("SP_CAM_OUT_H", str(self.OUTPUT_HEIGHT))))
     self.target_w = width
     self.target_h = height
     self.W = width
@@ -211,8 +277,142 @@ class V4L2Camera:
     self._nv12_size = width * height * 3 // 2
     self._open()
 
+  # ---- packed 字节序实测 (判据出自 文档/相机链路_绿色与撕裂) ----
+  LAYOUT_CACHE_PATH = os.path.join(os.path.expanduser("~/.comma"), "cam_packed_layout.json")
+
+  @staticmethod
+  def _layout_stat(y, c):
+    """一组 (亮度样本, 色度样本) 的统计量 (只用于日志/诊断)。
+
+    y_sd 亮度层次, c_sd 色度层次, y_hf/c_hf 相邻样本差分均值 (= 行内高频能量)。
+    真实图像的纹理在亮度里, 色度是 2x 下采样 + 低通。
+    """
+    yt = y.astype(np.int16)
+    ct = c.astype(np.int16)
+    y_hf = float(np.abs(np.diff(yt, axis=1)).mean()) if y.shape[1] > 1 else 0.0
+    c_hf = float(np.abs(np.diff(ct, axis=1)).mean()) if c.shape[1] > 1 else 0.0
+    return float(y.std()), float(c.std()), y_hf, c_hf
+
+  @staticmethod
+  def _layout_pair_scores(tight):
+    """按 CP 参考实现 (openpilot_cp_egpucp/openpilot/tools/webcam/camera.py::detect_layout)
+    的口径给两个候选字节对打分, 返回 (even 对分数, odd 对分数)。
+
+    一个 4 字节组是 (Y,U,Y,V) 或 (U,Y,V,Y)。**色度恒居中于 128 且方差小, 亮度离 128 远、
+    方差大**, 所以 分数 = |mean-128| + |mean-128| + std + std, 分**小**的那一对是色度。
+
+    为什么必须换成这个口径: 旧判据只比 "哪一组的 std 大" (即亮的当亮度), 夜间近乎全黑的
+    画面里真实亮度方差被压得比色度噪声还小 → 判据翻转 → 按错布局解码 → 整幅变绿。
+    新口径的主项是"离 128 的距离": 夜里亮度均值 ≈22 (偏离上百), 色度仍贴着 128, 所以照样
+    判得对。CP 那套画面正常, 用的就是这个口径。
+    """
+    a = tight.reshape(-1)
+    def pair(o1, o2):
+      b1 = a[o1::4].astype(np.int32)
+      b2 = a[o2::4].astype(np.int32)
+      return (abs(float(b1.mean()) - 128.0) + abs(float(b2.mean()) - 128.0)
+              + float(b1.std()) + float(b2.std()))
+    return pair(0, 2), pair(1, 3)
+
+  def _layout_fingerprint(self, bytesused):
+    return f"{os.path.basename(self.device)}:{bytesused}:{self.cam_bytesperline}"
+
+  def _remember_layout(self, name, bytesused):
+    try:
+      import json
+      d = {}
+      if os.path.exists(self.LAYOUT_CACHE_PATH):
+        with open(self.LAYOUT_CACHE_PATH) as f:
+          d = json.load(f)
+      d[self._layout_fingerprint(bytesused)] = name
+      os.makedirs(os.path.dirname(self.LAYOUT_CACHE_PATH), exist_ok=True)
+      with open(self.LAYOUT_CACHE_PATH, "w") as f:
+        json.dump(d, f)
+    except Exception:
+      pass
+
+  def _recall_layout(self, bytesused):
+    try:
+      import json
+      with open(self.LAYOUT_CACHE_PATH) as f:
+        return json.load(f).get(self._layout_fingerprint(bytesused))
+    except Exception:
+      return None
+
+  def _measure_packed_layout(self, frame, bytesused):
+    """从真实帧判定 packed 4:2:2 字节序 (YUYV / UYVY)。多判据 + 置信度 + 三级回退。
+
+    必须实测, 不能只信 G_FMT 的 pf: twgmsl 在 4K 虚标画布状态下对所有节点都报 UYVY。
+    但也**不能只靠单帧统计**: 判据本身在夜间失效 —— 2026-10-12 凌晨实测, 车库近乎全黑
+    (Y≈22.6) 时色度字节的方差(9.8)反而超过真实亮度方差, 于是 video0 被判成 UYVY
+    (真值 YUYV, G_FMT 也报 YUYV) → 按错布局解码 → 亮度被压平 → **整幅变绿**。
+
+    所以: 统计判据要有明显优势才采信; 不明确时按"紧凑状态下 G_FMT 可信"(§1.3),
+    再退到"同一几何指纹的上一轮确定结果"; 都不行才返回 None 并由上层沿用 G_FMT。
+    现场排障可用 CAM_PACKED_LAYOUT=YUYV|UYVY 直接强制。
+    """
+    forced = (os.environ.get("CAM_PACKED_LAYOUT") or "").upper()
+    if frame is None or bytesused <= 0:
+      return None
+    # 4K 画布: 真实图在左上 ACTIVE_W x ACTIVE_H, 行距 7680; 其余全零
+    if bytesused == self.CAMERA_NATIVE_SIZE:
+      stride = self.CAMERA_NATIVE_WIDTH * 2
+      h = self.ACTIVE_HEIGHT
+    else:
+      stride = max(self.cam_bytesperline, 1)
+      h = min(self.cam_h, len(frame) // stride)
+    need = h * stride
+    if need <= 0 or need > len(frame):
+      return None
+    rows = np.frombuffer(frame[:need], dtype=np.uint8).reshape(h, stride)
+    # 只取每行前 ACTIVE_W*2 字节 (4K 画布下每行后半是全零 padding)
+    tight = np.ascontiguousarray(rows[:, :self.ACTIVE_WIDTH * 2])
+
+    s_even, s_odd = self._layout_pair_scores(tight)
+    # 分数小的一对是色度: even 对是色度 -> 亮度落在奇数位 -> UYVY; 反之 YUYV
+    if s_even < s_odd:
+      best_name, chroma_score, luma_score = "UYVY", s_even, s_odd
+    else:
+      best_name, chroma_score, luma_score = "YUYV", s_odd, s_even
+    yo = 1 if best_name == "UYVY" else 0
+    y_sd, c_sd, y_hf, c_hf = self._layout_stat(tight[:, yo::2], tight[:, (1 - yo)::2])
+    detail = (f"选定={best_name} 色度对分={chroma_score:.1f} 亮度对分={luma_score:.1f} "
+              f"Y.sd={y_sd:.1f} C.sd={c_sd:.1f} hf={y_hf:.2f}/{c_hf:.2f}")
+
+    # 0) 环境变量强制 (现场排障用; 仍然实测打印数值, 便于对比判据)
+    #    两个名字都收: 本树的 CAM_PACKED_LAYOUT, 以及 CP 参考实现的 CAM_YUV_LAYOUT
+    forced = forced or (os.environ.get("CAM_YUV_LAYOUT") or "").upper()
+    if forced in ("YUYV", "UYVY"):
+      print(f"[V4L2Camera] {self.device}: packed 布局被 {forced} 强制指定 ({detail})", flush=True)
+      return forced, y_sd
+
+    # 1) 判据明确 (色度对的分显著小于亮度对, 且色度确实贴着 128 附近) -> 采信实测
+    if (luma_score - chroma_score) >= 8.0 and chroma_score <= 40.0:
+      self._remember_layout(best_name, bytesused)
+      return best_name, y_sd
+
+    # 2) 不明确 -> G_FMT (紧凑状态下可信) / 记忆值
+    gfmt = ("UYVY" if self._gfmt_pixelformat == V4L2_PIX_FMT_UYVY else
+            "YUYV" if self._gfmt_pixelformat == V4L2_PIX_FMT_YUYV else None)
+    compact = bytesused != self.CAMERA_NATIVE_SIZE
+    remembered = self._recall_layout(bytesused)
+    if compact and gfmt:
+      chosen, why = gfmt, "G_FMT(紧凑状态可信)"
+    elif remembered:
+      chosen, why = remembered, "同几何指纹的上一轮确定结果"
+    elif gfmt:
+      chosen, why = gfmt, "G_FMT(4K 虚标状态下仅供参考)"
+    else:
+      print(f"[V4L2Camera] {self.device}: WARNING 字节序判定不了 ({detail}) "
+            f"-> 返回 None, 上层沿用 G_FMT 的 {self.cam_format_name} (可能解错变绿)", flush=True)
+      return None
+    print(f"[V4L2Camera] {self.device}: 统计判据不明确({detail}) -> 取 {chosen} ({why}); "
+          f"若画面偏绿可用 CAM_PACKED_LAYOUT=YUYV|UYVY 强制", flush=True)
+    return chosen, y_sd
+
   def _probe_frame_bytesused(self):
-    """open 阶段布局探测: 临时 MMAP 抓几帧, 返回稳定后的 bytesused。
+    """open 阶段布局探测: 临时 MMAP 抓几帧, 返回稳定后的 bytesused,
+    并顺手把 packed 字节序 (YUYV/UYVY) 实测出来存在 self.probed_layout。
     结束时 STREAMOFF + 释放全部临时资源 + munmap, 不留脏状态。"""
     probe = v4l2_requestbuffers()
     probe.count = 2
@@ -220,9 +420,13 @@ class V4L2Camera:
     probe.memory = V4L2_MEMORY_MMAP
     mms = []
     seen = []
+    keep = None
+    eagain = 0
     try:
       fcntl.ioctl(self.fd, VIDIOC_REQBUFS, probe)
       if probe.count == 0:
+        print(f"[V4L2Camera] {self.device}: 布局探测失败: REQBUFS 返回 0 个 buffer "
+              f"(驱动未就绪/链路脏) -> 几何与字节序都测不到", flush=True)
         return -1
       qbufs = []
       mms = []
@@ -250,9 +454,13 @@ class V4L2Camera:
         try:
           fcntl.ioctl(self.fd, VIDIOC_DQBUF, buf)
         except BlockingIOError:
+          eagain += 1
           time.sleep(0.002)
           continue
         seen.append(buf.bytesused)
+        if keep is None:
+          mm, length = mms[buf.index]
+          keep = bytes(mm[:min(buf.bytesused, length)])
         rq = v4l2_buffer()
         rq.index = buf.index
         rq.type = V4L2_BUF_TYPE_VIDEO_CAPTURE
@@ -281,10 +489,36 @@ class V4L2Camera:
       except OSError:
         pass
     if not seen:
+      print(f"[V4L2Camera] {self.device}: 布局探测失败: STREAMON 后 2s 内一帧都没 DQBUF 到 "
+            f"(EAGAIN 空转 {eagain} 次) -> 驱动当时没在出帧。典型原因: 强杀采集进程后 V4L2 链路变脏; "
+            f"恢复: sudo rmmod twgmsl && sudo modprobe twgmsl && sleep 4", flush=True)
       return -1
     # 稳定值: 取众数 (前几帧可能有过渡)
     vals, counts = np.unique(np.array(seen), return_counts=True)
-    return int(vals[np.argmax(counts)])
+    stable = int(vals[np.argmax(counts)])
+    # 用稳定后的 bytesused 量字节序
+    self.probed_layout = self._measure_packed_layout(keep, stable)
+    return stable
+
+  def _set_exposure64(self, value: int) -> bool:
+    """用 VIDIOC_S_EXT_CTRLS 写 int64 曝光 (tegra 的 exposure 是 64 位控制)。
+
+    返回 True=成功。失败只返回 False 不抛, 由调用方决定是否走 32 位兜底。
+    """
+    try:
+      c = v4l2_ext_control()
+      c.id = V4L2_CID_EXPOSURE_TEGRA
+      c.size = 8  # sizeof(int64) —— 驱动按 size 判是不是 64 位控制
+      c.value64 = int(value)
+      ctrls = v4l2_ext_controls()
+      ctrls.ctrl_class = 0
+      ctrls.count = 1
+      ctrls.error_idx = 0
+      ctrls.controls = ctypes.pointer(c)
+      fcntl.ioctl(self.fd, VIDIOC_S_EXT_CTRLS, ctrls)
+      return ctrls.error_idx == 0
+    except OSError:
+      return False
 
   def _open(self):
     self.fd = os.open(self.device, os.O_RDWR | os.O_NONBLOCK)
@@ -298,7 +532,7 @@ class V4L2Camera:
 
     self._gfmt_ok = False
     try:
-      fmt = bytearray(204)
+      fmt = bytearray(208)
       struct.pack_into("I", fmt, 0, V4L2_BUF_TYPE_VIDEO_CAPTURE)
       fcntl.ioctl(self.fd, VIDIOC_G_FMT, fmt)
       # struct v4l2_format: type@0 (4B) → union 对齐到 8 → pix.width@8 height@12
@@ -308,8 +542,9 @@ class V4L2Camera:
       self.cam_pixelformat = struct.unpack_from("I", fmt, 16)[0]
       self.cam_bytesperline = struct.unpack_from("I", fmt, 24)[0]
       self.cam_sizeimage = struct.unpack_from("I", fmt, 28)[0]
-      self.cam_format_name = {V4L2_PIX_FMT_UYVY: 'UYVY', V4L2_PIX_FMT_NV12: 'NV12'}.get(self.cam_pixelformat, f"0x{self.cam_pixelformat:08x}")
+      self.cam_format_name = {V4L2_PIX_FMT_UYVY: 'UYVY', V4L2_PIX_FMT_YUYV: 'YUYV', V4L2_PIX_FMT_NV12: 'NV12'}.get(self.cam_pixelformat, f"0x{self.cam_pixelformat:08x}")
       self._gfmt_ok = True
+      self._gfmt_pixelformat = self.cam_pixelformat
       print(f"[V4L2Camera] {self.device}: G_FMT {self.cam_w}x{self.cam_h} {self.cam_format_name} stride={self.cam_bytesperline}")
     except OSError:
       self.cam_w = self.CAMERA_NATIVE_WIDTH
@@ -318,43 +553,70 @@ class V4L2Camera:
       self.cam_format_name = 'UYVY'
       self.cam_bytesperline = self.cam_w * 2
       self.cam_sizeimage = self.cam_h * self.cam_bytesperline
+      self._gfmt_pixelformat = None
       print(f"[V4L2Camera] {self.device}: G_FMT 失败 (twgmsl 不实现)，buffer 几何用 {self.cam_w}x{self.cam_h} UYVY")
 
     # G_FMT 失败 = twgmsl（驱动不实现 G_FMT）。布局用实测判定：驱动状态不同会发两种帧：
     #   ① 4K 画布: bytesused=16588800, 行距 7680, 真实 1920x1080 在左上（虚标状态）
     #   ② 紧凑 1080p: bytesused=4147200, 行距 3840, 整幅有效（真实状态，硬杀/重载后可能出现）
     # 靠猜会出 "1/4 画面" 或 "上半画面下半绿"，所以 open 时先抓一帧量 bytesused。
-    if self._gfmt_ok:
+    # twgmsl 驱动状态会变 (重启后回到 4K 虚标画布, 硬杀/重载后可能是紧凑 1080p),
+    # 而且真实图在 buffer 里的位置/行距、以及每个节点的 packed 字节序都会随之变化。
+    # G_FMT 的 pf 字段在 4K 画布状态下对所有节点都报 UYVY (实测 video0 其实是 YUYV),
+    # 几何也可能和真实 DMA 不一致 —— 所以一律以实测为准, G_FMT 只用来交叉印证。
+    probed = self._probe_frame_bytesused()
+    if probed == self.CAMERA_NATIVE_SIZE:
+      self.cam_w, self.cam_h = self.CAMERA_NATIVE_WIDTH, self.CAMERA_NATIVE_HEIGHT
+      self.cam_bytesperline = self.cam_w * 2
+      self.cam_sizeimage = self.CAMERA_NATIVE_SIZE
+      self.cam_active_w, self.cam_active_h = self.ACTIVE_WIDTH, self.ACTIVE_HEIGHT
+      print(f"[V4L2Camera] {self.device}: 实测 bytesused={probed} → 4K 画布布局, 行距 {self.cam_bytesperline}, 有效区 {self.cam_active_w}x{self.cam_active_h}", flush=True)
+    elif probed == self.ACTIVE_WIDTH * self.ACTIVE_HEIGHT * 2:
+      self.cam_w, self.cam_h = self.ACTIVE_WIDTH, self.ACTIVE_HEIGHT
+      self.cam_bytesperline = self.cam_w * 2
+      self.cam_sizeimage = probed
       self.cam_active_w, self.cam_active_h = self.cam_w, self.cam_h
+      print(f"[V4L2Camera] {self.device}: 实测 bytesused={probed} → 紧凑 1080p 布局, 整幅有效", flush=True)
     else:
-      probed = self._probe_frame_bytesused()
-      if probed == self.CAMERA_NATIVE_SIZE:
-        self.cam_w, self.cam_h = self.CAMERA_NATIVE_WIDTH, self.CAMERA_NATIVE_HEIGHT
-        self.cam_bytesperline = self.cam_w * 2
-        self.cam_sizeimage = self.CAMERA_NATIVE_SIZE
+      # 探测失败: 退回 G_FMT 报告的几何, 但不信任它的 pf (下面用实测覆盖)
+      self.cam_bytesperline = max(self.cam_bytesperline, self.cam_w * 2)
+      self.cam_sizeimage = max(self.cam_sizeimage, self.cam_h * self.cam_bytesperline)
+      if (self.cam_w, self.cam_h) == (self.CAMERA_NATIVE_WIDTH, self.CAMERA_NATIVE_HEIGHT):
         self.cam_active_w, self.cam_active_h = self.ACTIVE_WIDTH, self.ACTIVE_HEIGHT
-        print(f"[V4L2Camera] {self.device}: 实测 bytesused={probed} → 4K 画布布局, 有效区 {self.cam_active_w}x{self.cam_active_h}", flush=True)
-      elif probed == self.ACTIVE_WIDTH * self.ACTIVE_HEIGHT * 2:
-        self.cam_w, self.cam_h = self.ACTIVE_WIDTH, self.ACTIVE_HEIGHT
-        self.cam_bytesperline = self.cam_w * 2
-        self.cam_sizeimage = probed
-        self.cam_active_w, self.cam_active_h = self.cam_w, self.cam_h
-        print(f"[V4L2Camera] {self.device}: 实测 bytesused={probed} → 紧凑 1080p 布局, 整幅有效", flush=True)
       else:
-        self.cam_active_w = min(self.cam_w, self.ACTIVE_WIDTH)
-        self.cam_active_h = min(self.cam_h, self.ACTIVE_HEIGHT)
-        print(f"[V4L2Camera] {self.device}: 探测失败 (bytesused={probed})，按 4K 画布布局兜底", flush=True)
-      self._expected_bytesused = probed
+        self.cam_active_w, self.cam_active_h = self.cam_w, self.cam_h
+      print(f"[V4L2Camera] {self.device}: WARNING 实测 bytesused={probed} 不可用, 退回 G_FMT 几何 {self.cam_w}x{self.cam_h} stride={self.cam_bytesperline}", flush=True)
+      print(f"[V4L2Camera] {self.device}: WARNING 布局探测失败 -> 几何和字节序只能按 G_FMT 猜, "
+            f"本路可能绿屏/错位/无画面。先确认相机驱动已就绪(服务模式: sudo tw_camera_cfg, 不带 bring; 须早于 camerad); "
+            f"若刚强杀过采集进程/崩溃过, 链路可能已脏, 恢复: sudo rmmod twgmsl && sudo modprobe twgmsl && sleep 4", flush=True)
+    self._expected_bytesused = probed
+
+    # 字节序以实测为准 (G_FMT 的 pf 在 4K 画布状态下是假的)
+    if getattr(self, 'probed_layout', None):
+      _lay_name, _lay_sd = self.probed_layout
+      self.cam_format_name = _lay_name
+      self.cam_pixelformat = V4L2_PIX_FMT_UYVY if _lay_name == 'UYVY' else V4L2_PIX_FMT_YUYV
+      _gfmt_says = 'UYVY' if V4L2_PIX_FMT_UYVY == getattr(self, '_gfmt_pixelformat', None) else (
+        'YUYV' if V4L2_PIX_FMT_YUYV == getattr(self, '_gfmt_pixelformat', None) else '?')
+      note = '' if _gfmt_says == _lay_name else f" (G_FMT 报 {_gfmt_says}, 不采信)"
+      print(f"[V4L2Camera] {self.device}: packed 字节序实测={_lay_name} (Y.std={_lay_sd:.1f}){note}", flush=True)
+    else:
+      print(f"[V4L2Camera] {self.device}: WARNING 字节序实测失败, 沿用 G_FMT 的 {self.cam_format_name} (可能解错变绿)", flush=True)
 
     if self.exposure is not None:
-      ctrl = v4l2_control()
-      ctrl.id = V4L2_CID_EXPOSURE_TEGRA
-      ctrl.value = self.exposure
-      try:
-        fcntl.ioctl(self.fd, VIDIOC_S_CTRL, ctrl)
-        print(f"[V4L2Camera] {self.device}: exposure={self.exposure}", flush=True)
-      except OSError as e:
-        print(f"[V4L2Camera] {self.device}: 设曝光失败 {e}", flush=True)
+      # ① 正路: int64 扩展控制 (tegra 的 exposure 是 64 位)
+      if self._set_exposure64(self.exposure):
+        print(f"[V4L2Camera] {self.device}: exposure={self.exposure} (S_EXT_CTRLS/int64)", flush=True)
+      else:
+        # ② 兜底: 老写法 (32 位)。某些驱动/内核版本只认这个。
+        ctrl = v4l2_control()
+        ctrl.id = V4L2_CID_EXPOSURE_TEGRA
+        ctrl.value = self.exposure
+        try:
+          fcntl.ioctl(self.fd, VIDIOC_S_CTRL, ctrl)
+          print(f"[V4L2Camera] {self.device}: exposure={self.exposure} (S_CTRL/int32 兜底)", flush=True)
+        except OSError as e:
+          print(f"[V4L2Camera] {self.device}: 设曝光失败 {e} (两种写法都不行 → 曝光用驱动默认值)", flush=True)
 
     # 相机输出不是 NV12（或需要缩放）时，启用 VIC 硬件转换 UYVY→NV12
     # 注：taegra-camrtc 驱动不实现 G_FMT/S_FMT，G_FMT 失败时 cam_pixelformat 为 UYVY，
@@ -383,6 +645,47 @@ class V4L2Camera:
 
     self._src_surfs = []
     self._nvbuf_fds = []
+    self._nvbuf_zerocopy = os.environ.get("SP_NVBUF_ZEROCOPY", "0") == "1" and not self._vic
+    if self._nvbuf_zerocopy:
+      try:
+        self._nvbuf = ctypes.CDLL("/usr/lib/aarch64-linux-gnu/nvidia/libnvbufsurface.so")
+        self._nvbuf.NvBufSurfaceCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32, ctypes.POINTER(NvBufSurfaceCreateParams)]
+        self._nvbuf.NvBufSurfaceCreate.restype = ctypes.c_int
+        self._nvbuf.NvBufSurfaceDestroy.argtypes = [ctypes.c_void_p]
+        self._nvbuf.NvBufSurfaceDestroy.restype = ctypes.c_int
+        for i in range(self.num_buffers):
+          src_params = NvBufSurfaceCreateParams()
+          src_params.gpuId = 0
+          # 源 surface 尺寸必须 = 驱动真实 DMA 的画布 (cam_w x cam_h), 不是 cam_active。
+          # 4K 虚标画布状态下驱动会往这个 fd DMABUF cam_h*cam_bytesperline = 16588800 字节;
+          # 若按 cam_active (1920x1080=4147200 字节) 建, 驱动写入量是缓冲的 4 倍 →
+          # 越界 + 错行, 下游表现为"左上 1/4 画面 + 其余绿色"。
+          # 真实图只占左上 cam_active 区域, 由 CUDA kernel 按 src_stride 裁 (不缩放整幅 4K)。
+          src_params.width = self.cam_w
+          src_params.height = self.cam_h
+          src_params.size = 0
+          src_params.isContiguous = True
+          src_params.colorFormat = NVBUF_COLOR_FORMAT_UYVY
+          src_params.layout = NVBUF_LAYOUT_PITCH
+          src_params.memType = NVBUF_MEM_DEFAULT
+          src_surf = ctypes.c_void_p()
+          r = self._nvbuf.NvBufSurfaceCreate(ctypes.byref(src_surf), 1, ctypes.byref(src_params))
+          if r != 0:
+            raise RuntimeError(f"NvBufSurfaceCreate(src) failed: {r}")
+          self._src_surfs.append(src_surf)
+          params = ctypes.cast(src_surf, ctypes.POINTER(_NvBufSurfaceLite)).contents.surfaceList.contents
+          self._nvbuf_fds.append(int(params.bufferDesc))
+          print(f"[V4L2Camera] {self.device}: NVBUF zerocopy buffer {i} fd={params.bufferDesc} size={params.dataSize} pitch={params.pitch}", flush=True)
+      except Exception as e:
+        print(f"[V4L2Camera] {self.device}: NVBUF zerocopy init failed, fallback MMAP: {e}", flush=True)
+        for surf in self._src_surfs:
+          try:
+            self._nvbuf.NvBufSurfaceDestroy(surf)
+          except Exception:
+            pass
+        self._src_surfs = []
+        self._nvbuf_fds = []
+        self._nvbuf_zerocopy = False
     if self._vic:
       try:
         for i in range(self.num_buffers):
@@ -418,13 +721,13 @@ class V4L2Camera:
     req = v4l2_requestbuffers()
     req.count = self.num_buffers
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE
-    if self._vic and self._nvbuf_fds:
+    if (self._vic or self._nvbuf_zerocopy) and self._nvbuf_fds:
       req.memory = V4L2_MEMORY_DMABUF
     else:
       req.memory = V4L2_MEMORY_MMAP
     try:
       fcntl.ioctl(self.fd, VIDIOC_REQBUFS, req)
-      use_dmabuf = self._vic and self._nvbuf_fds
+      use_dmabuf = (self._vic or self._nvbuf_zerocopy) and self._nvbuf_fds
     except OSError:
       print(f"[V4L2Camera] DMABUF 不支持，回退 MMAP", flush=True)
       req.memory = V4L2_MEMORY_MMAP
@@ -607,14 +910,13 @@ class V4L2Camera:
   def _is_bad_buffer(self, buf):
     return buf.index >= self.num_buffers or (buf.bytesused == 0 and not self._use_dmabuf)
 
-  def _timestamp_ns_or_now(self, buf):
-    timestamp_ns = self._buf_timestamp_ns(buf)
-    if timestamp_ns > 0:
-      return timestamp_ns
-    if not hasattr(self, '_zero_timestamp_seen'):
-      self._zero_timestamp_seen = True
-      print(f"[V4L2Camera] {self.device}: V4L2 timestamp is zero; using monotonic clock for subsequent zero timestamp buffers", flush=True)
-    return time.monotonic_ns()
+  def _timestamp_ns_or_now(self, _buf):
+    # 帧时间戳必须用 openpilot 全链路时钟 (CLOCK_BOOTTIME, 与 logMonoTime/
+    # nanos_since_boot 一致)。twgmsl 驱动的 V4L2 buffer timestamp 不是 BOOTTIME
+    # 体系 (实测快 ~36s): 直接使用会让 cameraOdometry 时间错位, locationd 把
+    # 正确的 IMU 观测判为 "observation too old", 标定永远无法收敛。
+    # 帧间差值 (dt) 仍正确, modeld 的帧率/延迟补偿不受影响。 (cp 实车修复)
+    return int(time.clock_gettime_ns(time.CLOCK_BOOTTIME))
 
   def _note_error_flag(self, buf):
     if (buf.flags & V4L2_BUF_FLAG_ERROR) and not hasattr(self, '_error_flag_seen'):
@@ -704,6 +1006,8 @@ class V4L2Camera:
     if self._vic:
       data = self._vic_convert(index)
       self._requeue_buffer(index)
+    elif self._nvbuf_zerocopy:
+      data = None
     else:
       mm = self.mmap_ptrs[index]
       raw_data = bytes(mm[:self.cam_sizeimage])
@@ -767,7 +1071,7 @@ class V4L2Camera:
     while self.streaming:
       try:
         dmabuf_fd, data, index, timestamp_sof, timestamp_eof = self.read_frame()
-        if dmabuf_fd is not None and dmabuf_fd >= 0:
+        if self._nvbuf_zerocopy or (dmabuf_fd is not None and dmabuf_fd >= 0):
           is_nv12 = self._vic or self.cam_pixelformat == V4L2_PIX_FMT_NV12
           yield VisionBuf(
             dmabuf_fd=dmabuf_fd,
@@ -780,6 +1084,7 @@ class V4L2Camera:
             data=data,
             timestamp_sof=timestamp_sof,
             timestamp_eof=timestamp_eof,
+            v4l2_index=index,
           )
         self.cur_frame_id += 1
       except BlockingIOError:
