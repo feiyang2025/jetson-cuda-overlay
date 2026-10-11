@@ -471,8 +471,8 @@ class SelfCalibrator:
                 # Compare against current ECAM setting
                 ecam_current = 605
                 try:
-                    from openpilot.common.params import Params as P
-                    _e = json.loads(P().get("EcamIntrinsics") or "{}").get("fl")
+                    from params_json import params_json_get
+                    _e = (params_json_get("EcamIntrinsics") or {}).get("fl")
                     if _e: ecam_current = int(_e)
                 except: pass
                 delta = (fl_suggested / ecam_current - 1) * 100
@@ -631,9 +631,12 @@ def run_live(output_path: str, ecam: bool = False, fcam_fl: int = 2520):
         print(f"结果 {label} fl={fl_c}→{fl_s} ({pct:+.1f}%) 置信={f['confidence']} 样本={f['total_observations']}", flush=True)
 
     # Save to Params for UI to read
+    # 必须走 params_json: 本 fork 的 FcamCalibResult/WideCalibResult 是 JSON 型键,
+    # put(key, json.dumps(x)) 会 TypeError 被下面这个裸 except 吞掉 -> UI 永远读不到结果。
     try:
+        from params_json import params_json_put
         result_key = "WideCalibResult" if ecam else "FcamCalibResult"
-        params.put(result_key, json.dumps(result))
+        params_json_put(result_key, result, params)
     except:
         pass
 
@@ -654,9 +657,10 @@ def main():
     # Read true FCAM focal length from Params (fallback 2520)
     fcam_fl = 2520
     try:
-        from openpilot.common.params import Params
-        import json
-        fcam_fl = json.loads(Params().get("FcamIntrinsics") or "{}").get("fl", 2520)
+        # JSON 型键在本 fork 的 get() 已返回 dict, json.loads 会 TypeError 被 except 吞掉,
+        # 结果标定好的 fl 读不到、永远用 2520 默认值。
+        from params_json import params_json_get
+        fcam_fl = int((params_json_get("FcamIntrinsics") or {}).get("fl", 2520))
     except: pass
     FL_CURRENT = fcam_fl
 
@@ -664,8 +668,8 @@ def main():
     if args.ecam:
         FL_CURRENT = 605
         try:
-            from openpilot.common.params import Params as P2
-            _fl = json.loads(P2().get("EcamIntrinsics") or "{}").get("fl")
+            from params_json import params_json_get
+            _fl = (params_json_get("EcamIntrinsics") or {}).get("fl")
             if _fl: FL_CURRENT = int(_fl)
         except: pass
 

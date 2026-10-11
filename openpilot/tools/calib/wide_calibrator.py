@@ -72,10 +72,12 @@ def _rebuild_intrinsics():
 def _load_intrinsics():
     global ECAM_FL_CURRENT, FCAM_FL
     try:
-        from openpilot.common.params import Params
-        _f = json.loads(Params().get("FcamIntrinsics") or "{}").get("fl")
+        # 本 fork 的 JSON 型键 get() 直接返回 dict; 老的 json.loads 写法 TypeError 被吞掉,
+        # 于是标定好的 fl 读不到、一直退回模块默认值。
+        from params_json import params_json_get
+        _f = (params_json_get("FcamIntrinsics") or {}).get("fl")
         if _f: FCAM_FL = int(_f)
-        _e = json.loads(Params().get("EcamIntrinsics") or "{}").get("fl")
+        _e = (params_json_get("EcamIntrinsics") or {}).get("fl")
         if _e: ECAM_FL_CURRENT = int(_e)
     except Exception:
         pass
@@ -208,16 +210,25 @@ class WideCalibComputer:
 def collect_matches() -> List[Tuple]:
     """Grab one FCAM/ECAM frame pair and return matches."""
     try:
-        from msgq.visionipc import VisionIpcClient, VisionStreamType
+        from msgq.visionipc import VisionIpcClient
     except ImportError:
         return None  # None = fatal, can't init
+    # 本 fork 的 msgq 只有 VisionIpcClient, 没有 VisionStreamType (新代无类型 msgq):
+    # 数值与 sp 系枚举一致 (visionbuf.h: ROAD=0 DRIVER=1 WIDE_ROAD=2)，同
+    # openpilot/system/camerad/webcam/camerad.py 的兜底写法。
+    try:
+        from msgq.visionipc import VisionStreamType
+        stream_road = VisionStreamType.VISION_STREAM_ROAD
+        stream_wide = VisionStreamType.VISION_STREAM_WIDE_ROAD
+    except ImportError:
+        stream_road, stream_wide = 0, 2
 
     attr = collect_matches.__dict__
     if "_state" not in attr:
         attr["_state"] = "init"
         attr["_matcher"] = StereoMatcher()
-        attr["_fcam"] = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_ROAD, False)
-        attr["_ecam"] = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_WIDE_ROAD, False)
+        attr["_fcam"] = VisionIpcClient("camerad", stream_road, False)
+        attr["_ecam"] = VisionIpcClient("camerad", stream_wide, False)
         if not attr["_fcam"].connect(True) or not attr["_ecam"].connect(True):
             attr["_state"] = "failed"
             return None
@@ -282,8 +293,8 @@ def compute_and_save(matches: list, out_dir: str = None):
         json.dump(result, f, indent=2, ensure_ascii=False)
 
     try:
-        from openpilot.common.params import Params
-        Params().put("WideCalibResult", json.dumps(result))
+        from params_json import params_json_put
+        params_json_put("WideCalibResult", result)
     except:
         pass
 

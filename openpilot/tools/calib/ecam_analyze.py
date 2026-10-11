@@ -85,9 +85,9 @@ def main():
     fcam_fl = args.fcam_fl
     try:
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-        import json, importlib
-        Params = importlib.import_module("openpilot.common.params").Params
-        _fl = json.loads(Params().get("FcamIntrinsics") or "{}").get("fl")
+        # JSON 型键在本 fork 的 get() 直接返回 dict; json.loads 写法 TypeError 被吞掉
+        from params_json import params_json_get
+        _fl = (params_json_get("FcamIntrinsics") or {}).get("fl")
         if _fl: fcam_fl = int(_fl)
     except: pass
     print(f"FCAM fl: {fcam_fl}")
