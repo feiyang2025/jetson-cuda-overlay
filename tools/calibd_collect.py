@@ -113,20 +113,7 @@ def main() -> int:
     L.append("  ↑ 这里显示的 fl 就是标定的基准; 若与 FcamIntrinsics 里的 1344x760 条目不一致, 就是空间错位")
 
     out(L, "3. 标定相关参数 (全量)")
-    code = ("from openpilot.common.params import Params\n"
-            "import json\n"
-            "p=Params()\n"
-            f"for k in {KEY_PARAMS!r}:\n"
-            "  try:\n"
-            "    v=p.get(k)\n"
-            "  except Exception as e:\n"
-            "    v=f'(读不到: {type(e).__name__}: {e})'\n"
-            "  if k=='CalibrationParams':\n"
-            "    v='(存在)' if v is not None else None\n"
-            "  if isinstance(v,(dict,list)):\n"
-            "    v=json.dumps(v,ensure_ascii=False,indent=1)\n"
-            "  print(f'--- {k} = {v}')\n")
-    L.append(sh(f"cd {TREE} && PYTHONPATH=\"$PWD\" {PY} -c {json.dumps(code)} 2>&1"))
+    L.append(sh(f"cd {TREE} && PYTHONPATH=\"$PWD\" {PY} tools/calibd_params_dump.py 2>&1"))
 
     out(L, "4. calibd 报告 (自动模式 / 里程窗口 / 每趟结论与还差什么)")
     L.append(sh(f"cd {TREE} && PYTHONPATH=\"$PWD\" {PY} tools/calibd_report.py -v 2>&1", timeout=60))
@@ -148,26 +135,9 @@ def main() -> int:
         L.append(f"  {os.path.basename(d):32s} {sz:>8s}  "
                  f"{time.strftime('%m-%d %H:%M', time.localtime(os.path.getmtime(d)))}")
     if args.deep and segs:
-        code2 = ("from openpilot.tools.lib.logreader import LogReader\n"
-                 "import sys, os\n"
-                 "d=sys.argv[1]\n"
-                 "f=os.path.join(d,'qlog.zst')\n"
-                 "f=f if os.path.exists(f) else os.path.join(d,'rlog.zst')\n"
-                 "n=lead=lane=mov=0\n"
-                 "for m in LogReader(f):\n"
-                 "  w=m.which()\n"
-                 "  if w=='modelV2':\n"
-                 "    try:\n"
-                 "      lead += 1 if m.modelV2.leadsV3[0].prob>0.5 else 0\n"
-                 "      pr=list(m.modelV2.laneLineProbs)\n"
-                 "      lane += 1 if (len(pr)>=3 and pr[1]>0.5 and pr[2]>0.5) else 0\n"
-                 "    except Exception: pass\n"
-                 "  elif w=='carState':\n"
-                 "    try: mov += 1 if m.carState.vEgo>1.0 else 0\n"
-                 "    except Exception: pass\n"
-                 "print(f'  {os.path.basename(d)}: 有前车 {lead} 帧 / 双车道线 {lane} 帧 / 运动 {mov} 帧')\n")
-        for d in segs[-2:]:
-            L.append(sh(f"cd {TREE} && PYTHONPATH=\"$PWD\" {PY} -c {json.dumps(code2)} {d} 2>&1", timeout=180))
+        L.append("-- 场景统计 (只有前车/车道线/运动都有帧, 标定才可能有样本):")
+        L.append(sh(f"cd {TREE} && PYTHONPATH=\"$PWD\" {PY} tools/calibd_segments_scan.py "
+                    f"{' '.join(segs[-3:])} 2>&1", timeout=600))
 
     out(L, "7. 提示")
     L.extend([
