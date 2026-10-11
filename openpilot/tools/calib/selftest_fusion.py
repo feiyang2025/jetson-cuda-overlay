@@ -28,8 +28,17 @@ def check(name, cond, detail=""):
         FAILS.append(name)
 
 
-def fuse(cands, ref_fl=2520, ecam=False):
-    cal = sc.SelfCalibrator(ecam=ecam, fcam_fl=ref_fl)
+def _std_fl(cam: str = "fcam") -> float:
+    """该相机当前生效的 fl (sp-cuda 厂商标定: FCAM 961.76 / ECAM 1740), 与相机模型同源。"""
+    try:
+        from camera_std import effective
+        return float(effective(cam)["fl"])
+    except Exception:
+        return 1740.0 if cam == "ecam" else 961.76
+
+
+def fuse(cands, ref_fl=None, ecam=False):
+    cal = sc.SelfCalibrator(ecam=ecam, fcam_fl=ref_fl if ref_fl is not None else _std_fl("ecam" if ecam else "fcam"))
     return cal._fuse_methods(list(cands))
 
 
@@ -37,8 +46,8 @@ def c(name, fl, samples):
     return {"name": name, "fl": fl, "samples": samples}
 
 
-print("1) 三方法接近 + 独立偏差 -> 融合值比任一单方法更接近真值")
-truth = 2520.0
+print("1) 三方法接近 + 独立偏差 -> 融合值比任一单方法更接近真值 (真值 = 厂商标定 961.76)")
+truth = _std_fl("fcam")
 res = fuse([c("radar_vision_ratio", truth * 1.012, 300),
             c("lane_width", truth * 0.988, 200),
             c("curvature", truth * 1.006, 100)])
@@ -74,15 +83,15 @@ check("不采纳", res["accepted"] is False, f"reason={res['reason']}")
 
 print("6) ECAM: 门限更严 (2%) 且置信度不判 high")
 res = fuse([c("radar_vision_ratio", truth * 1.02, 300), c("lane_width", truth * 0.995, 300)],
-           ecam=True, ref_fl=605)
+           ecam=True, ref_fl=_std_fl("ecam"))
 check("2.5% 分歧在 ECAM 下不采纳", res["accepted"] is False, f"spread={res['spread_pct']}% reason={res['reason']}")
 res = fuse([c("radar_vision_ratio", truth * 1.005, 300), c("lane_width", truth * 0.999, 300)],
-           ecam=True, ref_fl=605)
+           ecam=True, ref_fl=_std_fl("ecam"))
 check("ECAM 一致时采纳但最高 medium", res["accepted"] is True and res["confidence"] == "medium",
       f"confidence={res['confidence']}")
 
 print("7) 曲率票: κ_model/κ_imu = fl_true/fl_assumed")
-ref = 605.0
+ref = _std_fl("ecam")   # 1740: ECAM(wide 流, 60° 窄角镜头)
 for ratio in (0.94, 1.0, 1.06):
     cvcal = sc.CurvatureCalibrator(fl_current=ref)
     k_imu = 0.01                      # rad/m, 半径 100m 的弯

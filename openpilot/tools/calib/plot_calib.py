@@ -17,14 +17,10 @@ from collections import defaultdict
 from openpilot.tools.lib.logreader import LogReader
 
 try:
-  from openpilot.common.transformations.camera import _read_calib_from_params
-  import os
-  _w = int(os.environ.get("ROAD_CAM_WIDTH", 1920))
-  _h = int(os.environ.get("ROAD_CAM_HEIGHT", 1080))
-  _base = 2580.0 * (_w / 1920.0)
-  FL_CURRENT = int(_read_calib_from_params("FcamIntrinsics", _w, _h, _base)[0])
+  from camera_std import effective
+  FL_CURRENT = int(effective("fcam")["fl"])
 except Exception:
-  FL_CURRENT = 2520
+  FL_CURRENT = 962
 
 FCAM_FL = FL_CURRENT
 STD_CLIP = 2.5

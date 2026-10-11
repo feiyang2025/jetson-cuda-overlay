@@ -45,12 +45,14 @@ def _read_calib_from_params(param_key, width, height, default_fl):
   import json
   raw = Params().get(param_key)
   if raw is None:
-    key = f"{width}x{height}"
     data = {"fl": default_fl, "cx": width / 2.0, "cy": height / 2.0,
-            "calibrations": {key: {"fl": default_fl, "cx": width / 2.0, "cy": height / 2.0}}}
-    Params().put(param_key, json.dumps(data))
+            "calibrations": {f"{width}x{height}": {"fl": default_fl, "cx": width / 2.0, "cy": height / 2.0}}}
+    try:
+      Params().put(param_key, data, block=True)
+    except Exception:
+      pass
   else:
-    data = json.loads(raw)
+    data = raw if isinstance(raw, dict) else json.loads(raw)
   calibs = data.get("calibrations")
   if calibs:
     key = f"{width}x{height}"
@@ -72,11 +74,20 @@ def _read_calib_from_params(param_key, width, height, default_fl):
 
 def _env_or(val, env_key, cast=int):
   import os
+  # env_key 可以是单个键或键列表 (按顺序取第一个非空的): 本树 launcher 用 CAM_WIDTH/HEIGHT,
+  # 移植脚本身份用 ROAD_/WIDE_CAM_WIDTH —— 名字分家就会让 K 的像素空间与 camerad 实际
+  # 送的帧不一致 (1344x760 的帧配 1920x1080 的 K = 模型 warp 尺度偏 1.43 倍)。
+  if isinstance(env_key, (list, tuple)):
+    for k in env_key:
+      env = os.environ.get(k)
+      if env:
+        return cast(env)
+    return val
   env = os.environ.get(env_key)
   return cast(env) if env else val
 
 
-def _camera_config_from_params(width_env: str, height_env: str, base_fl: float, param_key: str, base_w: int = 1920) -> CameraConfig:
+def _camera_config_from_params(width_env, height_env, base_fl: float, param_key: str, base_w: int = 1920) -> CameraConfig:
   width = _env_or(1920, width_env)
   height = _env_or(1080, height_env)
   fl = base_fl * (width / base_w)
@@ -97,9 +108,22 @@ PC_OVERRIDE = '''
 # fallback used the first time those Params are created.
 # camerad's roadCameraState.sensor enum cannot report imx390, so the ("pc",
 # "unknown") entry is replaced instead - the PC path only hits this one entry.
-_imx390_fcam = _camera_config_from_params("ROAD_CAM_WIDTH", "ROAD_CAM_HEIGHT", 961.76, "FcamIntrinsics")
-_imx390_ecam = _camera_config_from_params("WIDE_CAM_WIDTH", "WIDE_CAM_HEIGHT", 1740.0, "EcamIntrinsics")
+_imx390_fcam = _camera_config_from_params(("ROAD_CAM_WIDTH", "CAM_WIDTH"), ("ROAD_CAM_HEIGHT", "CAM_HEIGHT"), 961.76, "FcamIntrinsics")
+_imx390_ecam = _camera_config_from_params(("WIDE_CAM_WIDTH", "CAM_WIDTH"), ("WIDE_CAM_HEIGHT", "CAM_HEIGHT"), 1740.0, "EcamIntrinsics")
 DEVICE_CAMERAS[("pc", "unknown")] = DeviceCameraConfig(_imx390_fcam, _imx390_ecam, _imx390_ecam)
+
+# ---- AGX 移植兼容: DeviceCameraConfig 的旧字段名别名 ----
+# sp-cuda (连跑 1 个多月的那套) 的 camera.py 字段就叫 fcam/ecam/dcam, 其 modeld.py 与
+# modeld_bigcombo.py 直接写 dc.fcam / dc.ecam。若本树 camera.py 已跟上新上游命名
+# (narrow_road/cabin/wide_road) 而没补别名, modeld 会在 liveCalibration 第一次更新时
+# AttributeError 直接崩 —— 且内参标定永远到不了模型路径。
+def _sp_camera_config_aliases():
+  for _old, _new in (("fcam", "narrow_road"), ("ecam", "wide_road"), ("dcam", "cabin")):
+    if not hasattr(DeviceCameraConfig, _old):
+      setattr(DeviceCameraConfig, _old, property(lambda self, _n=_new: getattr(self, _n)))
+
+
+_sp_camera_config_aliases()
 '''
 
 ANCHOR_BEFORE_CONFIG = re.compile(r"^_ar_ox_fisheye = ", re.M)

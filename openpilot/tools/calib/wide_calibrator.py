@@ -43,8 +43,17 @@ import signal
 import time
 from typing import Dict, List, Tuple
 
-ECAM_FL_CURRENT = 605
-FCAM_FL = 2690
+# 内参基准 —— 与相机模型 (camera.py) 同源, 即 sp-cuda 厂商标定标准。
+# 曾经的 605 / 2690 是 comma 相机的**模型空间**数字, 与本机物理焦距 (1740 / 961.76) 差 ~2.8 倍。
+def _std_fl(ecam: bool) -> float:
+    try:
+        from camera_std import effective
+        return float(effective("ecam" if ecam else "fcam")["fl"])
+    except Exception:
+        return 1740.0 if ecam else 961.76
+
+ECAM_FL_CURRENT = _std_fl(True)
+FCAM_FL = _std_fl(False)
 R_F2E = np.eye(3, dtype=np.float64)
 t_F2E = np.zeros(3, dtype=np.float64)
 

@@ -37,7 +37,36 @@ from openpilot.tools.lib.logreader import LogReader
 
 
 CAMERA_RADAR_OFFSET = 1.5  # m; camera (windshield) behind radar (bumper)
-FL_CURRENT = 2520  # default FCAM fl; overridden in main() for --ecam
+
+
+def default_fl(ecam: bool = False) -> float:
+    """该相机**当前生效**的 fl —— 与相机模型 (camera.py) 同源。
+
+    标准取自 sp-cuda (连跑 1 个多月的那套厂商标定): FCAM(road) 961.76 / ECAM(wide) 1740。
+    早期版本的 2520 / 605 是 comma 相机的数字且属**模型空间**, 与本机物理焦距差 ~2.8 倍,
+    写进 FcamIntrinsics 会被相机模型当成物理焦距用 —— 这是必须先修掉的前提。
+    """
+    try:
+        from camera_std import effective
+        return float(effective("ecam" if ecam else "fcam")["fl"])
+    except Exception:
+        return 1740.0 if ecam else 961.76
+
+
+def _ecam_ratio_hint() -> float:
+    """ratio 判 ECAM 的阈值: 两种 fl 比值的几何中点。
+
+    comma 空间里 ECAM/FCAM ≈ 4.4 (阈值 1.5 是那么来的); 本机是 1740/961.76 ≈ 1.81,
+    所以阈值必须按实际 fl 推导, 不能用 comma 的硬编码。
+    """
+    try:
+        return (default_fl(False) * default_fl(True)) ** 0.5 / default_fl(False)
+    except Exception:
+        return 1.35
+
+
+FL_CURRENT = default_fl()          # 模块级默认; main() 会按 --ecam 覆盖
+ECAM_RATIO_HINT = _ecam_ratio_hint()
 HIGHWAY_SPEED_MS = 90 / 3.6   # 25 m/s
 EXPRESS_SPEED_MS = 60 / 3.6   # 16.7 m/s
 STRAIGHT_THRESHOLD = 0.008    # rad/m max |curv| for "straight road" filter
@@ -68,9 +97,9 @@ FUSION_MAD_K = 3.0               # MAD 离群剔除倍数
 
 
 class RadarVisionCalibrator:
-    def __init__(self, fl_current: float = 2520):
+    def __init__(self, fl_current: float = 0.0):
         self.pairs = []
-        self._fl = fl_current
+        self._fl = fl_current or default_fl()
 
     def add(self, d_radar: float, d_vision: float, v_ego: float):
         if d_radar > 3 and d_vision > 3:
@@ -135,10 +164,10 @@ class RadarVisionCalibrator:
 
 
 class LaneWidthCalibrator:
-    def __init__(self, fl_current: float = 2520, lane_marking_width: float = LANE_MARKING_WIDTH):
+    def __init__(self, fl_current: float = 0.0, lane_marking_width: float = LANE_MARKING_WIDTH):
         self.obs = []
         self._marking_w = lane_marking_width  # single-side marking → inner-edge offset
-        self._fl = fl_current
+        self._fl = fl_current or default_fl()
 
     def add(self, width: float, v_ego: float):
         if v_ego < 15 or not (2.0 < width < 6.0):
@@ -211,10 +240,10 @@ class CurvatureCalibrator:
         于是 fl_true = fl_assumed × median(κ_model/κ_imu)。
     """
 
-    def __init__(self, fl_current: float = 2520):
+    def __init__(self, fl_current: float = 0.0):
         self.pairs = []          # 直线样本 (诊断)
         self.curved = []         # 弯道样本 (尺度)
-        self._fl = fl_current
+        self._fl = fl_current or default_fl()
 
     def add(self, yaw_rate: float, v_ego: float, model_curv: float):
         if v_ego < 5:
@@ -268,14 +297,17 @@ class CurvatureCalibrator:
 
 
 class SelfCalibrator:
-    def __init__(self, ecam: bool = False, fcam_fl: int = 2520):
-        # ECAM mode uses a different reference fl; both fallback algorithms must
-        # base their fl_suggested on it (module-global FL_CURRENT is unreliable).
-        ref_fl = 605 if ecam else fcam_fl
-        # ECAM: 调用方 (main --ecam) 会把 EcamIntrinsics 的当前 fl 当 fcam_fl 传进来,
-        # 用它做参考; 只有没传时才退回 605 默认。
-        if ecam and fcam_fl:
-            ref_fl = fcam_fl
+    def __init__(self, ecam: bool = False, fcam_fl: float = 0.0):
+        # 参考 fl = 这台相机**当前生效**的 fl。与 camera.py 同源 (camera_std):
+        # 厂商标定 FCAM 961.76 / ECAM 1740, 可被 Params 覆盖, 随分辨率缩放。
+        # 传 0 表示"自己问 camera_std"; 调用方 (main) 会传正确的值进来。
+        if not fcam_fl:
+            try:
+                from camera_std import effective as _eff
+                fcam_fl = _eff("ecam" if ecam else "fcam")["fl"]
+            except Exception:
+                fcam_fl = 1740.0 if ecam else 961.76
+        ref_fl = float(fcam_fl)
         self.rv = RadarVisionCalibrator(fl_current=ref_fl)
         self.lw = LaneWidthCalibrator(fl_current=ref_fl)
         self.cv = CurvatureCalibrator(fl_current=ref_fl)
@@ -329,7 +361,7 @@ class SelfCalibrator:
 
         Two-pass:
           1. Compute overall ratio histogram to detect mode.
-          2. If ECAM mode (median > 1.5), filter to ECAM-only pairs and recompute.
+          2. If ECAM mode (median > ECAM_RATIO_HINT), filter to ECAM-only pairs and recompute.
         """
         pairs = [(p[0], p[1]) for p in self.rv.pairs if 5 < p[0] < 80 and p[1] > 3]
         if len(pairs) < 30:
@@ -350,12 +382,12 @@ class SelfCalibrator:
             d_v = d_v[mask]
 
         med_all = float(np.median(ratios))
-        is_ecam = med_all > 1.5
+        is_ecam = med_all > ECAM_RATIO_HINT
 
         # Two-pass for ECAM: filter out FCAM frames (ratio near 1)
         if is_ecam:
-            # Find the ECAM peak: use ratio > 1.5 as threshold
-            ecam_mask = ratios > 1.5
+            # Find the ECAM peak: 阈值按实际 fl 比推导 (comma 空间的 1.5 不适用于本机)
+            ecam_mask = ratios > ECAM_RATIO_HINT
             if int(ecam_mask.sum()) >= 30:
                 ratios = ratios[ecam_mask]
                 d_r = d_r[ecam_mask]
@@ -544,10 +576,10 @@ class SelfCalibrator:
             lines.append("  方法1: 雷达-视觉比率 (d_v/d_r) — 抗外参污染")
             lines.append("─" * 58)
             if rv.get("valid"):
-                dtype = "ECAM" if rv["ratio_median"] > 1.5 else "FCAM"
+                dtype = "ECAM" if rv["ratio_median"] > ECAM_RATIO_HINT else "FCAM"
                 lines.append(f"  样本: {rv['samples']}/{rv['samples_total']}")
                 lines.append(f"  比率中位数: {rv['ratio_median']:.3f} (均值: {rv['ratio_mean']:.3f} ± {rv['ratio_std']:.3f})")
-                lines.append(f"  检测到: {dtype} (ratio > 1.5 为 ECAM)")
+                lines.append(f"  检测到: {dtype} (ratio > {ECAM_RATIO_HINT:.2f} 为 ECAM; 按实际 fl 比推导)")
                 lines.append(f"  FCAM参考fl: {rv['fcam_fl']}")
                 for label, d in rv.get("stratified", {}).items():
                     lines.append(f"    {label}: ratio={d['mean_ratio']:.3f} → fl={d['fl_suggested']} (n={d['n']})")
@@ -679,7 +711,7 @@ def _default_realdata():
     return os.path.expanduser("~/.comma/media/0/realdata")
 
 
-def run_live(output_path: str, ecam: bool = False, fcam_fl: int = 2520):
+def run_live(output_path: str, ecam: bool = False, fcam_fl: float = 0.0):
     """Live collection mode: subscribe to messages, collect data, compute on exit."""
     # 导入要带 openpilot. 前缀: 本 fork 的源码在 <树根>/openpilot/ 子目录,
     # 裸的 `from common.params import ...` 只在老布局 (树根即 openpilot) 才能解析。
@@ -795,29 +827,19 @@ def main():
     parser.add_argument("--ecam", action="store_true", help="ECAM (wide camera) calibration mode")
     args = parser.parse_args()
 
-    # Read true FCAM focal length from Params (fallback 2520)
-    fcam_fl = 2520
-    try:
-        # JSON 型键在本 fork 的 get() 已返回 dict, json.loads 会 TypeError 被 except 吞掉,
-        # 结果标定好的 fl 读不到、永远用 2520 默认值。
-        from params_json import params_json_get
-        fcam_fl = int((params_json_get("FcamIntrinsics") or {}).get("fl", 2520))
-    except: pass
-    FL_CURRENT = fcam_fl
-
-    # For ECAM mode, we override FL_CURRENT but keep fcam_fl for ratio calc
-    if args.ecam:
-        FL_CURRENT = 605
-        try:
-            from params_json import params_json_get
-            _fl = (params_json_get("EcamIntrinsics") or {}).get("fl")
-            if _fl: FL_CURRENT = int(_fl)
-        except: pass
+    # 参考 fl = 相机模型当前**生效**的值 (sp-cuda 厂商标定标准: FCAM 961.76 / ECAM 1740),
+    # 由 camera_std 与 camera.py 同源取得 —— 硬编码 2520/605 会把建议值算到模型空间的
+    # 数字上, 写进 FcamIntrinsics 后被相机模型当成物理焦距用, 差 ~2.8 倍。
+    from camera_std import effective as _eff, describe as _describe
+    print(f"[基准] {_describe()}", flush=True)
+    fcam_fl = _eff("fcam")["fl"]          # road 流相机当前 fl
+    ecam_fl = _eff("ecam")["fl"]          # wide 流相机当前 fl
+    FL_CURRENT = ecam_fl if args.ecam else fcam_fl
 
     if args.live:
-        # ECAM 模式下要标定的是 ECAM, 参考 fl 必须传 ECAM 的当前值; 否则融合会把
-        # 建议值算到 FCAM 的 2520 上 (面板随后按 EcamIntrinsics 比对, 直接错位)。
-        run_live(args.output, ecam=args.ecam, fcam_fl=(FL_CURRENT if args.ecam else fcam_fl))
+        # ECAM 模式下要标定的是 ECAM, 参考 fl 传 ECAM 的当前值 (否则融合会把建议值算到
+        # FCAM 的值上, 面板随后按 EcamIntrinsics 比对会整体错位)。
+        run_live(args.output, ecam=args.ecam, fcam_fl=FL_CURRENT)
         return
 
     if args.json and args.route and args.route.endswith(".json"):
@@ -859,7 +881,7 @@ def main():
         print("未找到日志文件")
         return
 
-    cal = SelfCalibrator(fcam_fl=fcam_fl)
+    cal = SelfCalibrator(ecam=args.ecam, fcam_fl=FL_CURRENT)
     total_msgs = 0
     total_frames = 0
     print(f"分析 {len(paths)} 个日志段...")

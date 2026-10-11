@@ -5,10 +5,12 @@ and estimate ECAM focal length.
 
 For each frame with a valid lead:
   ratio = d_vision / d_radar
-  
-  With correct extrinsics:  ratio ≈ fl_fcam / fl_cam
-    FCAM: ratio ≈ 1
-    ECAM: ratio ≈ fl_fcam / fl_ecam ≈ 2656/605 ≈ 4.4
+
+  With correct extrinsics:  ratio ≈ fl_ref / fl_cam
+    本机 (sp-cuda 厂商标定标准): road 流 fl=961.76, wide 流 fl=1740
+      FCAM (road) 帧: ratio ≈ 1
+      ECAM (wide) 帧: ratio ≈ 961.76/1740 ≈ 0.55 (若参考值取 road)
+    comma 相机的 2520/605 ≈ 4.4 那套数字**不适用本机** (差 ~2.8 倍), 阈值必须按实际 fl 推导。
 
   With wrong extrinsics: ratio deviates due to pitch/height errors.
   We cluster frames by ratio and pick the ECAM cluster.
@@ -21,6 +23,42 @@ import argparse
 import sys
 from collections import Counter
 from openpilot.tools.lib.logreader import LogReader
+
+
+def _fcam_fl() -> float:
+  """当前生效的 FCAM(road) fl —— 与相机模型同源 (sp-cuda 厂商标定 961.76)。"""
+  try:
+    from camera_std import effective
+    return float(effective("fcam")["fl"])
+  except Exception:
+    return 961.76
+
+
+def _ecam_ratio_hint() -> float:
+  """判 ECAM 的 ratio 阈值: 两种 fl 比值的几何中点 (comma 的 1.5 不适用于本机)。"""
+  try:
+    from camera_std import effective
+    f, e = float(effective("fcam")["fl"]), float(effective("ecam")["fl"])
+    return (f * e) ** 0.5 / f
+  except Exception:
+    return 1.35
+
+
+def _default_realdata():
+  """Path::log_root() —— 布局自适应, 且绝不抛异常。
+
+  hw 模块 fork 间搬过家 (新布局 openpilot/common/hardware/hw,
+  老布局 openpilot/system/hardware/hw), 所以两个路径都试;
+  它又被当 argparse 的 default 求值, 在解析 --base-dir 之前就执行 ——
+  一旦抛 ModuleNotFoundError, 连显式传 --base-dir 都进不去 (master-c3 实测)。
+  """
+  import os as _os
+  for _mod in ("openpilot.common.hardware.hw", "openpilot.system.hardware.hw"):
+    try:
+      return __import__(_mod, fromlist=["Paths"]).Paths.log_root()
+    except Exception:
+      continue
+  return _os.path.expanduser("~/.comma/media/0/realdata")
 
 
 def _lead_present(lead) -> bool:
@@ -60,12 +98,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dir", help="Directory with segment subdirs")
     parser.add_argument("--route", type=str)
-    parser.add_argument("--base-dir", default="/home/dengjian/realdata")
+    parser.add_argument("--base-dir", default=_default_realdata())
     parser.add_argument("--output", default="ecam_analyze.json")
-    parser.add_argument("--ratio-min", type=float, default=1.5,
-                        help="Minimum d_vision/d_radar ratio to consider ECAM (default: 1.5)")
-    parser.add_argument("--fcam-fl", type=float, default=2656,
-                        help="FCAM focal length (default: 2656 from FcamIntrinsics)")
+    parser.add_argument("--ratio-min", type=float, default=_ecam_ratio_hint(),
+                        help="Minimum d_vision/d_radar ratio to consider ECAM (按实际 fl 比推导, 本机 ≈1.35)")
+    parser.add_argument("--fcam-fl", type=float, default=_fcam_fl(),
+                        help="FCAM (road) focal length (缺省取当前生效值: 厂商标定 961.76)")
     args = parser.parse_args()
 
     paths = []
