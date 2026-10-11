@@ -33,10 +33,30 @@ from openpilot.system.ui.widgets import DialogResult
 from openpilot.system.ui.widgets.confirm_dialog import ConfirmDialog
 from openpilot.system.ui.widgets.list_view import button_item
 from openpilot.system.ui.sunnypilot.widgets.html_render import HtmlModalSP
+# 内参读写与 calibd (常驻自动标定) 共用同一份实现 —— 之前这里有一份本地拷贝,
+# 口径一分家就会出现"面板写的和 daemon 写的语义不同"。
+from openpilot.sunnypilot.calib.intrinsics import (
+  cam_dims as _cam_dims,
+  pjson as _pjson,
+  write_intrinsics,
+)
 
-# 与 sp developer_panel.cc 对齐的默认焦距（用于没标过时的提示值）
-DEFAULT_FL_FCAM = 2520
-DEFAULT_FL_ECAM = 670
+def _std_fl(cam: str) -> int:
+  """相机模型当前生效的 fl —— 唯一权威来源 (sp-cuda 厂商标定标准: FCAM 961.76 / ECAM 1740)。
+
+  面板与 tools/calib 的标定脚本必须用同一个基准: 标定输出的是**物理**焦距的修正值,
+  写成 comma 相机的 2520/670 会让 conf 里存的数与相机模型差 ~2.8 倍, warp 与测距全崩。
+  """
+  try:
+    from openpilot.common.transformations.camera import DEVICE_CAMERAS
+    cfg = DEVICE_CAMERAS[("pc", "unknown")]
+    attr = "narrow_road" if cam == "fcam" else "wide_road"
+    return int(getattr(cfg, attr).focal_length)
+  except Exception:
+    return 962 if cam == "fcam" else 1740
+
+DEFAULT_FL_FCAM = _std_fl("fcam")
+DEFAULT_FL_ECAM = _std_fl("ecam")
 
 # 换流后短暂等待: camerad 轮询 WideCalibMode 的周期是 ~2s
 SWAP_SETTLE_S = 3.0
@@ -70,48 +90,12 @@ def _find_python(op_dir: str) -> str:
   return venv if os.path.exists(venv) else sys.executable
 
 
-def _cam_dims(key: str) -> tuple[int, int]:
-  """取该相机流的输出尺寸（与 launch_env.sh 的 CAM_WIDTH/HEIGHT 一致）。"""
-  if key == "FcamIntrinsics":
-    w = os.environ.get("ROAD_CAM_WIDTH") or os.environ.get("CAM_WIDTH")
-    h = os.environ.get("ROAD_CAM_HEIGHT") or os.environ.get("CAM_HEIGHT")
-  else:
-    w = os.environ.get("WIDE_CAM_WIDTH") or os.environ.get("CAM_WIDTH")
-    h = os.environ.get("WIDE_CAM_HEIGHT") or os.environ.get("CAM_HEIGHT")
-  try:
-    return int(w), int(h)
-  except (TypeError, ValueError):
-    return 1920, 1080
-
-
 def _pstr(p: Params, key: str) -> str:
   """字符串/字节型 param 的读取 (CalibrationParams 这类二进制用 bytes, 别走这里)。"""
   v = p.get(key)
   if v is None:
     return ""
   return v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
-
-
-def _pjson(p: Params, key: str) -> dict | None:
-  """JSON 型 param 的读取。
-
-  本 fork 的 Params 对 JSON 型键: get 直接返回 dict/list; 空键返回 None。
-  (旧 fork 可能返回 JSON 字符串, 所以两种都兜。)写入必须 put(dict), 传字符串会 TypeError;
-  而且 C++ 侧异步落盘, 写完要 block=True 才读得到。
-  """
-  v = p.get(key)
-  if v is None:
-    return None
-  if isinstance(v, (bytes, bytearray)):
-    v = v.decode(errors="replace")
-  if isinstance(v, str):
-    if not v.strip():
-      return None
-    try:
-      v = json.loads(v)
-    except Exception:
-      return None
-  return v if isinstance(v, dict) else None
 
 
 def _current_fl(p: Params, key: str, default_fl: int) -> int:
@@ -130,27 +114,6 @@ def _extract_fl(obj: dict) -> int:
     return int(obj.get("fl_suggested") or 0)
   except (TypeError, ValueError):
     return 0
-
-
-def write_intrinsics(p: Params, key: str, fl: int, clear_calibration: bool = True) -> None:
-  """写内参: 顶层 fl/cx/cy + calibrations[<W>x<H>], 可选清 CalibrationParams。
-
-  本 fork 这些键是 JSON 型: 必须 put(dict) 且 block=True(python2cpp 只认 dict,
-  传 json 字符串直接 TypeError; 异步落盘不 block 会立刻读不到)。
-  """
-  w, h = _cam_dims(key)
-  intr = dict(_pjson(p, key) or {})
-  intr["fl"] = fl
-  intr["cx"] = w / 2.0
-  intr["cy"] = h / 2.0
-  calibs = dict(intr.get("calibrations") or {})
-  calibs[f"{w}x{h}"] = {"fl": fl, "cx": w / 2.0, "cy": h / 2.0}
-  intr["calibrations"] = calibs
-  p.put(key, intr, block=True)
-
-  if clear_calibration:
-    # 换了内参, 旧的俯仰/偏航外参不再成立, 清掉让 calibrationd 重新标
-    p.remove("CalibrationParams")
 
 
 class CalibrationPanel:

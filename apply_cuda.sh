@@ -307,6 +307,9 @@ echo "Installing calibration panel (developer page)..."
 UI_SP_DIR="$REPO_ROOT/openpilot/selfdrive/ui/sunnypilot"
 if [ -d "$UI_SP_DIR" ]; then
   install_file "$OVERLAY_DIR/kits/ui/calibration_panel.py" "$UI_SP_DIR/calibration_panel.py"
+  # 静止计时器: 把它的显示门槛与 DM(driverStateV2) 解耦 —— 本机没有座舱相机, driverStateV2
+  # 永不出现, 原实现让"开关打开也不显示"
+  install_file "$OVERLAY_DIR/kits/ui/circular_alerts.py" "$UI_SP_DIR/onroad/circular_alerts.py"
 else
   echo "  - 无 sunnypilot UI 目录, 跳过标定面板"
 fi
