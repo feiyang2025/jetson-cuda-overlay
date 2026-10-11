@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 
 from openpilot.sunnypilot.calib.intrinsics import (
@@ -26,10 +27,14 @@ from openpilot.sunnypilot.calib.intrinsics import (
   write_intrinsics,
 )
 
-# ---- 门限 (与 tools/calib 的融合门限叠加使用) ----
-MIN_RUNS = 3                # 连续多少趟一致才自动写
-CONSISTENCY_PCT = 1.5       # 这几趟的建议值彼此允许的离散 (%)
-MAX_DELTA_PCT = 15.0        # 单趟修正幅度上限 (%)
+# ---- 门限 ----
+# 触发以**里程**为主: 同一台相机累计跑够 MIN_DISTANCE_KM 才可能写, 期间把所有"已采纳"的
+# 趟数汇成一个池子取加权中位数 —— 这样"跑多少 km 自动写"就是可预期、可解释的, 不需要人
+# 盯着开关。里程按 vEgo 积分, 存在 AutoCalibHistory 里, 重启不清零。
+MIN_DISTANCE_KM = 30.0      # 累计多少 km 才有资格写 (可被 env CALIB_MIN_KM 覆盖)
+MIN_RUNS = 2                # 池子里至少几趟有效数据 (一趟 10-20km, 30km 通常 2-3 趟)
+CONSISTENCY_PCT = 1.5       # 池子里各趟建议值彼此允许的离散 (%)
+MAX_DELTA_PCT = 15.0        # 修正幅度上限 (%)
 MIN_APPLY_DELTA_PCT = 2.0   # 偏差小于这个就不动 (属于测量噪声)
 HISTORY_LEN = 20            # 历史保留条数
 
@@ -42,6 +47,18 @@ def _now() -> str:
   return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _weighted_median(vals: list, weights: list) -> float:
+  """按样本数加权的中位数 —— "最合适"的那个值 (比取最后一趟稳)。"""
+  pairs = sorted(zip(vals, [max(int(w), 1) for w in weights]))
+  total = sum(w for _, w in pairs)
+  acc = 0
+  for v, w in pairs:
+    acc += w
+    if acc >= total / 2:
+      return float(v)
+  return float(pairs[-1][0])
+
+
 class AutoCalibController:
   def __init__(self, params, cam: str = "fcam", log=print):
     assert cam in ("fcam", "ecam"), cam
@@ -52,10 +69,24 @@ class AutoCalibController:
 
   # ------------------------------------------------------------------ params
   def enabled(self) -> bool:
+    """自动写入是否开启。
+
+    默认**开** (键不存在 = 自动): 装好就该自己收敛, 不需要人知道有这条流程。
+    要关就显式写 False (kill switch), 那时只收数据/只给建议。
+    """
     try:
-      return bool(self.params.get_bool(PARAM_ENABLE))
+      v = self.params.get(PARAM_ENABLE)
     except Exception:
-      return False
+      return True
+    if v is None or v == "":
+      return True
+    return bool(self.params.get_bool(PARAM_ENABLE))
+
+  def min_distance_km(self) -> float:
+    try:
+      return float(os.environ.get("CALIB_MIN_KM") or MIN_DISTANCE_KM)
+    except (TypeError, ValueError):
+      return MIN_DISTANCE_KM
 
   def history(self) -> list:
     try:
@@ -68,11 +99,43 @@ class AutoCalibController:
       pass
     return []
 
-  def _save_history(self, hist: list) -> None:
+  def _save_history(self, hist: list, state: dict | None = None) -> None:
+    doc = {"runs": hist[-HISTORY_LEN:]}
+    doc.update(state if state is not None else self.state())
     try:
-      self.params.put(PARAM_HISTORY, {"runs": hist[-HISTORY_LEN:]}, block=True)
+      self.params.put(PARAM_HISTORY, doc, block=True)
     except Exception as e:
       self.log(f"[calibd] 写历史失败: {e}")
+
+  def state(self) -> dict:
+    """与里程相关的持久状态 {auto: {distance_km, since, written}}。"""
+    try:
+      d = self.params.get(PARAM_HISTORY)
+      if isinstance(d, dict) and isinstance(d.get("auto"), dict):
+        return {"auto": d["auto"]}
+    except Exception:
+      pass
+    return {}
+
+  def distance_km(self) -> float:
+    return float((self.state().get("auto") or {}).get("distance_km") or 0.0)
+
+  def add_distance(self, km: float) -> float:
+    """累加本窗口的行驶里程 (calibd 在每个 onroad tick 调)。"""
+    if km <= 0:
+      return self.distance_km()
+    st = self.state()
+    auto = dict(st.get("auto") or {})
+    auto["distance_km"] = round(float(auto.get("distance_km") or 0.0) + km, 3)
+    auto.setdefault("since", _now())
+    st["auto"] = auto
+    self._save_history(self.history(), st)
+    return auto["distance_km"]
+
+  def _reset_window(self, written: dict) -> None:
+    """写成功之后: 里程清零重新累计, 保留历史与已写入记录。"""
+    st = {"auto": {"distance_km": 0.0, "since": _now(), "written": written}}
+    self._save_history(self.history(), st)
 
   # ------------------------------------------------------------------ 决策
   def consider(self, result: dict) -> dict:
@@ -112,33 +175,44 @@ class AutoCalibController:
     hist.append(entry)
     self._save_history(hist)
     self.log(f"[calibd] 结果 {self.cam}: fl={entry['fl_current']}→{entry['fl_suggested']} "
-             f"({entry['delta_pct']}%) 置信={entry['confidence']} 动作={entry['action']}"
+             f"({entry['delta_pct']}%) 置信={entry['confidence']} "
+             f"里程={self.distance_km():.1f}/{self.min_distance_km():.0f}km 动作={entry['action']}"
              + (f" — {entry['reason']}" if entry["reason"] else ""))
     return entry
 
   def _maybe_apply(self, fl_cur: float, fl_sug: float, entry: dict) -> bool:
-    """滞回检查: 连续 MIN_RUNS 趟一致才写。返回是否真的写了。"""
+    """里程触发: 累计够 km + 池内各趟一致 → 写"最合适"的值 (加权中位数)。"""
     delta = abs((fl_sug / fl_cur - 1.0) * 100.0)
     if delta > MAX_DELTA_PCT:
       entry["reason"] = f"修正幅度 {delta:.1f}% 超上限 {MAX_DELTA_PCT}% → 不自动写 (先查相机安装/型号)"
       return False
 
-    recent = [h for h in self.history() if h.get("accepted") and h.get("cam") == self.cam
-              and h.get("fl_suggested")]
-    recent = recent[-(MIN_RUNS - 1):]          # 含本趟共 MIN_RUNS 趟
-    if len(recent) < MIN_RUNS - 1:
-      entry["reason"] = f"还需要 {MIN_RUNS - len(recent) - 1} 趟一致的结果才自动写 (已有 {len(recent)} 趟)"
+    need_km = self.min_distance_km()
+    done_km = self.distance_km()
+    pool = [h for h in self.history() if h.get("accepted") and h.get("cam") == self.cam
+            and h.get("fl_suggested")]
+    vals = [float(h["fl_suggested"]) for h in pool] + [fl_sug]
+    weights = [int(h.get("samples") or 0) for h in pool] + [int(entry.get("samples") or 0)]
+
+    if done_km < need_km:
+      entry["reason"] = f"里程 {done_km:.1f}/{need_km:.0f} km (差 {need_km - done_km:.1f} km), 继续跑"
       return False
-    vals = [float(h["fl_suggested"]) for h in recent] + [fl_sug]
-    spread = (max(vals) - min(vals)) / (sum(vals) / len(vals)) * 100.0
+    if len(vals) < MIN_RUNS:
+      entry["reason"] = f"里程够了但有效趟数不足 ({len(vals)}/{MIN_RUNS}) → 再跑一趟"
+      return False
+    mean = sum(vals) / len(vals)
+    spread = (max(vals) - min(vals)) / mean * 100.0
     if spread > CONSISTENCY_PCT:
-      entry["reason"] = f"最近 {len(vals)} 趟离散 {spread:.2f}% > {CONSISTENCY_PCT}% → 再等等"
+      entry["reason"] = f"池内 {len(vals)} 趟离散 {spread:.2f}% > {CONSISTENCY_PCT}% → 数据还不稳, 继续收"
       return False
 
-    apply_fl = sorted(vals)[len(vals) // 2]    # 取中位数, 别用最后一趟
-    self.apply(apply_fl, reason=f"连续 {len(vals)} 趟一致 (离散 {spread:.2f}%)")
+    apply_fl = _weighted_median(vals, weights)
+    self.apply(apply_fl, reason=f"累计 {done_km:.1f} km / {len(vals)} 趟一致 (离散 {spread:.2f}%)")
     entry["applied_fl"] = round(apply_fl, 2)
+    entry["applied_km"] = round(done_km, 1)
     entry["applied_spread_pct"] = round(spread, 2)
+    self._reset_window({"ts": _now(), "fl": round(apply_fl, 2), "km": round(done_km, 1),
+                        "runs": len(vals)})
     return True
 
   # ------------------------------------------------------------------ 执行

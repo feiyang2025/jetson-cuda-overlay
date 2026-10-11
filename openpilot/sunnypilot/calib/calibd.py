@@ -87,12 +87,15 @@ def main() -> int:
   ecam = cam == "ecam"
   ctl = AutoCalibController(params, cam=cam, log=_log)
   sm = messaging.SubMaster(["deviceState", "carState", "radarState", "modelV2"])
-  _log(f"启动: 主相机={cam} ({ctl.key}), 自动写入={'开' if ctl.enabled() else '关'} (AutoCalib); "
-       f"采样口径与手动标定一致")
+  _log(f"启动: 主相机={cam} ({ctl.key}), 自动写入={'开' if ctl.enabled() else '关'}"
+       + (f" — 累计 {ctl.min_distance_km():.0f} km 且各趟一致即自动写入 (当前已累计 "
+          f"{ctl.distance_km():.1f} km)" if ctl.enabled() else " (AutoCalib=False, 只给建议)")
+       + "; 采样口径与手动标定一致")
 
   session = None
   last_log = 0.0
   enabled_prev = ctl.enabled()
+  prev_tick = time.monotonic()
 
   while not exit_now:
     # 回滚请求 (面板/命令行置位)
@@ -116,14 +119,24 @@ def main() -> int:
       if session is None:
         session = CalibSession(ecam=ecam)
         last_log = 0.0
-        _log("开始采样 (onroad)")
+        _log(f"开始采样 (onroad); 自动写入门槛: 累计 {ctl.min_distance_km():.0f} km")
       session.feed(sm)
       now = time.monotonic()
+      # 里程触发: 按 vEgo 积分 (这一段的行驶距离就是这个窗口的"投入")
+      try:
+        km = max(float(sm["carState"].vEgo), 0.0) * (now - prev_tick) / 1000.0
+        if km > 0:
+          ctl.add_distance(km)
+      except Exception:
+        pass
       if now - last_log >= LOG_PERIOD_S:
         last_log = now
         rv, lw, cv = session.counts
-        _log(f"采样中 rv={rv} lw={lw} cv={cv} 共={session.total}")
+        _log(f"采样中 rv={rv} lw={lw} cv={cv} 共={session.total} | "
+             f"累计 {ctl.distance_km():.1f}/{ctl.min_distance_km():.0f} km")
+      prev_tick = now
     else:
+      prev_tick = time.monotonic()
       if session is not None:
         total = session.total
         _log(f"收尾: 共 {total} 个样本" + (" (手动标定接管/offroad)" if not manual else ""))
