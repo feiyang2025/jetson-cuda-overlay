@@ -311,8 +311,11 @@ class ModelState:
         ('big_input_imgs', 'big_img', wbuf, transform_wide),
       ):
         state = self._cuda_states[frame_key]
-        c_ptr = fbuf.data.ctypes.data
-        buf_len = fbuf.data.nbytes
+        # msgq 的 VisionBuf.data 是 memoryview(不是 numpy 数组): 先 frombuffer 才能取
+        # .ctypes / .nbytes (否则 AttributeError: 'memoryview' object has no attribute 'ctypes')
+        data_np = np.frombuffer(fbuf.data, dtype=np.uint8)
+        c_ptr = data_np.ctypes.data
+        buf_len = data_np.nbytes
         output_ptr = self._cu_transform.cuda_transform_execute(
           ctypes.byref(state), ctypes.c_void_p(c_ptr),
           fbuf.width, fbuf.height, fbuf.stride, fbuf.uv_offset,

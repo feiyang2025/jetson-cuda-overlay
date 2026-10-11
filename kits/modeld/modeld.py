@@ -319,7 +319,10 @@ class ModelState:
         state = self._cuda_states[key]
         proj = transform if key == 'input_imgs' else transform_wide
         # 零拷贝: buffer 若是映射内存, 用设备指针, transform 内部跳过 H2D
-        c_ptr = fbuf.data.ctypes.data
+        # 注意: msgq 的 VisionBuf.data 是 memoryview(不是 numpy 数组), 必须先 frombuffer
+        # 才能取 .ctypes / .nbytes (否则 AttributeError: 'memoryview' object has no attribute 'ctypes')
+        data_np = np.frombuffer(fbuf.data, dtype=np.uint8)
+        c_ptr = data_np.ctypes.data
         input_is_device = 0
         if self._cudart_zc is not None:
           dptr = self._vipc_devptr.get(c_ptr)
@@ -331,7 +334,7 @@ class ModelState:
           if dptr is not None:
             c_ptr = dptr
             input_is_device = 1
-        buf_len = fbuf.data.nbytes
+        buf_len = data_np.nbytes
         output_ptr = self._cu_transform.cuda_transform_execute(
           ctypes.byref(state), ctypes.c_void_p(c_ptr),
           fbuf.width, fbuf.height, fbuf.stride, fbuf.uv_offset,
@@ -403,6 +406,16 @@ class ModelState:
       combined_outputs_dict['raw_pred'] = np.concatenate([self.vision_output.copy(), self.policy_output.copy()])
 
     return combined_outputs_dict
+
+
+def _release_vipc(buf):
+  """归还 VisionIPC buffer, 与客户端 recv 的 acquire 配对。
+
+  本树的 msgq 未打零拷贝补丁时 (无 write_and_send / 共享 refcount) VisionBuf 没有
+  release() —— 无条件调用会 AttributeError 直接打死 modeld (相机有画面但无 modelV2)。
+  """
+  if buf is not None and hasattr(buf, 'release'):
+    buf.release()
 
 
 def main(demo=False):
@@ -511,7 +524,7 @@ def main(demo=False):
       if buf_extra is None:
         cloudlog.debug("vipc_client_extra no frame")
         if buf_main is not None:
-          buf_main.release()  # 归还已 acquire 的 main buffer, 避免 ref_count 泄漏
+          _release_vipc(buf_main)  # 归还已 acquire 的 main buffer, 避免 ref_count 泄漏
         continue
 
       # Decoupled FrameSync: wide 稳定落后 main 1 帧是设计稳态 (claim/follow 交错, camerad.py),
@@ -573,9 +586,9 @@ def main(demo=False):
 
     # 推理/读取完成, 释放 vipc buffer 供 camerad 复用 (与 client recv 的 acquire 配对)
     if buf_extra is not None and buf_extra is not buf_main:
-      buf_extra.release()
+      _release_vipc(buf_extra)
     if buf_main is not None:
-      buf_main.release()
+      _release_vipc(buf_main)
 
     # Log GPU memory periodically (every 100 frames) on CUDA/Orin
     if not TICI and frame_id % 100 == 0:
