@@ -68,31 +68,51 @@ static int g_chroma_swap = 0;
 
 extern "C" void packed_to_nv12_set_chroma_swap(int v) { g_chroma_swap = v ? 1 : 0; }
 
+// ---- 设备缓冲缓存 -----------------------------------------------------------
+// 热路径 20Hz 上"每帧 cudaMalloc + cudaFree"是同步驱动调用, 实测是单帧最大的固定
+// 开销之一(2026-10-12: 采集周期被顶到 33.3ms 以上 → 驱动丢帧 → 交付帧率 20→17)。
+// 源/目标尺寸按路固定, 改成按线程缓存、逐帧复用。
+// 必须是 thread_local: camerad 的 road/wide 是两个线程并发调 convert(), 共享一份
+// 设备缓冲会互相覆盖(ctypes 调用期间 GIL 是释放的)。每线程 ~5.6MB, 进程退出回收。
+static thread_local uint8_t *g_conv_src = nullptr; static thread_local size_t g_conv_src_cap = 0;
+static thread_local uint8_t *g_conv_dst = nullptr; static thread_local size_t g_conv_dst_cap = 0;
+
+static int _ensure_conv_buffers(size_t src_bytes, size_t dst_bytes) {
+  if (src_bytes > g_conv_src_cap) {
+    if (g_conv_src) { cudaFree(g_conv_src); g_conv_src = nullptr; g_conv_src_cap = 0; }
+    if (cudaMalloc((void **)&g_conv_src, src_bytes) != cudaSuccess) { g_conv_src = nullptr; return 1; }
+    g_conv_src_cap = src_bytes;
+  }
+  if (dst_bytes > g_conv_dst_cap) {
+    if (g_conv_dst) { cudaFree(g_conv_dst); g_conv_dst = nullptr; g_conv_dst_cap = 0; }
+    if (cudaMalloc((void **)&g_conv_dst, dst_bytes) != cudaSuccess) { g_conv_dst = nullptr; return 2; }
+    g_conv_dst_cap = dst_bytes;
+  }
+  return 0;
+}
+
 extern "C" int packed_to_nv12(const uint8_t* src_host, uint8_t* dst_host,
                               int width, int height, int layout, int src_stride) {
-  size_t src_bytes = (size_t)(src_stride > 0 ? src_stride : width * 2) * height;
+  const int row_bytes = width * 2;                                 // 有效像素每行字节数
+  const int host_pitch = src_stride > 0 ? src_stride : row_bytes;  // 源实际行距(4K 画布=7680)
+  size_t src_bytes = (size_t)row_bytes * height;                   // 设备上紧密存放
   size_t dst_bytes = (size_t)width * height * 3 / 2;
 
-  uint8_t *d_src = nullptr, *d_dst = nullptr;
-  if (cudaMalloc(&d_src, src_bytes) != cudaSuccess) return 1;
-  if (cudaMalloc(&d_dst, dst_bytes) != cudaSuccess) { cudaFree(d_src); return 2; }
+  if (_ensure_conv_buffers(src_bytes, dst_bytes) != 0) return 1;
 
-  if (cudaMemcpy(d_src, src_host, src_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-    cudaFree(d_src); cudaFree(d_dst); return 3;
-  }
+  // 2D 拷贝: 4K 虚标画布下只搬每行行首的有效 1920px(3840B), 不再整块搬 8.3MB/16.6MB
+  if (cudaMemcpy2D(g_conv_src, row_bytes, src_host, host_pitch, row_bytes, height,
+                   cudaMemcpyHostToDevice) != cudaSuccess) return 3;
 
   dim3 block(32, 8);
   dim3 grid((width + 31) / 32, (height + 7) / 8);
-  packed_to_nv12_kernel<<<grid, block>>>(d_src, d_dst, width, height, layout, src_stride, g_chroma_swap);
+  packed_to_nv12_kernel<<<grid, block>>>(g_conv_src, g_conv_dst, width, height, layout,
+                                         row_bytes, g_chroma_swap);
 
   cudaError_t err = cudaDeviceSynchronize();
-  if (err != cudaSuccess) { cudaFree(d_src); cudaFree(d_dst); return 4; }
+  if (err != cudaSuccess) return 4;
 
-  if (cudaMemcpy(dst_host, d_dst, dst_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
-    cudaFree(d_src); cudaFree(d_dst); return 5;
-  }
-  cudaFree(d_src);
-  cudaFree(d_dst);
+  if (cudaMemcpy(dst_host, g_conv_dst, dst_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return 5;
   return 0;
 }
 
@@ -242,26 +262,26 @@ extern "C" int packed_to_nv12_resize_device_to_device(const uint8_t* src_device,
 extern "C" int packed_to_nv12_resize(const uint8_t* src_host, uint8_t* dst_host,
                                      int sw, int sh, int dw, int dh,
                                      int flip, int chroma_swap, int layout, int src_stride) {
-  size_t src_bytes = (size_t)(src_stride > 0 ? src_stride : sw * 2) * sh;
+  const int row_bytes = sw * 2;                                   // 有效像素每行字节数 (1920px → 3840B)
+  const int host_pitch = src_stride > 0 ? src_stride : row_bytes;  // 源实际行距 (4K 画布 = 7680)
+  size_t src_bytes = (size_t)row_bytes * sh;                       // 设备上紧密存放
   size_t dst_bytes = (size_t)dw * dh * 3 / 2;
-  uint8_t *d_src = nullptr, *d_dst = nullptr;
-  if (cudaMalloc(&d_src, src_bytes) != cudaSuccess) return 1;
-  if (cudaMalloc(&d_dst, dst_bytes) != cudaSuccess) { cudaFree(d_src); return 2; }
-  if (cudaMemcpy(d_src, src_host, src_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-    cudaFree(d_src); cudaFree(d_dst); return 3;
-  }
+  if (_ensure_conv_buffers(src_bytes, dst_bytes) != 0) return 1;
+
+  // 2D 拷贝: 只搬每行行首的有效像素。4K 虚标画布状态下源行距 7680、有效 3840,
+  // 旧实现整块 cudaMemcpy(src_stride*sh = 8.3MB) 并把 H2D 量翻倍。
+  if (cudaMemcpy2D(g_conv_src, row_bytes, src_host, host_pitch, row_bytes, sh,
+                   cudaMemcpyHostToDevice) != cudaSuccess) return 3;
+
   dim3 block(32, 8);
   dim3 grid((dw + 31) / 32, (dh + 7) / 8);
-  packed_to_nv12_resize_kernel<<<grid, block>>>(d_src, d_dst, sw, sh, dw, dh,
+  packed_to_nv12_resize_kernel<<<grid, block>>>(g_conv_src, g_conv_dst, sw, sh, dw, dh,
                                                 flip ? 1 : 0, chroma_swap ? 1 : 0, layout,
-                                                dw, dh, src_stride);
+                                                dw, dh, row_bytes);
   cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) { cudaFree(d_src); cudaFree(d_dst); return 6; }
+  if (err != cudaSuccess) return 6;
   err = cudaDeviceSynchronize();
-  if (err != cudaSuccess) { cudaFree(d_src); cudaFree(d_dst); return 7; }
-  if (cudaMemcpy(dst_host, d_dst, dst_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
-    cudaFree(d_src); cudaFree(d_dst); return 5;
-  }
-  cudaFree(d_src); cudaFree(d_dst);
+  if (err != cudaSuccess) return 7;
+  if (cudaMemcpy(dst_host, g_conv_dst, dst_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return 5;
   return 0;
 }

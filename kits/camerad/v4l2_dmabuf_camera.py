@@ -1010,12 +1010,19 @@ class V4L2Camera:
       data = None
     else:
       mm = self.mmap_ptrs[index]
-      raw_data = bytes(mm[:self.cam_sizeimage])
-      self._requeue_buffer(index)
+      # 只取"有效图像区"要用的那些行 (cam_h 行 × 画布行距), 不再 bytes(mm[:cam_sizeimage]):
+      # 4K 虚标画布状态下 cam_sizeimage 是 16.6MB(实测掉电重载后还见过 67MB 画布),
+      # 整块 bytes() 复制会吃掉单帧预算 → DQBUF 周期 > 33.3ms → 驱动丢帧 →
+      # 交付帧率从 20fps 掉到 17fps, UI 报"相机帧率过低"。(2026-10-12 实测根因)
+      # np.frombuffer 是零拷贝视图; 真正的拷贝只发生在 _numpy_downsample 里切出的有效区(4.1MB)。
+      need = min(len(mm), max(self.cam_h * self.cam_bytesperline, self._nv12_size))
+      raw_view = np.frombuffer(mm, dtype=np.uint8, count=need)
       if self.cam_pixelformat == V4L2_PIX_FMT_NV12:
-        data = raw_data
+        data = bytes(raw_view[:self._nv12_size])
       else:
-        data = self._numpy_downsample(raw_data)
+        # 必须在归还 buffer 之前完成拷贝: 归还后驱动随时可能往这块 mmap 写下一帧
+        data = self._numpy_downsample(raw_view)
+      self._requeue_buffer(index)
     _t2 = time.monotonic()  # VIC 转换+回队 完成
 
     # 诊断计时(可通过 SP_TIMING=1 开启): dq等待/EAGAIN空转/VIC耗时/SOF硬件时间戳间隔,
@@ -1053,8 +1060,13 @@ class V4L2Camera:
     return dmabuf_fd, data, index, timestamp_sof, timestamp_eof
 
   def _numpy_downsample(self, raw_data):
-    """CPU 回退: 从 VI buffer 裁出真实图像区 (active), 必要时整数倍抽点到目标尺寸"""
-    raw = np.frombuffer(raw_data, dtype=np.uint8)
+    """CPU 回退: 从 VI buffer 裁出真实图像区 (active), 必要时整数倍抽点到目标尺寸。
+
+    raw_data 可以是 bytes, 也可以是 mmap 上的零拷贝 numpy 视图 (read_frame 传视图,
+    避免整块复制画布)。只读, 不修改入参。
+    """
+    raw = raw_data if isinstance(raw_data, np.ndarray) else np.frombuffer(raw_data, dtype=np.uint8)
+    raw = np.asarray(raw, dtype=np.uint8)
     aw, ah = self.cam_active_w, self.cam_active_h
     rows = raw[:self.cam_h * self.cam_bytesperline].reshape(self.cam_h, self.cam_bytesperline)
     uyvy = np.ascontiguousarray(rows[:ah, :aw * 2])
