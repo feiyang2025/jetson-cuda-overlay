@@ -318,6 +318,7 @@ echo "Patching master-c3 (carrot) specifics..."
 set +e
 python3 "$OVERLAY_DIR/patch_master_c3.py" "$REPO_ROOT"
 python3 "$OVERLAY_DIR/tools/patch_translations.py" "$REPO_ROOT"
+python3 "$OVERLAY_DIR/patch_ui_i18n.py" "$REPO_ROOT"
 set -e
 
 # panda 只走 USB: 关掉 SPI 探测。Orin 上 /dev/spidev* 属 gpio 组, 裸 PermissionError 会

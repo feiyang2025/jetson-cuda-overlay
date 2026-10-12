@@ -193,19 +193,26 @@ class TensorRTModel:
         # ── Ensure CUDA driver is initialized ──
         _check(self.cu.cuInit(0))
 
-        # ── 绑定 PRIMARY context ──
+        # ── 采用"当前已生效"的 context ──
         # 根因(0902晚): modeld 进程 tinygrad/transform/TRT 三方混用, TRT 跟随 current context
         # 或私建 context 都导致引擎读到全零输入(唯一能跑的配置=primary, 独立测试与FOF均如此)。
-        # 统一: 全部资源(retain primary)+调用时 push/pop, 与可工作的独立配置完全一致。
-        # 根因(0910): 旧代码在"current 已是 primary"时走 ctx = pri 分支, 而 pri 的 retain
-        # 已在上一行被 cuDevicePrimaryCtxRelease 抵消 —— 缓存的是个悬空句柄。后续 tinygrad
-        # 释放/重建 primary 后, 首次推理 cuCtxPushCurrent 报 CUDA driver error 201 并无限重启。
-        # 修复: 一律 retain primary 并保持该引用存活(进程生命周期内不 release), 只缓存这个活句柄。
-        ctx = ctypes.c_ulonglong()
-        _check(self.cu.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), 0))
-        _check(self.cu.cuCtxSetCurrent(ctx))
-        sys.stderr.write(f"[TRT_CTYPES] CUDA ctx=0x{ctx.value:x} primary=True (retained)\n")
-        self._cuda_ctx = ctx.value  # save for context push before each inference
+        # 根因(0910/1012): retain primary + 每次 push 的写法在 tinygrad / cuda_transform 之后失效
+        # —— 推理时 current 已经不是 primary 了, cuCtxPushCurrent(primary) 报
+        # CUDA driver error 201 (INVALID_CONTEXT)，modeld 无限重启。diag 行可见:
+        #   cached=0x…cc0 live_primary=0x…cc0 (retain rc=0) current=0x…09d0
+        # 修复: 让 TRT 引擎在"当前 context"(tinygrad 已建好并设为 current 的那个)里反序列化并
+        # 运行, 不再 retain/set primary —— 只有确实没有 current context 时才回退 retain primary。
+        ctx_now = ctypes.c_ulonglong()
+        rc_cur = self.cu.cuCtxGetCurrent(ctypes.byref(ctx_now))
+        if rc_cur == 0 and ctx_now.value:
+            self._cuda_ctx = ctx_now.value
+            sys.stderr.write(f"[TRT_CTYPES] CUDA ctx=0x{ctx_now.value:x} adopted current\n")
+        else:
+            ctx = ctypes.c_ulonglong()
+            _check(self.cu.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), 0))
+            _check(self.cu.cuCtxSetCurrent(ctx))
+            sys.stderr.write(f"[TRT_CTYPES] CUDA ctx=0x{ctx.value:x} primary=True (retained)\n")
+            self._cuda_ctx = ctx.value  # save for context push before each inference
 
         # ── Read serialised engine ──
         with open(engine_path, "rb") as f:
@@ -277,23 +284,21 @@ class TensorRTModel:
         # ── 进入 TRT 专属 context(所有绑定显存/拷贝/执行都在本 context 内) ──
         pushed = False
         if self._cuda_ctx:
-            # 每次都向驱动重新取一次 primary 句柄: tinygrad / cuda_transform 可能在两次调用
-            # 之间 release 并重建 primary, 缓存的老句柄 push 会报 CUDA driver error 201。
-            live = ctypes.c_ulonglong()
-            rc_retain = cu.cuDevicePrimaryCtxRetain(ctypes.byref(live), 0)
+            # 引擎跟随"当前 context"运行 —— 这里绝不能把缓存句柄(primary) push 回去:
+            # current 已经是 tinygrad / cuda_transform 的 context 时, push primary 会报
+            # CUDA driver error 201 (INVALID_CONTEXT), 于是 modeld 无限重启。所以只要
+            # current 非空就直接采用它; 只有确实没有 current context 时才 push 缓存的那个。
             ctx_now = ctypes.c_ulonglong()
-            cu.cuCtxGetCurrent(ctypes.byref(ctx_now))
+            rc_now = cu.cuCtxGetCurrent(ctypes.byref(ctx_now))
             if not getattr(self, '_ctx_diag_done', False):
-                sys.stderr.write(f"[TRT_CTYPES] ctx diag: cached=0x{self._cuda_ctx:x} live_primary=0x{live.value:x} "
-                                 f"(retain rc={rc_retain}) current=0x{ctx_now.value:x}\n")
+                sys.stderr.write(f"[TRT_CTYPES] ctx diag: cached=0x{self._cuda_ctx:x} "
+                                 f"current=0x{ctx_now.value:x} (get rc={rc_now})\n")
                 self._ctx_diag_done = True
-            if rc_retain == 0 and live.value:
-                self._cuda_ctx = live.value
-            if ctx_now.value != self._cuda_ctx:
+            if rc_now == 0 and ctx_now.value:
+                self._cuda_ctx = ctx_now.value
+            else:
                 _check(cu.cuCtxPushCurrent(self._cuda_ctx))
                 pushed = True
-            else:
-                pushed = False
 
         # ── Build input address array for the C API ─────────────────
         input_addrs = (ctypes.c_ulonglong * self.num_inputs)()
