@@ -133,32 +133,39 @@ def patch_application(root: Path) -> None:
 def patch_usbgpu(root: Path) -> None:
   p = _find_tree(root, "openpilot/selfdrive/ui/layouts/settings/usbgpu.py",
                 "selfdrive/ui/layouts/settings/usbgpu.py")
-  if p is not None:
-    s = _read(p)
-    if "tr_usbgpu_status" in s:
-      print("  - usbgpu.py 已接过翻译, 不动")
-    else:
-      s = s.replace("from openpilot.selfdrive.ui.ui_state import ui_state",
-                    "from openpilot.selfdrive.ui.layouts.settings.usbgpu_text import tr_usbgpu_check, tr_usbgpu_status\n"
-                    "from openpilot.selfdrive.ui.ui_state import ui_state", 1)
-      s = s.replace('text_item(lambda: tr("eGPU Status"), self._status),',
-                    'text_item(lambda: tr("eGPU Status"), lambda: tr_usbgpu_status(self._status())),')
-      s = s.replace('text_item(lambda: tr("USB Link"), self._link),',
-                    'text_item(lambda: tr("USB Link"), lambda: tr_usbgpu_status(self._link())),')
-      s = s.replace('text_item(lambda: tr("Connection Check"), lambda: self._check_result),',
-                    'text_item(lambda: tr("Connection Check"), lambda: tr_usbgpu_check(self._check_result)),')
-      p.write_text(s, encoding="utf-8")
-      print("  + usbgpu.py: 面板取值改走 tr_usbgpu_*(原来值是英文 token)")
+  if p is None:
+    print("  [ui-i18n] 找不到 settings/usbgpu.py, 跳过")
+    return
 
-  p = _find_tree(root, "openpilot/selfdrive/ui/layouts/settings/usbgpu_text.py",
-                "selfdrive/ui/layouts/settings/usbgpu_text.py")
-  if p is not None:
-    s = _read(p)
+  # usbgpu_text.py 有的树里没有(该面板却要 import 它) —— 缺了就装上, 否则界面导入即崩
+  text_py = p.parent / "usbgpu_text.py"
+  if not text_py.exists() and (KIT / "usbgpu_text.py").exists():
+    text_py.write_text((KIT / "usbgpu_text.py").read_text(encoding="utf-8"), encoding="utf-8")
+    print(f"  + 装上 usbgpu_text.py (原树缺这个文件, 面板会 import 它) -> {text_py}")
+
+  s = _read(p)
+  if "tr_usbgpu_status" in s:
+    print("  - usbgpu.py 已接过翻译, 不动")
+  else:
+    s = s.replace("from openpilot.selfdrive.ui.ui_state import ui_state",
+                  "from openpilot.selfdrive.ui.layouts.settings.usbgpu_text import tr_usbgpu_check, tr_usbgpu_status\n"
+                  "from openpilot.selfdrive.ui.ui_state import ui_state", 1)
+    s = s.replace('text_item(lambda: tr("eGPU Status"), self._status),',
+                  'text_item(lambda: tr("eGPU Status"), lambda: tr_usbgpu_status(self._status())),')
+    s = s.replace('text_item(lambda: tr("USB Link"), self._link),',
+                  'text_item(lambda: tr("USB Link"), lambda: tr_usbgpu_status(self._link())),')
+    s = s.replace('text_item(lambda: tr("Connection Check"), lambda: self._check_result),',
+                  'text_item(lambda: tr("Connection Check"), lambda: tr_usbgpu_check(self._check_result)),')
+    p.write_text(s, encoding="utf-8")
+    print("  + usbgpu.py: 面板取值改走 tr_usbgpu_*(原来值是英文 token)")
+
+  if text_py.exists():
+    s = _read(text_py)
     if '"not connected"' not in s:
       s = s.replace('  tr_noop("USB not connected"),',
                     '  tr_noop("USB not connected"),\n  tr_noop("not connected"),\n'
                     '  tr_noop("not checked"),\n  tr_noop("checking..."),', 1)
-      p.write_text(s, encoding="utf-8")
+      text_py.write_text(s, encoding="utf-8")
       print("  + usbgpu_text.py: 补 not connected / not checked / checking... 三个 token")
 
 
