@@ -7,9 +7,9 @@ For each frame with a valid lead:
   ratio = d_vision / d_radar
 
   With correct extrinsics:  ratio ≈ fl_ref / fl_cam
-    本机 (sp-cuda 厂商标定标准): road 流 fl=961.76, wide 流 fl=1740
+    本机 (厂商标定标准) 流↔镜头: road 流 = 60° 窄角 fl=1740, wide 流 = 120° 广角 fl=961.76
       FCAM (road) 帧: ratio ≈ 1
-      ECAM (wide) 帧: ratio ≈ 961.76/1740 ≈ 0.55 (若参考值取 road)
+      ECAM (wide) 帧: ratio ≈ 1740/961.76 ≈ 1.81 (若参考值取 road)
     comma 相机的 2520/605 ≈ 4.4 那套数字**不适用本机** (差 ~2.8 倍), 阈值必须按实际 fl 推导。
 
   With wrong extrinsics: ratio deviates due to pitch/height errors.
@@ -26,12 +26,12 @@ from openpilot.tools.lib.logreader import LogReader
 
 
 def _fcam_fl() -> float:
-  """当前生效的 FCAM(road) fl —— 与相机模型同源 (sp-cuda 厂商标定 961.76)。"""
+  """当前生效的 FCAM(road) fl —— 与相机模型同源 (厂商标定 1740 = 本机 road 流那台 60° 窄角)。"""
   try:
     from camera_std import effective
     return float(effective("fcam")["fl"])
   except Exception:
-    return 961.76
+    return 1740.0
 
 
 def _ecam_ratio_hint() -> float:

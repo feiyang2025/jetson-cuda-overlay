@@ -7,10 +7,14 @@
   绝对建议值一旦写进 FcamIntrinsics, 相机模型会当成物理焦距用, 画面 warp 与视觉测距直接崩。
   所以三处 (工具 / 面板 / camera.py) 必须共用同一个来源: 本模块。
 
-sp-cuda 标准 (该树连跑 1 个多月, 2026-08-30 厂商标定):
-  * road 流相机 (视频口 video1): 120° 广角镜头, pinhole fl ≈ 961.76 @1920x1080,
-    带 fisheye 畸变 (模型路径不做畸变校正)
-  * wide 流相机 (视频口 video2, 名字叫 WIDE 实际是 60° **窄角**): fx = fy = 1740, cx = 960, cy = 540
+sp-cuda 标准 (该树连跑 1 个多月, 2026-08-30 厂商标定) 的 **镜头数值**:
+  * 120° 广角镜头 (带 fisheye 畸变, 模型路径不做畸变校正): pinhole fl ≈ 961.76 @1920x1080
+  * 60° 窄角镜头: fx = fy = 1740, cx = 960, cy = 540
+按 *本机* 实测的流↔镜头对应 (2026-10-12, ORB 尺度比 road/wide=1.735):
+  * road 流 = /dev/video0 = twgmsl 9-0028 = **60° 窄角** → fl = 1740 (× 宽度比)
+  * wide 流 = /dev/video1 = twgmsl 9-002a = **120° 广角** → fl = 961.76 (× 宽度比)
+  (sp-cuda 那台把 120° 那只接在 road 流上, 所以它写的是 FCAM=961.76 / ECAM=1740;
+   本机两只节点的角色相反 —— 数值不变, 归属跟着镜头走。)
   * 运行时可覆盖: Params 的 FcamIntrinsics / EcamIntrinsics; 缺省即上述厂商标定值
   * 分辨率经 env ROAD_CAM_WIDTH/HEIGHT, WIDE_CAM_WIDTH/HEIGHT 参与缩放 (fl 随宽度线性缩放)
 
@@ -25,11 +29,11 @@ from __future__ import annotations
 
 import os
 
-# --- sp-cuda 厂商标定标准 (base 分辨率 1920x1080) ---
+# --- 厂商标定标准 (base 分辨率 1920x1080) ---
 STD_BASE_W = 1920
 STD_BASE_H = 1080
-STD_FCAM_FL = 961.76     # road 流 / 120° 广角镜头
-STD_ECAM_FL = 1740.0     # wide 流 / 60° 窄角镜头
+STD_FCAM_FL = 1740.0     # road 流 / 本机是 60° 窄角镜头 (tvide0 9-0028)
+STD_ECAM_FL = 961.76    # wide 流 / 本机是 120° 广角镜头 (video1 9-002a)
 
 # 名称映射: 工具沿用 FCAM/ECAM 的叫法, 对应 camera.py 的字段与 Params 键
 _CAM_META = {
