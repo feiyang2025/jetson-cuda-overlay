@@ -98,6 +98,21 @@ class _CUDA:
             ("cuCtxGetCurrent",
              [ctypes.POINTER(ctypes.c_ulonglong)],
              ctypes.c_int),
+            ("cuCtxPushCurrent",
+             [ctypes.c_ulonglong],
+             ctypes.c_int),
+            ("cuCtxPopCurrent",
+             [ctypes.POINTER(ctypes.c_ulonglong)],
+             ctypes.c_int),
+            ("cuCtxCreate_v2",
+             [ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_uint, ctypes.c_int],
+             ctypes.c_int),
+            ("cuDevicePrimaryCtxRetain",
+             [ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_int],
+             ctypes.c_int),
+            ("cuDevicePrimaryCtxRelease",
+             [ctypes.c_int],
+             ctypes.c_int),
             ("cuCtxSetCurrent",
              [ctypes.c_ulonglong],
              ctypes.c_int),
@@ -133,6 +148,27 @@ class _CUDA:
             f.restype = rest
             setattr(self, fn, f)
 
+        # 可选符号: 缺失绝不能影响 TensorRT 初始化。
+        # 本 fork 加载的是 nvgpu shim /data/opt/nvidia/l4t-gpu-libs/nvgpu/libcuda.so.1,
+        # 它只导出 cuMemHostAlloc(无 _v2), 且完全没有 cuMemHostFree_v2/cuMemFreeHost。
+        # 之前把 cuMemHostAlloc_v2 放进必需列表 → undefined symbol → TRT 初始化抛异常
+        # → modeld 重试 3 次后静默回退 tinygrad, 表现为 modelV2 停止发布。
+        for fn, argt, rest in [
+            ("cuMemHostAlloc_v2",
+             [ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_size_t, ctypes.c_uint],
+             ctypes.c_int),
+            ("cuMemHostAlloc",
+             [ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_size_t, ctypes.c_uint],
+             ctypes.c_int),
+        ]:
+            try:
+                f = getattr(self.lib, fn)
+            except AttributeError:
+                continue
+            f.argtypes = argt
+            f.restype = rest
+            setattr(self, fn, f)
+
 
 def _check(ret: int):
     if ret != 0:
@@ -157,15 +193,18 @@ class TensorRTModel:
         # ── Ensure CUDA driver is initialized ──
         _check(self.cu.cuInit(0))
 
-        # ── Ensure a CUDA context is current ──
-        # If tinygrad hasn't set one yet, we retain the primary context.
+        # ── 绑定 PRIMARY context ──
+        # 根因(0902晚): modeld 进程 tinygrad/transform/TRT 三方混用, TRT 跟随 current context
+        # 或私建 context 都导致引擎读到全零输入(唯一能跑的配置=primary, 独立测试与FOF均如此)。
+        # 统一: 全部资源(retain primary)+调用时 push/pop, 与可工作的独立配置完全一致。
+        # 根因(0910): 旧代码在"current 已是 primary"时走 ctx = pri 分支, 而 pri 的 retain
+        # 已在上一行被 cuDevicePrimaryCtxRelease 抵消 —— 缓存的是个悬空句柄。后续 tinygrad
+        # 释放/重建 primary 后, 首次推理 cuCtxPushCurrent 报 CUDA driver error 201 并无限重启。
+        # 修复: 一律 retain primary 并保持该引用存活(进程生命周期内不 release), 只缓存这个活句柄。
         ctx = ctypes.c_ulonglong()
-        ret = self.cu.cuCtxGetCurrent(ctypes.byref(ctx))
-        if ret != 0 or ctx.value == 0:
-            sys.stderr.write("[TRT_CTYPES] No active CUDA context — retaining primary\n")
-            _check(self.cu.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), 0))
-            _check(self.cu.cuCtxSetCurrent(ctx))
-        sys.stderr.write(f"[TRT_CTYPES] CUDA ctx=0x{ctx.value:x}\n")
+        _check(self.cu.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), 0))
+        _check(self.cu.cuCtxSetCurrent(ctx))
+        sys.stderr.write(f"[TRT_CTYPES] CUDA ctx=0x{ctx.value:x} primary=True (retained)\n")
         self._cuda_ctx = ctx.value  # save for context push before each inference
 
         # ── Read serialised engine ──
@@ -184,6 +223,7 @@ class TensorRTModel:
 
         self.input_names: list[str] = []
         self.input_shapes: list[tuple] = []
+        self.input_dtypes: dict[str, np.dtype] = {}  # engine-expected dtype per input
         for i in range(self.num_inputs):
             name = _lib.trt_engine_input_name(self._handle, i).decode()
             self.input_names.append(name)
@@ -195,6 +235,7 @@ class TensorRTModel:
                 ctypes.byref(ndim), dims_arr, ctypes.byref(dt),
             )
             self.input_shapes.append(tuple(dims_arr[: ndim.value]))
+            self.input_dtypes[name] = _TRT_DTYPE_TO_NP.get(dt.value, np.float32)
 
         self.output_names: list[str] = []
         for i in range(self.num_outputs):
@@ -233,13 +274,16 @@ class TensorRTModel:
         """
         cu = self.cu
 
-        # ── Ensure our CUDA context is current ──
-        # tinygrad may switch contexts between inferences, invalidating TRT handles
+        # ── 进入 TRT 专属 context(所有绑定显存/拷贝/执行都在本 context 内) ──
+        pushed = False
         if self._cuda_ctx:
             ctx_now = ctypes.c_ulonglong()
             cu.cuCtxGetCurrent(ctypes.byref(ctx_now))
             if ctx_now.value != self._cuda_ctx:
-                _check(cu.cuCtxSetCurrent(self._cuda_ctx))
+                _check(cu.cuCtxPushCurrent(self._cuda_ctx))
+                pushed = True
+            else:
+                pushed = False
 
         # ── Build input address array for the C API ─────────────────
         input_addrs = (ctypes.c_ulonglong * self.num_inputs)()
@@ -253,6 +297,11 @@ class TensorRTModel:
                 input_addrs[i] = int(val)
 
             elif isinstance(val, np.ndarray):
+                # Convert host dtype to engine-expected dtype (e.g. fp32 → fp16).
+                # Copying raw fp32 bytes into an fp16 binding reads garbage
+                # (bit-pattern reinterpretation → feature amplification/NaN).
+                if val.dtype != self.input_dtypes[name]:
+                    val = np.ascontiguousarray(val, dtype=self.input_dtypes[name])
                 # H2D copy — lazy-allocate a GPU buffer for this input
                 info = self.input_gpu.get(name)
                 if info is None:
@@ -285,34 +334,63 @@ class TensorRTModel:
             raise RuntimeError("trt_engine_execute returned non-zero")
 
         # ── D2H: copy output back to CPU ───────────────────────────
-        cpu_out = np.empty(self.output_shape, dtype=self.output_dtype_np)
+        # 用一次性分配的 pinned(host) 缓冲替代每次 np.empty: 可分页内存的
+        # cuMemcpyDtoHAsync 必须经驱动内部中转, 实测 2.5KB 要 3.55ms; pinned 是直写 DMA。
+        # 驱动缺 host-alloc 符号时退回可分页(行为同改前, 不会失败)。
+        if getattr(self, "_h_view", None) is None:
+            alloc = (getattr(self, "cuMemHostAlloc_v2", None)
+                     or getattr(self, "cuMemHostAlloc", None))
+            if alloc is not None:
+                _hp = ctypes.c_ulonglong()
+                _check(alloc(ctypes.byref(_hp), self.output_nbytes, 0))
+                self._h_ptr = _hp
+                # 持住 ctypes 指针, 否则 numpy 视图会失去内存所有者
+                self._h_keep = ctypes.cast(
+                    _hp, ctypes.POINTER(np.ctypeslib.as_ctypes_type(self.output_dtype_np)))
+                self._h_view = np.ctypeslib.as_array(self._h_keep, shape=self.output_shape)
+                sys.stderr.write("[TRT_CTYPES] pinned host output buffer allocated\n")
+            else:
+                self._h_ptr = None
+                self._h_view = np.empty(self.output_shape, dtype=self.output_dtype_np)
+                sys.stderr.write("[TRT_CTYPES] no cuMemHostAlloc*, using pageable output\n")
         _check(cu.cuMemcpyDtoHAsync_v2(
-            ctypes.c_void_p(cpu_out.ctypes.data),
+            ctypes.c_void_p(self._h_ptr.value if self._h_ptr else self._h_view.ctypes.data),
             self.gpu_output,
             self.output_nbytes,
             self.stream,
         ))
         _check(cu.cuStreamSynchronize(self.stream))
+        cpu_out = self._h_view
+
+        if self._cuda_ctx and pushed:
+            popped = ctypes.c_ulonglong()
+            _check(cu.cuCtxPopCurrent(ctypes.byref(popped)))
 
         return cpu_out.astype(np.float32).ravel()
 
     # ────────────────────────────────────────────────────────────────────
 
     def __del__(self):
+        # 构造失败时部分属性不存在，全部用 getattr 守卫，避免 in-exception double fault
         exc = None
-        for fn, args in [
-            (_lib.trt_engine_destroy, (self._handle,)),
-            (self.cu.cuStreamDestroy_v2, (self.stream,)),
-            (self.cu.cuMemFree_v2, (self.gpu_output,)),
-        ]:
-            try:
-                fn(*args)
-            except Exception as e:
-                exc = e
-        for info in self.input_gpu.values():
-            try:
-                self.cu.cuMemFree_v2(info["ptr"])
-            except Exception as e:
-                exc = e
+        if hasattr(self, "cu") and hasattr(self, "input_gpu"):
+            for fn, args in [
+                (getattr(_lib, "trt_engine_destroy", None), (getattr(self, "_handle", None),)),
+                (getattr(self.cu, "cuStreamDestroy_v2", None), (getattr(self, "stream", None),)),
+                (getattr(self.cu, "cuMemFree_v2", None), (getattr(self, "gpu_output", None),)),
+                # 故意不释放 _h_ptr: nvgpu shim 无 cuMemHostFree*/cuMemFreeHost,
+                # 该缓冲进程生命周期内复用, 由进程退出时内核回收。
+            ]:
+                if fn is None or args[0] is None:
+                    continue
+                try:
+                    fn(*args)
+                except Exception as e:
+                    exc = e
+            for info in self.input_gpu.values():
+                try:
+                    self.cu.cuMemFree_v2(info["ptr"])
+                except Exception as e:
+                    exc = e
         if exc is not None:
             sys.stderr.write(f"[TRT_CTYPES] __del__ error: {exc}\n")
