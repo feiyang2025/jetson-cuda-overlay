@@ -143,6 +143,60 @@ static void load_imu_calibration(const std::string &path) {
       g_imu_calib.accel_bias_g[0], g_imu_calib.accel_bias_g[1], g_imu_calib.accel_bias_g[2]);
 }
 
+// -------------------------------------------------------------------
+// IMU 安装朝向自动标定（device -> car 旋转矩阵，行主序）
+//   目标车体系: x=前, y=右, z=下（与 openpilot accelerometer 约定一致）：
+//     静止时 accel ≈ [0, 0, -9.81]；前向加速时 accel 的前向分量 > 0。
+//   用 静止重力(定"上/下") + 直线加速(定"前") 两个方向构造旋转，写回 json 持久化。
+//   没有 json / carState 时退化为现有写死映射 [y,-x,z]，行为不变。
+// -------------------------------------------------------------------
+static float g_imu_from_device[9] = {1,0,0, 0,1,0, 0,0,1};
+static bool g_imu_from_device_valid = false;
+
+static std::string orientation_path() {
+  const char *env = std::getenv("IMU_ORIENTATION_JSON");
+  if (env && env[0] != '\0') return env;
+  return get_project_root() + "/imu_orientation.json";
+}
+
+static void load_orientation(const std::string &path) {
+  std::string content = util::read_file(path);
+  if (content.empty()) return;
+  std::string err;
+  json11::Json j = json11::Json::parse(content, err);
+  if (!err.empty() || !j.is_object()) return;
+  auto m = j["imuFromDevice"];
+  if (!m.is_array() || m.array_items().size() != 9) return;
+  for (int i = 0; i < 9; i++) g_imu_from_device[i] = (float)m.array_items()[i].number_value();
+  g_imu_from_device_valid = true;
+  LOG("IMU orientation loaded from %s: [%.4f %.4f %.4f | %.4f %.4f %.4f | %.4f %.4f %.4f]",
+      path.c_str(), g_imu_from_device[0], g_imu_from_device[1], g_imu_from_device[2],
+      g_imu_from_device[3], g_imu_from_device[4], g_imu_from_device[5],
+      g_imu_from_device[6], g_imu_from_device[7], g_imu_from_device[8]);
+}
+
+static bool save_orientation(const std::string &path, const float R[9], int samples) {
+  FILE *f = fopen(path.c_str(), "w");
+  if (!f) { LOGE("cannot write orientation %s", path.c_str()); return false; }
+  fprintf(f,
+    "{\n"
+    "  \"imuFromDevice\": [%.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f],\n"
+    "  \"samples\": %d,\n"
+    "  \"note\": \"device(base-mapped) -> car frame rotation (x fwd, y right, z down)\"\n"
+    "}\n",
+    R[0],R[1],R[2],R[3],R[4],R[5],R[6],R[7],R[8], samples);
+  fclose(f);
+  LOG("IMU orientation saved to %s", path.c_str());
+  return true;
+}
+
+static void apply_rot3(const float R[9], float v[3]) {
+  float x = R[0]*v[0] + R[1]*v[1] + R[2]*v[2];
+  float y = R[3]*v[0] + R[4]*v[1] + R[5]*v[2];
+  float z = R[6]*v[0] + R[7]*v[1] + R[8]*v[2];
+  v[0] = x; v[1] = y; v[2] = z;
+}
+
 static inline int16_t parse_16bit(uint8_t lsb, uint8_t msb) {
   return static_cast<int16_t>(static_cast<uint16_t>(msb) << 8 | lsb);
 }
@@ -787,6 +841,16 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
   double bias_sumsq[3] = {0.0, 0.0, 0.0};
   int bias_n = 0;
 
+  // 安装朝向自动标定（device -> car 旋转）：静止重力定"下/上"，直线前进加速定"前"。
+  // 需要 carState（vEgo/aEgo/steeringAngleDeg）；没有 carState（如台架）时跳过，用已有 json。
+  SubMaster sm_car({"carState"});
+  bool orient_done = g_imu_from_device_valid;
+  bool og_ready = false;
+  double og_sum[3] = {0.0, 0.0, 0.0};
+  int og_n = 0;
+  double of_sum[3] = {0.0, 0.0, 0.0};
+  int of_n = 0;
+
   try {
     sensor.open();
     sensor.init_sensor();
@@ -816,6 +880,53 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
         cache.acc_v[2] = z * ACCEL_SCALE;
         cache.valid = true;
         fresh_acc = true;
+
+        // --- 安装朝向自动标定（用 base-mapped 原始 accel，未加旋转） ---
+        if (!orient_done) {
+          sm_car.update(0);
+          if (sm_car.alive("carState") && sm_car.valid("carState")) {
+            auto cs = sm_car["carState"].getCarState();
+            float vEgo = cs.getVEgo();
+            float aEgo = cs.getAEgo();
+            float steer = cs.getSteeringAngleDeg();
+            if (std::fabs(vEgo) < 0.1f) {  // 静止 -> 累计重力
+              for (int i = 0; i < 3; i++) og_sum[i] += cache.acc_v[i];
+              if (++og_n >= 100) og_ready = true;
+            }
+            if (og_ready && aEgo > 0.3f && vEgo > 0.5f && std::fabs(steer) < 5.0f) {  // 直线前进加速
+              double g_mean[3] = {og_sum[0] / og_n, og_sum[1] / og_n, og_sum[2] / og_n};
+              for (int i = 0; i < 3; i++) of_sum[i] += cache.acc_v[i] - g_mean[i];
+              of_n++;
+            }
+            if (og_ready && of_n >= 40) {
+              double g_mean[3] = {og_sum[0] / og_n, og_sum[1] / og_n, og_sum[2] / og_n};
+              double f_mean[3] = {of_sum[0] / of_n, of_sum[1] / of_n, of_sum[2] / of_n};
+              double gn = std::sqrt(g_mean[0]*g_mean[0] + g_mean[1]*g_mean[1] + g_mean[2]*g_mean[2]);
+              double dot = f_mean[0]*g_mean[0] + f_mean[1]*g_mean[1] + f_mean[2]*g_mean[2];
+              double fh[3] = {f_mean[0] - (dot/(gn*gn))*g_mean[0],
+                              f_mean[1] - (dot/(gn*gn))*g_mean[1],
+                              f_mean[2] - (dot/(gn*gn))*g_mean[2]};
+              double fn = std::sqrt(fh[0]*fh[0] + fh[1]*fh[1] + fh[2]*fh[2]);
+              if (gn > 8.0 && gn < 11.0 && fn > 0.3) {
+                double e1[3] = {fh[0]/fn, fh[1]/fn, fh[2]/fn};               // device 前
+                double e3[3] = {g_mean[0]/gn, g_mean[1]/gn, g_mean[2]/gn};   // device 上
+                double e2[3] = {e3[1]*e1[2]-e3[2]*e1[1], e3[2]*e1[0]-e3[0]*e1[2], e3[0]*e1[1]-e3[1]*e1[0]};
+                float R[9] = {(float)e1[0], (float)e1[1], (float)e1[2],
+                              (float)-e2[0], (float)-e2[1], (float)-e2[2],
+                              (float)-e3[0], (float)-e3[1], (float)-e3[2]};
+                for (int i = 0; i < 9; i++) g_imu_from_device[i] = R[i];
+                g_imu_from_device_valid = true;
+                orient_done = true;
+                save_orientation(orientation_path(), R, of_n);
+                LOGW("IMU orientation auto-calibrated (g_n=%d f_n=%d): [%.3f %.3f %.3f | %.3f %.3f %.3f | %.3f %.3f %.3f]",
+                     og_n, of_n, R[0],R[1],R[2],R[3],R[4],R[5],R[6],R[7],R[8]);
+                gyro_bias_done = false; auto_bias_t0 = 0; bias_n = 0;  // 旋转后零偏需重测
+                for (int i = 0; i < 3; i++) { bias_sum[i] = 0.0; bias_sumsq[i] = 0.0; }
+              }
+            }
+          }
+        }
+        if (g_imu_from_device_valid) apply_rot3(g_imu_from_device, cache.acc_v);
       } catch (...) { i2c_error = true; }
     }
 
@@ -828,6 +939,7 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
         cache.gyro_v[0] = y * GYRO_SCALE;
         cache.gyro_v[1] = -x * GYRO_SCALE;
         cache.gyro_v[2] = z * GYRO_SCALE;
+        if (g_imu_from_device_valid) apply_rot3(g_imu_from_device, cache.gyro_v);
         fresh_gyro = true;
       } catch (...) { i2c_error = true; }
     }
@@ -999,6 +1111,7 @@ int main(int argc, char **argv) {
   std::string calib_path = (env_calib && env_calib[0] != '\0')
       ? std::string(env_calib) : get_project_root() + "/imu_calibration.json";
   load_imu_calibration(calib_path);
+  load_orientation(orientation_path());  // 安装朝向旋转（无则用写死映射，并尝试自动标定）
 
   while (!do_exit) {
     // Reduce priority after watchdog restart
