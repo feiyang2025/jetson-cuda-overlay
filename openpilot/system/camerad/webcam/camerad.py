@@ -468,6 +468,7 @@ class Camerad:
     self._nvbuf_zerocopy = os.environ.get('SP_NVBUF_ZEROCOPY', '0') == '1'
     self._src_devptr = {}
     self._staging_devptr = {}   # stream_type -> CUDA 暂存 NV12 device ptr
+    self._pending_nvbuf = {}    # 物理相机 -> 待发布帧(隔一帧发, 见 _send_nv12_nvbuf)
     self._staging_size = {}     # stream_type -> NV12 staging 字节数
     self._cudart = None
     self._cuda = None
@@ -482,6 +483,8 @@ class Camerad:
         self._cudart.cudaMalloc.restype = ctypes.c_int
         self._cudart.cudaMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
         self._cudart.cudaMemcpy.restype = ctypes.c_int
+        self._cudart.cudaDeviceSynchronize.argtypes = []
+        self._cudart.cudaDeviceSynchronize.restype = ctypes.c_int
         if self._nvbuf_zerocopy:
           # libnvbuf_import.so 部署位候选(与 packed_so 同规则)
           _imp_candidates = [
@@ -717,26 +720,41 @@ class Camerad:
       timestamp_eof = timestamp_sof if timestamp_sof > 0 else int(time.monotonic_ns())
     # staging 与相机 buffer 归属都按"物理相机"(src_stream); yuv_type 只用于输出流。
     _src = src_stream if src_stream is not None else yuv_type
+    # 【隔一帧发布 · 防撕裂核心】本帧先入队, 真正转换+发布的是上一帧。
+    # 实测(twgmsl GMSL + 4K 画布)：驱动把 buffer 交给应用时这一帧"还在写" —— DQBUF 发生在
+    # 写完约 35~60% 处, 剩下还要 ~11ms(写速率 ~38 行/ms, 整帧 ~28ms ≈ 一个 33.3ms 帧周期)。
+    # 此刻读它, 出图必然是"上半截新帧 + 下半截上一帧", 撕裂线位置 = 当时 VI 的写指针
+    # (road≈行650 / wide≈行380), 所以撕裂线会随各种时序变化移动, 且不触碰任何 refcount,
+    # 所有计数器都是 0。绕开方式(不依赖驱动修好): 驱动一次只写一帧 → 它把下一帧交给我们时,
+    # 手里这帧必然已写完。代价仅一帧延迟(33ms)。详见 文档/相机链路_撕裂与绿色_根因与排查手册。
+    prev = self._pending_nvbuf.get(_src)
+    self._pending_nvbuf[_src] = (vision_buf, converter, frame_id, pub_type, yuv_type, timestamp_sof, timestamp_eof)
+    if prev is None:
+      return True   # 首帧只入队: 还没有"上一帧"可发
+    p_buf, p_conv, p_fid, p_pub, p_yuv, p_sof, p_eof = prev
     staging = self._staging_devptr.get(_src)
     if staging is None:
       raise RuntimeError(f"no staging buffer for {_src}")
     try:
       # 第一步：kernel 把相机 buffer 直接转换到独立暂存区（这是唯一读相机 buffer 的时刻）。
-      src = self._import_nvbuf(vision_buf.fd, os.fstat(vision_buf.fd).st_size)
-      if not converter.convert_device_to_device(src, staging):
+      src = self._import_nvbuf(p_buf.fd, os.fstat(p_buf.fd).st_size)
+      if not p_conv.convert_device_to_device(src, staging):
         raise RuntimeError("convert_device_to_device failed")
+      # 归还之前必须确认 kernel 读完（I1）
+      if self._cudart is not None:
+        self._cudart.cudaDeviceSynchronize()
     finally:
-      # 相机 buffer 用完立刻归还，不等 VisionIPC。
-      if vision_buf.v4l2_index is not None:
+      # 这一帧处理完立刻还给驱动(不等 VisionIPC)。本帧留在 _pending, 由下一帧触发处理。
+      if p_buf.v4l2_index is not None:
         for cam in self.cameras:
           if getattr(cam, "stream_type", None) == _src and hasattr(getattr(cam, "cam", None), "_requeue_buffer"):
-            cam.cam._requeue_buffer(vision_buf.v4l2_index)
+            cam.cam._requeue_buffer(p_buf.v4l2_index)
             break
 
     # 第二步：把暂存区 NV12 D2D 拷进 VisionIPC 自己的 device ptr，然后发送。
     def fill(dst):
       host_ptr = dst.ctypes.data
-      cache = self._devptr_cache.setdefault(yuv_type, {})
+      cache = self._devptr_cache.setdefault(p_yuv, {})
       dptr = cache.get(host_ptr)
       if dptr is None:
         d = ctypes.c_void_p()
@@ -745,12 +763,14 @@ class Camerad:
           raise RuntimeError(f"cudaHostGetDevicePointer rc={rc}")
         dptr = d.value
         cache[host_ptr] = dptr
-      rc = self._cudart.cudaMemcpy(dptr, staging, converter.nv12_size, 3)  # 3 = cudaMemcpyDeviceToDevice; 2 是 DeviceToHost 会写错地方
+      rc = self._cudart.cudaMemcpy(dptr, staging, p_conv.nv12_size, 3)  # 3 = cudaMemcpyDeviceToDevice; 2 是 DeviceToHost 会写错地方
       if rc != 0:
         raise RuntimeError(f"staging D2D copy failed rc={rc}")
+      # 目的端是 vipc 的 pinned host 内存 -> cudaMemcpy 可能异步返回, 必须在 send() 前落定(I3)
+      self._cudart.cudaDeviceSynchronize()
 
-    self.vipc_server.write_and_send(yuv_type, fill, frame_id, timestamp_sof, timestamp_eof)
-    self._publish_camera_state(frame_id, pub_type, timestamp_sof, timestamp_eof)
+    self.vipc_server.write_and_send(p_yuv, fill, p_fid, p_sof, p_eof)
+    self._publish_camera_state(p_fid, p_pub, p_sof, p_eof)
     return True
 
   def _publish_camera_state(self, frame_id, pub_type, timestamp_sof=0, timestamp_eof=0):
