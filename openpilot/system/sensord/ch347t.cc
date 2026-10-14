@@ -844,7 +844,11 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
   // 安装朝向自动标定（device -> car 旋转）：静止重力定"下/上"，直线前进加速定"前"。
   // 需要 carState（vEgo/aEgo/steeringAngleDeg）；没有 carState（如台架）时跳过，用已有 json。
   SubMaster sm_car({"carState"});
-  bool orient_done = g_imu_from_device_valid;
+  // 每次启动都重新标定一次：设备可能被移动/翻转，装好后开机+一段静止+直线加速即自动定朝向。
+  // （json 只作"标定完成前的初值"；标定成功后覆盖。要停用重标就设 IMU_ORIENT_RECALIB=0。）
+  bool orient_recalib = std::getenv("IMU_ORIENT_RECALIB") == nullptr ||
+                        std::string(std::getenv("IMU_ORIENT_RECALIB")) != "0";
+  bool orient_done = !orient_recalib;  // 需重标时为 false -> 走自动标定
   bool og_ready = false;
   double og_sum[3] = {0.0, 0.0, 0.0};
   int og_n = 0;
