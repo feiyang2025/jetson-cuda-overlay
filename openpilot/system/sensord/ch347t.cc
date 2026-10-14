@@ -44,6 +44,22 @@ static constexpr int MAX_CONSECUTIVE_ERRORS = 10;
 static constexpr int MAX_REINIT_ATTEMPTS = 3;
 static constexpr int CH347_WAIT_SECONDS = 30;
 static constexpr int CH347_RECHECK_INTERVAL_MS = 5000;
+// USB-HID 桥偶发单次 I2C 事务失败（实测），短重试后再放弃（对齐 overlay
+// kits/imu_calib/auto_calibrate.py 的 _stream_read/_stream_write 策略）。
+static constexpr int CH347_I2C_RETRIES = 5;
+static constexpr int CH347_I2C_RETRY_DELAY_MS = 10;
+// I2C 速率自适应候选：不同台面/线缆下 CH347→LSM6DS3 可用的速率不同（本机实测
+// 100kHz/400kHz 写会挂总线、回送陈旧/全 0 缓冲，20kHz 稳定出数据）。每个候选给
+// 一段探测预算，先通过"逐寄存器写+回读校验 + 真出数据"的速率被采用；被采用后整条
+// 数据链路都用它。
+struct CH347I2CSpeedCandidate { int speed; int probe_attempts; };
+static constexpr CH347I2CSpeedCandidate CH347_I2C_CANDIDATES[] = {
+  {0x00, 40},  // 20kHz：慢，但边缘链路最稳（本板实测唯一可用，优先）
+  {0x01, 15},  // 100kHz
+  {0x02, 15},  // 400kHz
+};
+// 边缘板上 I2C 相位延时（CH347I2C_SetDelaymS），实测明显减少读写失败。
+static constexpr int CH347_I2C_DELAY_MS = 5;
 // ---------------------------------------------------------------------------
 // AGX Orin 本地 I2C 总线安全限制（2026-08-26 安全修复）
 // 事故：旧逻辑 glob 扫描全部 /dev/i2c-* 并裸写探测，戳中设备树里没有任何子设备的
@@ -177,6 +193,8 @@ public:
     if (sym) i2c_set_ignore_nack_ = (CH347I2C_SetIgnoreNack_t)sym;
     sym = dlsym(lib_handle_, "CH347I2C_SetStretch");
     if (sym) i2c_set_stretch_ = (CH347I2C_SetStretch_t)sym;
+    sym = dlsym(lib_handle_, "CH347I2C_SetDelaymS");
+    if (sym) i2c_set_delay_ms_ = (CH347I2C_SetDelaymS_t)sym;
 
     if (!open_dev_ || !close_dev_ || !set_timeout_ || !i2c_set_ || !stream_i2c_)
       throw std::runtime_error("libch347 missing required symbols");
@@ -194,47 +212,92 @@ public:
       typedef int (*OpenIdxT)(unsigned long);
       fd_ = ((OpenIdxT)(void *)open_dev_)((unsigned long)(long)(hidraw_n - 2));
       LOG("CH347 open(index convention): fd=%d", fd_);
-      if (fd_ >= 0 && setup_and_detect()) return;
-      if (fd_ >= 0) { close_dev_(fd_); fd_ = -1; }
+      if (fd_ >= 0) {
+        // 索引式打开成功说明是新库；此时不要再走路径式回退（新库会把
+        // 路径指针当索引用，得到垃圾路径）。探测失败直接抛，交给外层重试。
+        for (const auto &cand : CH347_I2C_CANDIDATES) {
+          if (setup_and_detect(cand.speed, cand.probe_attempts)) {
+            LOGW("CH347 I2C speed=0x%02X selected (fd=%d)", cand.speed, fd_);
+            return;
+          }
+        }
+        close_dev_(fd_);
+        fd_ = -1;
+        throw std::runtime_error("CH347 LSM6DS3 not detected on 0x6A/0x6B (all I2C speeds)");
+      }
     }
     // ---- 回退旧库约定（路径）----
     fd_ = open_dev_(dev_path_.c_str());
     if (fd_ < 0) throw std::runtime_error("failed to open " + dev_path_);
-    if (!setup_and_detect())
-      throw std::runtime_error("CH347 LSM6DS3 not detected on 0x6A/0x6B");
+    for (const auto &cand : CH347_I2C_CANDIDATES) {
+      if (setup_and_detect(cand.speed, cand.probe_attempts)) {
+        LOGW("CH347 I2C speed=0x%02X selected (fd=%d, path convention)", cand.speed, fd_);
+        return;
+      }
+    }
+    throw std::runtime_error("CH347 LSM6DS3 not detected on 0x6A/0x6B (all I2C speeds)");
   }
 
 private:
-  // 打开后的统一配置 + IMU 探测；成功返回 true（addr_ 已就绪）
-  bool setup_and_detect() {
+  // 打开后的统一配置 + IMU 探测；成功返回 true（addr_ 已就绪）。
+  // speed 由调用方的速率候选表给出，probe_attempts 是该速率的探测预算。
+  bool setup_and_detect(int speed, int probe_attempts) {
     if (fd_ < 0) return false;
     // 超时设置在新库上可能签名不同或缺符号：失败仅告警不致命
     if (!set_timeout_(fd_, 2000, 2000))
       LOGW("CH34xSetTimeout failed (tolerated; some lib builds don't need it)");
-    if (!i2c_set_(fd_, 0x01)) return false;  // 0x01 = 400kHz I2C
-    if (i2c_set_ignore_nack_) i2c_set_ignore_nack_(fd_, 1);
-    if (i2c_set_stretch_) i2c_set_stretch_(fd_, true);
+    if (!configure_speed(speed)) return false;
     util::sleep_for(20);
 
-    for (int attempt = 0; attempt < 8; attempt++) {
+    // 打开后前若干次 I2C 事务会失败（"预热"），多试几轮；换速率由 open() 负责。
+    // 判据以"逐寄存器写+回读校验成功"为准（连续批量写会丢）；数据可能在若干帧后
+    // 才稳定，读循环里有卡死自愈（见 sensor_read_loop）。本板只有 20kHz 稳。
+    for (int attempt = 0; attempt < probe_attempts && !do_exit; attempt++) {
+      if (attempt > 0 && attempt % 10 == 0) configure_speed(speed);
       for (uint8_t addr : LSM6_ADDRS) {
-        try {
-          uint8_t wb[] = {static_cast<uint8_t>(addr << 1), WHO_AM_I_REG};
-          auto r = stream_read(wb, 2, 1);
-          uint8_t who = r[0];
-          for (uint8_t id : WHO_AM_I_IDS) {
-            if (who == id) {
-              addr_ = addr;
-              source_ = (who == 0x6A)
-                ? cereal::SensorEventData::SensorSource::LSM6DS3TRC
-                : cereal::SensorEventData::SensorSource::LSM6DS3;
-              LOG("CH347 LSM6DS3 detected at addr=0x%02X, who=0x%02X", addr, who);
-              return true;
-            }
-          }
-        } catch (...) { continue; }
+        uint8_t who = 0;
+        if (!read_who(addr, who)) continue;
+        if (who != 0x69 && who != 0x6A) continue;
+        addr_ = addr;
+        if (write_verify(0x10, 0x40) && write_verify(0x11, 0x40)) {
+          source_ = (who == 0x6A)
+            ? cereal::SensorEventData::SensorSource::LSM6DS3TRC
+            : cereal::SensorEventData::SensorSource::LSM6DS3;
+          LOG("CH347 LSM6DS3 detected addr=0x%02X who=0x%02X speed=0x%02X (attempt %d)",
+              addr, who, speed, attempt);
+          return true;
+        }
+        addr_ = 0;
       }
-      util::sleep_for(20);
+      util::sleep_for(5);
+    }
+    return false;
+  }
+
+  bool configure_speed(int speed) {
+    if (!i2c_set_(fd_, speed)) return false;  // 0x00=20kHz 0x01=100kHz 0x02=400kHz
+    if (i2c_set_delay_ms_) i2c_set_delay_ms_(fd_, CH347_I2C_DELAY_MS);
+    if (i2c_set_ignore_nack_) i2c_set_ignore_nack_(fd_, 1);
+    if (i2c_set_stretch_) i2c_set_stretch_(fd_, true);
+    return true;
+  }
+
+  bool read_who(uint8_t addr, uint8_t &who) {
+    uint8_t wb[] = {static_cast<uint8_t>(addr << 1), WHO_AM_I_REG};
+    who = 0;
+    if (stream_i2c_ret_ack_) {
+      int ack = 0;
+      return stream_i2c_ret_ack_(fd_, 2, wb, 1, &who, &ack);
+    }
+    return stream_i2c_(fd_, 2, wb, 1, &who);
+  }
+
+  // 逐寄存器写 + 立即回读校验：本板 CH347 连续批量写会丢，必须写一个读一个。
+  bool write_verify(uint8_t reg, uint8_t val, int tries = 20) {
+    for (int i = 0; i < tries && !do_exit; i++) {
+      try { write_u8(reg, val); } catch (const std::exception &) { continue; }
+      try { if (read_u8(reg) == val) return true; } catch (const std::exception &) {}
+      util::sleep_for(2);
     }
     return false;
   }
@@ -242,11 +305,14 @@ private:
 public:
 
   void init_sensor() override {
-    write_u8(0x12, 0x01);
-    util::sleep_for(100);
-    write_u8(0x12, 0x04);
-    write_u8(0x10, 0x40);
-    write_u8(0x11, 0x40);
+    // 本板 CH347 连续批量写会丢 → 必须逐寄存器"写 + 立即回读校验"。
+    try { write_u8(0x12, 0x01); } catch (const std::exception &) {}  // soft reset
+    util::sleep_for(50);
+    bool ok = write_verify(0x10, 0x40)   // CTRL1_XL: 104Hz, +-2g
+           && write_verify(0x11, 0x40)   // CTRL2_G : 104Hz, 245dps
+           && write_verify(0x12, 0x44);  // CTRL3_C: BDU(bit6) + IF_INC(bit2)
+    if (!ok) throw std::runtime_error("CH347 init_sensor failed to configure LSM6DS3");
+    LOG("CH347 sensor configured");
   }
 
   void shutdown() override {
@@ -271,21 +337,26 @@ public:
 
   std::vector<uint8_t> read_block(uint8_t start_reg, int length) override {
     std::vector<uint8_t> rbuf(length);
-    if (stream_i2c_ret_ack_) {
-      uint8_t addr_write[] = {static_cast<uint8_t>(addr_ << 1 | 0x00), start_reg};
-      int ack = 0;
-      if (!stream_i2c_ret_ack_(fd_, 2, addr_write, 0, nullptr, &ack))
-        throw std::runtime_error("CH347 I2C block write address failed");
-      uint8_t addr_read[] = {static_cast<uint8_t>(addr_ << 1 | 0x01)};
-      if (!stream_i2c_ret_ack_(fd_, 1, addr_read, length, rbuf.data(), &ack))
-        throw std::runtime_error("CH347 I2C block read data failed");
-    } else {
-      // Older lib without RetAck: combined write+read in one stream call.
-      uint8_t buf[2] = {static_cast<uint8_t>(addr_ << 1), start_reg};
-      if (!stream_i2c_(fd_, 2, buf, length, rbuf.data()))
-        throw std::runtime_error("CH347 I2C block read failed");
+    for (int attempt = 0; attempt < CH347_I2C_RETRIES; attempt++) {
+      bool ok = true;
+      if (stream_i2c_ret_ack_) {
+        uint8_t addr_write[] = {static_cast<uint8_t>(addr_ << 1 | 0x00), start_reg};
+        int ack = 0;
+        ok = stream_i2c_ret_ack_(fd_, 2, addr_write, 0, nullptr, &ack);
+        if (ok) {
+          uint8_t addr_read[] = {static_cast<uint8_t>(addr_ << 1 | 0x01)};
+          ok = stream_i2c_ret_ack_(fd_, 1, addr_read, length, rbuf.data(), &ack);
+        }
+      } else {
+        // Older lib without RetAck: combined write+read in one stream call.
+        uint8_t buf[2] = {static_cast<uint8_t>(addr_ << 1), start_reg};
+        ok = stream_i2c_(fd_, 2, buf, length, rbuf.data());
+      }
+      if (ok)
+        return rbuf;
+      util::sleep_for(CH347_I2C_RETRY_DELAY_MS);
     }
-    return rbuf;
+    throw std::runtime_error("CH347 I2C block read failed");
   }
 
   cereal::SensorEventData::SensorSource source() const override { return source_; }
@@ -293,22 +364,30 @@ public:
 private:
   std::vector<uint8_t> stream_read(const uint8_t *write_bytes, int write_len, int read_len) {
     std::vector<uint8_t> rbuf(read_len);
-    if (stream_i2c_ret_ack_) {
-      int ack = 0;
-      if (!stream_i2c_ret_ack_(fd_, write_len, const_cast<uint8_t *>(write_bytes),
-                               read_len, rbuf.data(), &ack))
-        throw std::runtime_error("CH347 I2C read failed");
-    } else {
-      if (!stream_i2c_(fd_, write_len, const_cast<uint8_t *>(write_bytes),
-                       read_len, rbuf.data()))
-        throw std::runtime_error("CH347 I2C read failed");
+    for (int attempt = 0; attempt < CH347_I2C_RETRIES; attempt++) {
+      bool ok;
+      if (stream_i2c_ret_ack_) {
+        int ack = 0;
+        ok = stream_i2c_ret_ack_(fd_, write_len, const_cast<uint8_t *>(write_bytes),
+                                 read_len, rbuf.data(), &ack);
+      } else {
+        ok = stream_i2c_(fd_, write_len, const_cast<uint8_t *>(write_bytes),
+                         read_len, rbuf.data());
+      }
+      if (ok)
+        return rbuf;
+      util::sleep_for(CH347_I2C_RETRY_DELAY_MS);
     }
-    return rbuf;
+    throw std::runtime_error("CH347 I2C read failed");
   }
 
   void stream_write(const uint8_t *write_bytes, int write_len) {
-    if (!stream_i2c_(fd_, write_len, const_cast<uint8_t *>(write_bytes), 0, nullptr))
-      throw std::runtime_error("CH347 I2C write failed");
+    for (int attempt = 0; attempt < CH347_I2C_RETRIES; attempt++) {
+      if (stream_i2c_(fd_, write_len, const_cast<uint8_t *>(write_bytes), 0, nullptr))
+        return;
+      util::sleep_for(CH347_I2C_RETRY_DELAY_MS);
+    }
+    throw std::runtime_error("CH347 I2C write failed");
   }
 
   // CH347 function pointer types
@@ -318,6 +397,7 @@ private:
   typedef bool (*CH347I2C_Set_t)(int, int);
   typedef bool (*CH347I2C_SetIgnoreNack_t)(int, uint8_t);
   typedef bool (*CH347I2C_SetStretch_t)(int, bool);
+  typedef bool (*CH347I2C_SetDelaymS_t)(int, int);
   typedef bool (*CH347StreamI2C_t)(int, int, void *, int, void *);
   typedef bool (*CH347StreamI2C_RetAck_t)(int, int, void *, int, void *, int *);
 
@@ -332,6 +412,7 @@ private:
   CH347I2C_Set_t i2c_set_ = nullptr;
   CH347I2C_SetIgnoreNack_t i2c_set_ignore_nack_ = nullptr;
   CH347I2C_SetStretch_t i2c_set_stretch_ = nullptr;
+  CH347I2C_SetDelaymS_t i2c_set_delay_ms_ = nullptr;
   CH347StreamI2C_t stream_i2c_ = nullptr;
   CH347StreamI2C_RetAck_t stream_i2c_ret_ack_ = nullptr;
 };
@@ -362,7 +443,7 @@ public:
   void init_sensor() override {
     write_u8(0x12, 0x01);
     util::sleep_for(100);
-    write_u8(0x12, 0x04);
+    write_u8(0x12, 0x44);  // CTRL3_C: BDU(bit6) + IF_INC(bit2)
     write_u8(0x10, 0x40);
     write_u8(0x11, 0x40);
   }
@@ -477,17 +558,20 @@ static bool hidraw_is_ch347_i2c(const char *dev_path, bool allow_uart_iface) {
   if (!have_id) return false;
   if (vid != 0x1A86 || (pid != 0x55DB && pid != 0x55DC)) return false;
 
-  // Distinguish the two HID interfaces when possible: the USB interface
-  // name of the UART one usually mentions UART/Serial/COM.
-  std::ifstream iface_file("/sys/class/hidraw/" + base + "/device/../interface");
-  if (iface_file.is_open()) {
-    std::string iface((std::istreambuf_iterator<char>(iface_file)),
-                       std::istreambuf_iterator<char>());
-    for (char &c : iface) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    bool looks_uart = iface.find("UART") != std::string::npos ||
-                      iface.find("SERIAL") != std::string::npos ||
-                      iface.find("COM") != std::string::npos;
-    if (looks_uart && !allow_uart_iface) return false;
+  // Distinguish the two HID interfaces by USB interface number. The old
+  // approach read /sys/class/hidraw/<base>/device/../interface, but that file
+  // does not exist on this Tegra kernel, so the filter never worked and the
+  // UART interface could be picked (writes then fail). Resolve the device
+  // symlink and match the interface number: SPI/I2C is :1.1/:1.2, UART is :1.0.
+  // Mirrors kits/imu_calib/auto_calibrate.py::find_hidraw().
+  char resolved[4096];
+  if (realpath(("/sys/class/hidraw/" + base + "/device").c_str(), resolved) != nullptr) {
+    std::string real(resolved);
+    bool is_i2c_iface = real.find(":1.1/") != std::string::npos ||
+                        real.find(":1.2/") != std::string::npos;
+    if (!is_i2c_iface && !allow_uart_iface) return false;
+  } else if (!allow_uart_iface) {
+    return false;
   }
   return true;
 }
@@ -695,6 +779,7 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
   int temp_ticks = 0;
   int consecutive_errors = 0;
   int reinit_attempts = 0;
+  int no_data_cycles = 0;
   SensorCache cache;
   bool gyro_bias_done = false;
   uint64_t auto_bias_t0 = 0;
@@ -804,6 +889,21 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
       reinit_attempts = 0;
     }
 
+    // 卡死自愈：本板 CH347↔LSM6DS3 的配置偶发丢失（STATUS 一直 0、无新数据、
+    // 又不算 I2C 错误），此时重下发一次配置即可恢复，避免静默不出数。
+    if (!i2c_error && !fresh_acc && !fresh_gyro) {
+      if (++no_data_cycles >= 200) {  // ~2s @104Hz
+        no_data_cycles = 0;
+        LOGW("%s: no fresh data for ~2s, re-applying sensor config", backend_name.c_str());
+        try { sensor.init_sensor(); }
+        catch (const std::exception &e) {
+          LOGE("%s: re-apply config failed: %s", backend_name.c_str(), e.what());
+        }
+      }
+    } else {
+      no_data_cycles = 0;
+    }
+
     bool send_stale = i2c_error && consecutive_errors <= MAX_STALE_FRAMES;
 
     if (fresh_acc) {
@@ -909,7 +1009,7 @@ int main(int argc, char **argv) {
     if (wait_for_ch347(dev_path, lib_path)) {
       void *lib_handle = dlopen(lib_path.c_str(), RTLD_NOW);
       if (lib_handle) {
-        LOG("CH347 backend available, starting...");
+        LOG("CH347 backend available, starting... dev=%s lib=%s", dev_path.c_str(), lib_path.c_str());
         CH347LSM6 sensor(dev_path, lib_handle);
         RateKeeper rk("ch347d", 104.0f);
         bool ok = sensor_read_loop(sensor, publisher, rk, "CH347", switch_backend);
