@@ -137,7 +137,10 @@ REALDATA = _realdata()
 
 
 def _pick_primary() -> str | None:
-    sig_by_fork = {f: (fw_sig(fork_fw(f)) or "") for f in FORKS}
+    sig_by_fork: dict[str, str] = {}
+    for f in FORKS:
+        p = fork_fw(f)
+        sig_by_fork[f] = (fw_sig(p) or "") if p else ""
     owner = _signature_owner_from_logs(sig_by_fork)
     if owner:
         return owner
@@ -213,7 +216,7 @@ def _self_test() -> int:
     for f in FORKS:
         fw = fork_fw(f)
         print(f"   - {os.path.basename(f):<24} health_v={health_version(f)} size={health_struct_size(f)}B"
-              f" fw_sig={fw_sig(fw) if fw else 'n/a'} md5={(fw_md5(fw) or 'n/a')[:8]}")
+              f" fw_sig={fw_sig(fw) if fw else 'n/a'} md5={(fw_md5(fw) or 'n/a')[:8] if fw else 'n/a'}")
     print("PRIMARY       :", os.path.basename(PRIMARY) if PRIMARY else None)
     print("CANON_SIG     :", CANON_SIG)
     print("CANON_MD5     :", CANON_MD5)
