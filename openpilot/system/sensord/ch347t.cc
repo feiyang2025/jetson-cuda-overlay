@@ -844,12 +844,15 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
   // 安装朝向自动标定（device -> car 旋转）：静止重力定"下/上"，直线前进加速定"前"。
   // 需要 carState（vEgo/aEgo/steeringAngleDeg）；没有 carState（如台架）时跳过，用已有 json。
   SubMaster sm_car({"carState"});
-  // 每次启动都重新标定一次：设备可能被移动/翻转，装好后开机+一段静止+直线加速即自动定朝向。
-  // （json 只作"标定完成前的初值"；标定成功后覆盖。要停用重标就设 IMU_ORIENT_RECALIB=0。）
+  // 朝向标定策略：开机静止测重力，与已存标定比对——
+  //   变化小(<20°)：视为同一安装(差异只是坡度) -> 沿用旧标定, 不重标(也不把坡度标进去)
+  //   变化大(>=20°)：设备被翻动/移动 -> 重标(需要一段直线加速)
+  // 无 carState 时用已有 json；IMU_ORIENT_RECALIB=0 则完全禁用重标。
   bool orient_recalib = std::getenv("IMU_ORIENT_RECALIB") == nullptr ||
                         std::string(std::getenv("IMU_ORIENT_RECALIB")) != "0";
-  bool orient_done = !orient_recalib;  // 需重标时为 false -> 走自动标定
+  bool orient_done = !orient_recalib;  // 禁用重标时直接置完成
   bool og_ready = false;
+  bool og_checked = false;             // 是否已比对过"安装是否变化"
   double og_sum[3] = {0.0, 0.0, 0.0};
   int og_n = 0;
   double of_sum[3] = {0.0, 0.0, 0.0};
@@ -885,7 +888,7 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
         cache.valid = true;
         fresh_acc = true;
 
-        // --- 安装朝向自动标定（用 base-mapped 原始 accel，未加旋转） ---
+        // --- 安装朝向标定（用 base-mapped 原始 accel，未加旋转） ---
         if (!orient_done) {
           sm_car.update(0);
           if (sm_car.alive("carState") && sm_car.valid("carState")) {
@@ -895,14 +898,36 @@ static bool sensor_read_loop(LSM6DS3 &sensor, PubMaster &pm, RateKeeper &rk,
             float steer = cs.getSteeringAngleDeg();
             if (std::fabs(vEgo) < 0.1f) {  // 静止 -> 累计重力
               for (int i = 0; i < 3; i++) og_sum[i] += cache.acc_v[i];
-              if (++og_n >= 100) og_ready = true;
+              og_n++;
+              if (og_n >= 100) og_ready = true;
             }
-            if (og_ready && aEgo > 0.3f && vEgo > 0.5f && std::fabs(steer) < 5.0f) {  // 直线前进加速
+            // 重力够多后，先判断"安装是否变了"（只判一次）
+            if (og_ready && !og_checked) {
+              og_checked = true;
+              if (g_imu_from_device_valid) {
+                double gm[3] = {og_sum[0]/og_n, og_sum[1]/og_n, og_sum[2]/og_n};
+                double gn = std::sqrt(gm[0]*gm[0] + gm[1]*gm[1] + gm[2]*gm[2]);
+                if (gn > 8.0) {
+                  double meas[3] = {gm[0]/gn, gm[1]/gn, gm[2]/gn};
+                  double exp_up[3] = {-g_imu_from_device[6], -g_imu_from_device[7], -g_imu_from_device[8]};
+                  double d = meas[0]*exp_up[0] + meas[1]*exp_up[1] + meas[2]*exp_up[2];
+                  d = d < -1.0 ? -1.0 : (d > 1.0 ? 1.0 : d);
+                  double ang = std::acos(d) * 180.0 / M_PI;
+                  if (ang < 20.0) {
+                    LOGW("IMU mount unchanged (gravity dev %.1f deg) -> keep stored orientation", ang);
+                    orient_done = true;  // 变化小：沿用旧标定，丢弃本次（也避免把坡度标进去）
+                  } else {
+                    LOGW("IMU mount changed (gravity dev %.1f deg) -> re-calibrating", ang);
+                  }
+                }
+              }
+            }
+            if (og_ready && !orient_done && aEgo > 0.3f && vEgo > 0.5f && std::fabs(steer) < 5.0f) {  // 直线前进加速
               double g_mean[3] = {og_sum[0] / og_n, og_sum[1] / og_n, og_sum[2] / og_n};
               for (int i = 0; i < 3; i++) of_sum[i] += cache.acc_v[i] - g_mean[i];
               of_n++;
             }
-            if (og_ready && of_n >= 40) {
+            if (og_ready && !orient_done && of_n >= 40) {
               double g_mean[3] = {og_sum[0] / og_n, og_sum[1] / og_n, og_sum[2] / og_n};
               double f_mean[3] = {of_sum[0] / of_n, of_sum[1] / of_n, of_sum[2] / of_n};
               double gn = std::sqrt(g_mean[0]*g_mean[0] + g_mean[1]*g_mean[1] + g_mean[2]*g_mean[2]);
