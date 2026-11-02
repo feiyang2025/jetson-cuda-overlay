@@ -139,7 +139,7 @@ python3 tools/stereo_sync_probe.py skew --json /tmp/s2.json
 python3 tools/stereo_sync_probe.py verdict /tmp/s1.json /tmp/s2.json
 ```
 
-`verdict` 退出码: **0**=偏置可复现(疑似真同步) **2**=部分复现 **3**=free-run。
+`verdict` 退出码: **0**=偏置可复现(疑似真同步) **2**=部分复现 **3**=free-run, **4**=证据不足(需第 3 次)。
 
 > **最容易踩的误判**: 单次测量 MAD < 1us 看起来"完美同步", 但那是两路挂在同一颗
 > des 上共享参考时钟的必然结果 —— 帧率被锁死, 绝对相位仍随每次初始化跳变数毫秒。

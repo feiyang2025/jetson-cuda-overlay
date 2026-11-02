@@ -192,7 +192,7 @@ class _Cam(threading.Thread):
 
     def run(self):
         try:
-            fd = os.open(self.dev, os.O_RDWR)
+            fd = os.open(self.dev, os.O_RDWR | os.O_NONBLOCK)
         except OSError as e:
             self.err = f"打开失败: {e}"
             return
@@ -251,8 +251,16 @@ def measure(road: str, wide: str, frames: int, duration: float) -> dict:
     a, b = _Cam(road, "road", frames, duration), _Cam(wide, "wide", frames, duration)
     a.start()
     b.start()
-    a.join()
-    b.join()
+    # 有界 join: DQBUF 在设备没出帧/被占用时可能一直阻塞, 不能让整个工具挂死。
+    # 超时后置 halt 并放弃该线程 (daemon=True, 进程退出即回收)。
+    limit = duration + 10.0
+    for t in (a, b):
+        t.join(timeout=limit)
+    for t in (a, b):
+        if t.is_alive():
+            t._halt = True
+            if t.err is None:
+                t.err = f"采集超时 (> {limit:.0f}s 未返回): 该路没出帧或设备被占用"
 
     if a.err or b.err:
         return {"ok": False, "road_err": a.err, "wide_err": b.err,
@@ -294,8 +302,13 @@ def measure(road: str, wide: str, frames: int, duration: float) -> dict:
 
 def _print_measure(r: dict):
     if not r.get("ok"):
-        print(f"  测量失败: road={r.get('road_err')} wide={r.get('wide_err')} "
-              f"frames={r.get('road_frames')}/{r.get('wide_frames')} {r.get('reason', '')}")
+        rf, wf = r.get("road_frames", 0), r.get("wide_frames", 0)
+        print(f"  测量失败: road 拿到 {rf} 帧, wide 拿到 {wf} 帧")
+        for tag, key in (("road", "road_err"), ("wide", "wide_err")):
+            if r.get(key):
+                print(f"    {tag}: {r[key]}")
+        if r.get("reason"):
+            print(f"    {r['reason']}")
         return
     print(f"  帧数        : {r['frames']} (有效配对 {r['pairs_valid']})")
     print(f"  road 周期   : {r['road_period_us']:.1f} us  sigma {r['road_sigma_us']:.2f} us"
@@ -341,6 +354,10 @@ def cmd_verdict(args) -> int:
     if len(runs) < 2:
         print("  至少需要 2 次有效测量 (每次在不同初始化之后) 才能判同步。")
         return 1
+    if len(runs) < 3:
+        print("  ⚠ 只有 2 次测量, 样本不足以区分'恰好接近'与'真复现'。")
+        print("    建议再做第 3 次 (重启后测) 再下结论。")
+        print("    当前仅报告区间, 不当作最终同步判决。\n")
 
     print("  各次测量 (应按顺序在不同 tw_camera_cfg 初始化之后采集):")
     offs = []
@@ -352,6 +369,11 @@ def cmd_verdict(args) -> int:
     spread = max(offs) - min(offs)
     print(f"\n  偏置跨重启极差 : {spread:.1f} us")
     print(f"  单次内 MAD 上限: {max(r['mad_us'] for _, r in runs):.1f} us")
+
+    if len(runs) < 3:
+        print(f"\n  → 结论: 证据不足 (仅 {len(runs)} 次), 不能判定。")
+        print("     区间跨度已看到, 但样本太少, 未下同步/free-run 定论。")
+        return 4
 
     if spread < 100:
         print("\n  → 结论: 偏置跨重启可复现 (<100us), **疑似真硬件同步**。")
