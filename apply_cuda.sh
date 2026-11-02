@@ -278,6 +278,14 @@ if [ -f "$PCONFIG" ] && ! grep -q "sensord_ch347" "$PCONFIG"; then
     echo "[apply_cuda] WARN ch347 manager patch skipped"
 fi
 
+echo "Installing stereo-sync probe..."
+# road/wide 双目同步诊断 (只读): 寄存器判读 + 并行时间戳测量 + 跨重启偏置复现判定。
+# 结论见 kits/camerad/CAMERAD_CONTRACT.md「双目同步」一节:
+# 当前设备上硬件曝光同步尚未成立, 软件配对是唯一已验证路径, 因此不默认开 trigmode。
+mkdir -p "$REPO_ROOT/tools"
+install_file "$OVERLAY_DIR/tools/stereo_sync_probe.py" "$REPO_ROOT/tools/stereo_sync_probe.py"
+chmod +x "$REPO_ROOT/tools/stereo_sync_probe.py" 2>/dev/null || true
+
 echo "Installing camera-calibration toolkit..."
 # tools/calib/*: FCAM/ECAM intrinsic + ECAM extrinsic calibration (log-based,
 # no hardcoded paths, layout-agnostic). Run with the *system* python3 for the

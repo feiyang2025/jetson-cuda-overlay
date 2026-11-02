@@ -45,6 +45,7 @@ python3 /data/openpilot/jetson-cuda-overlay/doctor.py
 | CUDA 推理后端 | CUDA 图像变换（NV12→12 通道 warp，绕开 pocl/OpenCL）+ TensorRT 运行器（零拷贝），tinygrad 自动回退 | 实机 `Using TensorRT` ～2ms/帧 |
 | 模型兼容 | **小模型（分体 vision+policy，FiletOFish 类）与 1.7G 大模型（BigCombo 单引擎合并）都支持**，走 ModelProfile 注册表自动选 | 本机两套引擎都跑过（BigCombo 240 帧漂移测试通过） |
 | CH347 IMU | 外置 USB-I2C LSM6DS3 守护进程：发 accelerometer/gyroscope/temperatureSensor，开机零偏自动校准，**没插设备自动干净退出** | 实机验证；`process_config` 注册可选守护进程 |
+| 硬件同步 | **未作为默认能力宣称**: T906G/IMX390/MAX9295A 寄存器配置可读到但跨初始化曝光相位未复现; 只读判定用 `tools/stereo_sync_probe.py` |
 | 相机标定工具链 | FCAM/ECAM 内参、ECAM 外参（离线用行车日志）；参数化内参按分辨率存 Params，全栈自动读取 | 150 段真实日志跑出 pitch 5.2°/RMSE 4.98m（ajouatom + dp 都验过） |
 | Panda 跨分支统一 | 所有分支共用同一份 panda 固件字节（签名一致）→ **任何分支启动都不再刷固件**；协议三方一致（py库/health.h/C结构） | 三个分支签名统一为 `1eddee73…`；启动自检 0.06s |
 | 体检/排障 | `doctor.py` 一条命令过一遍环境/分支/相机/CUDA/IMU/标定/Panda | 本机跑通（4 项提示均为"未插设备"类） |
@@ -55,6 +56,7 @@ python3 /data/openpilot/jetson-cuda-overlay/doctor.py
 |---|---|
 | "自动"是两档 | 文件/补丁是真自动；**设备侧仍需手动 3 步**：编 `libcuda_transform.so`、准备 `.plan` 引擎、重编一次 `scons -j8 common/` |
 | 相机外参"自动" | rpy 外参由 openpilot 自带 `calibrationd` 在线自动估（overlay 未改）；overlay 提供的是**离线标定** FCAM/ECAM 内参 + ECAM 外参（pitch/高度） |
+| 双目硬件同步 | **未成立, 不作为默认能力**: 寄存器配置可读到, 但跨初始化曝光相位不可复现(跳变数 ms); 工具只做判定(`tools/stereo_sync_probe.py`), 不会自动开启触发 |
 | 标定需要在车上实时按按钮的那条路 | 未移植（见 1.3） |
 | 引擎/固件字节不进仓库 | `.plan`、`panda_h7.bin.signed`、`libcuda_transform.so` 都是设备相关产物，仓库只带工具与补丁 |
 | `wide_calibrator.py` | 需要 `cv2`：系统 python3 与 dp 的 venv 有，cuda/ajouatom 的 venv 没有（用系统 python3 或自行 pip 装 opencv） |

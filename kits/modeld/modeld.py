@@ -461,6 +461,12 @@ def main(demo=False):
   vipc_client_main = VisionIpcClient("camerad", vipc_client_main_stream, True)
   vipc_client_extra = VisionIpcClient("camerad", _VST_WIDE_ROAD, True)
   cloudlog.warning(f"vision stream set up, main_wide_camera: {main_wide_camera}, use_extra_client: {use_extra_client}")
+  # 双目同步状态必须显式记录: 本设备硬件 FSYNC 尚未验证成立 (见
+  # kits/camerad/CAMERAD_CONTRACT.md), 当前靠 camerad 的 FrameSync frame_id
+  # + 下面的 sof 配对兜底。日志写明模式, 避免"看着同步"被误当成硬同步。
+  if use_extra_client:
+    cloudlog.warning("camera sync mode: software pairing (frame_id primary, sof as bound); "
+                     "hardware FSYNC not verified on this device")
 
   while not vipc_client_main.connect(False):
     time.sleep(0.1)

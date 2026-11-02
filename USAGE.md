@@ -117,6 +117,36 @@ nvcc -arch=sm_87 -O3 --shared -o libpacked_to_nv12.so packed_to_nv12.cu
 # 产物与 camerad.py 同目录即可自动发现; 缺失时自动回退 CPU 转换
 ```
 
+### 2.4.2 双目同步状态判定(只读, 2026-11-02 实测)
+
+**当前这台设备的 road/wide 硬件曝光同步尚未成立**, 双目按软件配对运行
+(`FrameSync` + `modeld camera_sync`)。不要默认开 `trigmode=trigger`。
+
+判定工具(随 apply 安装到目标树 `tools/`):
+
+```bash
+cd <目标fork>
+
+# 寄存器判读(不需要停栈)
+python3 tools/stereo_sync_probe.py regs
+
+# 单次相位(需相机空闲: 停 manager/camerad 并关掉 gst 预览)
+python3 tools/stereo_sync_probe.py skew --json /tmp/s1.json
+
+# 重启相机驱动后再测一次, 然后判定
+sudo pkill -x tw_camera_cfg; sudo tw_camera_cfg
+python3 tools/stereo_sync_probe.py skew --json /tmp/s2.json
+python3 tools/stereo_sync_probe.py verdict /tmp/s1.json /tmp/s2.json
+```
+
+`verdict` 退出码: **0**=偏置可复现(疑似真同步) **2**=部分复现 **3**=free-run。
+
+> **最容易踩的误判**: 单次测量 MAD < 1us 看起来"完美同步", 但那是两路挂在同一颗
+> des 上共享参考时钟的必然结果 —— 帧率被锁死, 绝对相位仍随每次初始化跳变数毫秒。
+> 必须看跨初始化偏置是否复现, 才有资格谈硬件同步。
+
+实测数据与钉死的规则见 `kits/camerad/CAMERAD_CONTRACT.md` 的「双目同步」一节。
+
 ### 2.5 相机适配"水土不服"防护（2026-09-16 起）
 
 历史教训: patch_camerad.py 只认官方结构的 import 锚点

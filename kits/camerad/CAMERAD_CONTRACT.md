@@ -111,6 +111,86 @@ fork 本地版 = 单分支直连 (import 写死)。**不要用 fork 本地版替
 - 坑: nvbuf 相机 buffer 归还要在 kernel 转换完成后立即做, 不许等 write_and_send;
       丢帧/异常路径必须 finally 兜底归还 + requeued 标志防双还 (4 块 buffer 12 帧=0.4s 扣死过)。
 
+## 双目同步 (road/wide) —— 现状与规则 (2026-11-02 实测)
+
+**结论先说: 当前设备上硬件曝光同步尚未成立。软件配对是唯一已验证可用的路径。**
+
+### 已实测的事实 (T906G / IMX390 / MAX9295A + MAX9296A / bus 9)
+
+```
+road = /dev/video1 = twgmsl 9-002a
+wide = /dev/video0 = twgmsl 9-0028
+两路同一颗 MAX9296A (组 0)
+ser DEV_ID=0x91, des DEV_ID=0x94
+```
+
+寄存器层面 FSYNC 相关配置**看着是到位的**:
+
+```
+des 0x02b0=0x83 / 0x02b1=0xa7    GPIO 透传
+des 0x02c2=0x83 / 0x02c3=0xa6    MFP 输入 + passthrough
+ser 0x02d3=0x8c / 0x02d5=0xc7 / 0x02d6=0x8c / 0x02d8=0xc7
+des 0x0013=0xfa (bit3 LOCKED) / 0x0308=0x61 (PLL)
+```
+
+但**相位跨初始化不可复现**:
+
+| 初始化方式 | wide-road 偏置 (并行测得) |
+|---|---|
+| 服务模式第一次 | +725 / +747 / +763 us (同一次会话内) |
+| bring 后重启 | -4406 us |
+| 服务模式重启 ×2 | -4391 / -4128 us |
+
+同一次会话内 MAD 只有 0~1 us、帧率完全一致 (33330.0 us 周期, sigma<0.5us)。
+这说明**两路共享同一时钟源 (同颗 des 分发参考时钟), 帧率被锁死**, 但绝对相位随初始化跳变约 5 ms。
+**真正的 FSYNC 同步应该给出跨初始化可复现的固定偏置 (us 级)。**
+
+### 由此钉死的规则
+
+1. **不要默认开 `trigmode=trigger`**。实测 `trigmode=trigger` + `tw_camera_cfg bring`
+   与 `no_trigger` 写入的主要 FSYNC 寄存器无差异, 且没有产生可复现的共同曝光相位。
+   在脉冲源/主从角色确认之前打开它, 只会把未验证状态传播到所有分支。
+2. **不要因为"单次 MAD 很小"就收紧 modeld 配对**。`MAX_FRAME_SKEW=2` /
+   `TOLERANCE_NS=120ms` 是 free-run 下的必要容差, 不是待优化的失败值。
+   只有 verdict 判定偏置可复现 (极差 <100us) 之后, 才允许新增严格模式。
+3. **road/wide 必须落在同一组** (`9-0028` + `9-002a`)。跨组 (如 wide 换 `10-0028`)
+   时 des 内 MFP 透传物理上不可能成立, 不要在这条路径上花时间。
+4. **`tw_camera_cfg` 会覆盖寄存器**。任何手工 enable 都活不过下一次 bring/重启。
+   如果将来要固化, 正确位置是 ini 的 `trigmode` 字段 (固件内置 T906G+IMX390 触发表),
+   而不是启动脚本里补 i2c 写。
+5. **V4L2 timestamp 不是传感器真实 SOF**。`v4l2_dmabuf_camera.py` 用
+   `CLOCK_BOOTTIME at DQBUF` 是为了修正 twgmsl 时钟域 (实测快 ~36s), 属于正确回退;
+   但它测不出真实曝光时刻。相位结论最终要靠光学 spinner 或示波器确认。
+
+### 诊断工具
+
+`tools/stereo_sync_probe.py` (随 apply 安装到目标树的 `tools/`):
+
+```bash
+# 寄存器判读 (只读, 不需要停栈)
+python3 tools/stereo_sync_probe.py regs
+
+# 单次相位 (需相机空闲: 停 manager/camerad, 关掉 gst 预览)
+python3 tools/stereo_sync_probe.py skew --json /tmp/s1.json
+
+# 重启 tw_camera_cfg 后再测, 然后判同步
+python3 tools/stereo_sync_probe.py skew --json /tmp/s2.json
+python3 tools/stereo_sync_probe.py verdict /tmp/s1.json /tmp/s2.json
+```
+
+`verdict` 退出码: 0=偏置可复现(疑似真同步) 2=部分复现 3=free-run。
+**只看单次 skew 的 MAD 会得出错误结论** —— 共用时钟的 free-run 也能做到 MAD<1us。
+
+### 待确认 (挡住硬件同步的最后一层)
+
+- 模组内 MAX9295A MFP7 是否真接到 IMX390 XVS (公开资料标注 MFP7 控制 Frame Sync,
+  但需要本批模组原理图或厂商确认)
+- 两颗 serializer 谁是 master: 主相机自产 XVS 透传, 还是等外部 FSYNC 输入
+  (若是后者, 当前没有任何脉冲源, 所以两路只能 free-run)
+- 需要示波器看 MFP7/XVS 是否真有波形
+
+在以上确认之前, 双目按"软件配对"运行, 这是当前正确且唯一可用的状态。
+
 ## 环境变量清单
 
 | 变量 | 默认 | 作用 |
