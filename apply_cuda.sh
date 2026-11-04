@@ -111,6 +111,27 @@ install_file "$MODELD_KIT/tensorrt_runner.py" "$MODELD_KIT_DST/runners/tensorrt_
 install_file "$MODELD_KIT/cuda_transform.cu" "$MODELD_KIT_DST/transforms/cuda_transform.cu"
 install_file "$MODELD_KIT/cuda_transform.h" "$MODELD_KIT_DST/transforms/cuda_transform.h"
 
+echo "Installing stateful TRT runner (optional, 参考实现)..."
+# 状态模型 (cinque-v3 等新代) 用设备驻留乒乓缓冲跑 TRT; 当前 split 模型用不到。
+# 目标树已有 stateful_model_state.py 时自动装, 否则跳过 (不干扰现有链路)。
+STATEFUL_DST="$MODELD_KIT_DST"
+if [ -d "$REPO_ROOT/openpilot/sunnypilot/modeld_v2" ]; then
+  STATEFUL_DST="$REPO_ROOT/openpilot/sunnypilot/modeld_v2"
+fi
+if [ -f "$REPO_ROOT/openpilot/selfdrive/modeld/stateful_model_state.py" ] || [ -f "$REPO_ROOT/selfdrive/modeld/stateful_model_state.py" ]; then
+  for f in stateful_trt_runner.py tensorrt_policy_runner.py; do
+    if [ -f "$STATEFUL_DST/$f" ] && grep -q "StatefulTensorRTPolicyRunner" "$STATEFUL_DST/$f" 2>/dev/null; then
+      echo "  - $f 已装, 不动"
+    else
+      [ -f "$STATEFUL_DST/$f" ] && cp -f "$STATEFUL_DST/$f" "$STATEFUL_DST/$f.orig_local" 2>/dev/null || true
+      install_file "$MODELD_KIT/stateful/$f" "$STATEFUL_DST/$f"
+      echo "  - $f 已装 (stateful runner 参考实现)"
+    fi
+  done
+else
+  echo "  - 目标树无 stateful_model_state.py, 跳过 stateful runner (当前模型用不到)"
+fi
+
 echo "Installing V4L2/VIC camera adapter..."
 CAMERA_KIT="$OVERLAY_DIR/kits/camerad"
 # 布局检测以目标 fork 实际目录为准 (不猜 new/old):
