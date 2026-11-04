@@ -51,6 +51,7 @@ source .venv/bin/activate && scons -j8 common/         # 标定组件改了 para
 | 7 | **Panda 固件/协议统一** | `/data/openpilot/panda_版本核对/`（设备侧脚本） | 不进 overlay，运行在 `/data/openpilot` | 让所有分支共用同一份 panda 固件与协议，**不再来回刷固件** |
 | 8 | **master-c3 收口补丁** | `patch_master_c3.py`（apply_cuda.sh 末尾自动调用） | SConstruct / `launch_chffrplus.sh` / `launch_env.sh` / `pc/hardware.h` / `ui/onroad/cameraview.py` / `manager/process_config.py` / `ui/sunnypilot/layouts/settings/developer.py` | apply 覆盖不到的 carrot 系 AGX 改动（HOME/PARAMS_ROOT、树内 .venv、AGX env 默认、get_voltage/current、NV12 `.rg`、webcamerad restart_if_crash、开发者页标定按钮接线）。**按锚点判断，锚点不在就 SKIP，对别的 fork 无副作用** |
 | 9 | **摄像头标定面板（UI 按钮）** | `kits/ui/calibration_panel.py` + `tools/patch_translations.py` | `selfdrive/ui/sunnypilot/calibration_panel.py`（4 个按钮接进开发者页；中文词条按 msgid 注入 `app_zh-CHS.po`） | 把 sp Qt 版的 4 个标定按钮搬到新 UI：FCAM 扫描标定 / FCAM 实时标定 / 宽角(Wide)标定 / 查看标定。配套 `kits/camerad/camerad.py` 的 WideCalibMode 换流 |
+| 10 | **分支适配补丁层 + 模型目录动态注册** | `kits/patch/`（`detect_fork.py` / `cuda_adapter.py` / `install_patch.py`）、`gpu_backend/models/registry.py` | `<pkg>/selfdrive/modeld/cuda_adapter.py` + `sitecustomize.py` 钩子 | 不再"整文件覆盖碰运气"：import 时注入 ModelState→CUDA/TRT（失败回退 tinygrad）+ camerad→V4L2；模型目录自动扫描/有序选择/失败冷却。非 stock fork（FrogPilot 等）只走补丁层 |
 
 > 6/7 是本轮新增。7 不落在 overlay 仓库里，因为它是"跨分支运维脚本"，作用于
 > `/data/openpilot/*` 三个仓库（panda 固件字节按 gitignore 属构建产物，不适合放进 overlay 仓库）。
@@ -326,6 +327,10 @@ bash /data/openpilot/panda_版本核对/panda_boot_check.sh
   轮询 `WideCalibMode` + 互换内参 + 输出 msg/stream 打到对侧。
   **未实测**：换流的真机验证要有相机 + 独占 msgq（见 §4 第 1/3 步的前置条件）。
 - **模型引擎与 libcuda_transform.so**：属设备侧产物，overlay 不带，按 §2 自己编。
+- **FrogPilot / 非 stock fork 的完整适配**：补丁层（§8）会注入 ModelState→CUDA 与
+  camerad→V4L2，但 FrogPilot 0.9.7 的 ModelState 是 `(context, model, model_version)`
+  形状 —— adapter 对它只记录不支持、不碰。要真正跑起来还需一个 FrogPilot 专用
+  adapter（接入点：`ModelState.run`），这属于下一阶段（详见 kits/patch/README.md）。
 - 运行 `wide_calibrator.py` 需要 `cv2`：dp 的 venv 和系统 python3 有，cuda/ajouatom 的 venv 没有
   （用系统 python3 跑，或自行 `pip install opencv-python`）。
 
@@ -341,3 +346,82 @@ bash /data/openpilot/panda_版本核对/panda_boot_check.sh
 | 引擎加载失败 `Platform specific tag mismatch` | 引擎不是在 AGX Orin 上编的（必须 sm_87 + 同 TensorRT 版本） |
 | 切分支后 panda 又开始刷固件 | 跑 `panda_维护.sh`（谁单独重编过固件，签名就会不一致） |
 | 标定脚本说 `No rlog files found` | 需要 `--dir` 指向"子目录里各含 rlog.zst"的目录，见 §3.2 第 3 步 |
+| 切了模型但 modeld 还在跑旧的 | 选择顺序是 `MODEL_NAME` env > `models/.trt_order` > Params `Model` > 手工清单 → 扫描目录按名排序；`--diagnose` 看 selected 字段 |
+| 某个模型一直起不来、modeld 反复重启 | 初始化失败的 bundle 会在 `models/.trt_failed` 里被冷却 900s 跳过；重编引擎（mtime 变新）自动复活，或手工删该 json |
+
+---
+
+## 8. 分支适配补丁层（kits/patch）
+
+解决的问题：过去适配新分支只能"整文件覆盖 modeld.py / camerad.py"，一旦对方 fork 的
+这两个文件带自己的业务逻辑（FrogPilot 的模型注册与 CLContext、StarPilot 的 bundle
+切换），覆盖 = 静默删功能。现在改成**按 fork 形状分流**。
+
+### 8.1 三条路线
+
+| fork 形状（`detect_fork.py` 判定，纯 AST 不导入） | 示例 | apply_cuda.sh 行为 |
+|---|---|---|
+| `sunnypilot-stock`：`ModelState.__init__(cam_w, cam_h, chestnut...)` | 新 sunnypilot、master-c3、StarPilot | 整文件覆盖 + 补丁层 |
+| `frogpilot`：`__init__(context, model, model_version)` | FrogPilot 0.9.7、egpu(cp-cuda-main) | **只装补丁层**，不动 modeld.py |
+| `unknown` | sunnypilot-cuda（老布局） | 只装补丁层 |
+
+`apply_cuda.sh` 会自动打印 `fork modeld shape: <kind>`，并据此跳过整文件覆盖
+（`- fork=xxx: 跳过整文件 modeld 覆盖, 交给补丁层`）。
+
+### 8.2 补丁层做什么
+
+```text
+sitecustomize.py (解释器启动时自动 import)
+  -> cuda_adapter.apply()
+       hook: <fork>.modeld        -> ModelState.__init__ 包一层 -> GpuModelState
+                                     失败一律回退原 tinygrad 类, 并记 models/.trt_failed
+       hook: <fork>.webcam.camerad -> Camera -> v4l2_dmabuf_camera.Camera
+```
+
+三条硬规则（照搬 eGPU 补丁层的纪律）：
+
+1. 启动时不 import 被补丁的模块（用 `patch_after_import`）——modeld 必须先设好
+   tinygrad 设备；实测 `apply()` 后新增导入为 **0 个** fork 模块；
+2. 一个 patch 只解决一件事，幂等，失败静默——本模块在设备上每个 python 进程里跑；
+3. `OPENPILOT_CUDA_PATCH=0` 全关，`DISABLE_CUDA_BACKEND=1` 钩子挂着但回退原类。
+
+### 8.3 模型目录动态注册
+
+`gpu_backend/models/registry.py` 从"手工三家 profile"扩成两层：手工 profile（保留各家
+engine 绑定名的怪癖）+ 目录扫描。因此新模型**编完放进 `models/<Name>/` 就能用**，不用改代码。
+
+- 扫描：`models/<Name>/{driving_*_metadata.pkl, driving_*_fp16.plan}`；shape/slices/时域
+  窗口全从 metadata 读，缺引擎的 bundle 仍列出来但标 `ready=false`（StarPilot 语义）；
+- 选择：显式名 → `MODEL_NAME` → `models/.trt_order` → Params `Model` → 手工清单 →
+  扫描目录按名排序。显式名是"偏好"不是"约束"（不会因为选中的引擎没编好就掉回 tinygrad）；
+  `resolve_profile(name, strict=True)` 才是"就它或没有"；
+- 失败记忆：`models/.trt_failed`（冷却 900s，`TRT_FAIL_COOLDOWN_S` 可调；引擎 mtime 变新
+  即视为已重编，自动重试）；
+- 逃生门：`DISABLE_GPU_REGISTRY_SCAN=1` 退回只认手工清单。
+
+### 8.4 三条常用命令
+
+```bash
+# 1. 单独装/更新补丁层 (apply_cuda.sh 已自动调用, 幂等)
+python3 kits/patch/install_patch.py <树根>
+
+# 2. 看这台机器的模型就绪状况 (选了谁 / 谁缺引擎 / 谁被冷却)
+PYTHONPATH=<树根> python3 <树根>/<pkg>/selfdrive/modeld/cuda_adapter.py --diagnose <树根>
+#   或直接: PYTHONPATH=<树根> python3 kits/patch/cuda_adapter.py --diagnose <树根>
+
+# 3. 补丁层自身的回归测试 (27 例)
+python3 -m unittest discover -s kits/patch/tests -v
+```
+
+### 8.5 实测状态（2026-11-04，本机）
+
+| 树 | detect_fork | diagnose |
+|---|---|---|
+| master-c3 | sunnypilot-stock | supercombo / TGC / FiletOFish ready，supercombo selected；BigCombo 空目录未就绪 |
+| sunnypilot | sunnypilot-stock | BigCombo selected，CD210 / FiletOFish ready，Dark_Souls_2 可见但缺引擎 |
+| FrogPilot 0.9.7 | frogpilot (thneed) | 不碰（需专用 adapter，接入点 `ModelState.run`） |
+| egpu | frogpilot 形状 (cuda-trt) | 不碰 |
+| sunnypilot-cuda | unknown | 不碰 |
+
+> **未实测**：真机 modeld 走补丁层后 CUDA 是否接管、V4L2 相机是否生效——需要相机 +
+> 独占 msgq 的台架条件（§4）；本次只验证了判定、注入位置、幂等、扫描与选择逻辑。

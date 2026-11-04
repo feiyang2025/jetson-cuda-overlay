@@ -60,15 +60,43 @@ else
   MD="$REPO_ROOT/selfdrive/modeld"
 fi
 if [ -f "$MD/modeld.py" ]; then
-  grep -q "TRT_LOAD_ATTEMPTS" "$MD/modeld.py" && pass "modeld.py TRT 兜底闭环在" || fail "modeld.py 非兜底闭环版 (缺 TRT_LOAD_ATTEMPTS)"
-  grep -q "BigComboTrtUnavailable" "$MD/modeld_bigcombo.py" 2>/dev/null && pass "modeld_bigcombo.py BigCombo 降级闭环在" || fail "modeld_bigcombo.py 缺 BigComboTrtUnavailable"
+  if [ -f "$MD/cuda_adapter.py" ]; then
+    # 补丁层路线 (非 stock fork / 上游新结构): 不覆盖 modeld.py, 判据换成 adapter 是否就位。
+    pass "modeld.py 走补丁层 (cuda_adapter.py 在, 不覆盖上游文件)"
+  else
+    grep -q "TRT_LOAD_ATTEMPTS" "$MD/modeld.py" && pass "modeld.py TRT 兜底闭环在" || fail "modeld.py 非兜底闭环版 (缺 TRT_LOAD_ATTEMPTS, 也没装补丁层)"
+  fi
+  if [ -f "$MD/modeld_bigcombo.py" ]; then
+    grep -q "BigComboTrtUnavailable" "$MD/modeld_bigcombo.py" && pass "modeld_bigcombo.py BigCombo 降级闭环在" || warn "modeld_bigcombo.py 缺 BigComboTrtUnavailable (补丁层路线可忽略)"
+  fi
 else
   fail "selfdrive/modeld/modeld.py 不存在"
 fi
-[ -f "$MD/runners/tensorrt_runner.py" ] && pass "tensorrt_runner.py 在" || fail "tensorrt_runner.py 缺失"
+if [ -f "$MD/runners/tensorrt_runner.py" ] || [ -d "$REPO_ROOT/openpilot/sunnypilot/modeld_v2/gpu_backend" ]; then
+  pass "TRT 运行器在 (runners/tensorrt_runner.py 或 gpu_backend/trt_runner.py)"
+else
+  fail "tensorrt_runner.py / gpu_backend 都缺失"
+fi
 [ -f "$MD/transforms/cuda_transform.cu" ] && pass "cuda_transform.cu 在" || fail "cuda_transform.cu 缺失"
 [ -f "$MD/transforms/libcuda_transform.so" ] && pass "libcuda_transform.so (设备侧产物)" || warn "libcuda_transform.so 未编译 (需 nvcc 编)"
 [ -d "$MD/models" ] && ls "$MD/models"/*/ 2>/dev/null | grep -q "\.plan" && pass "有 .plan 引擎" || warn "models/ 下无 .plan (需 trtexec 编)"
+
+echo "[分支适配补丁层 + 模型目录动态注册]"
+if [ -f "$MD/cuda_adapter.py" ]; then
+  pass "cuda_adapter.py 在 ($MD)"
+  grep -q "cuda_adapter" "$REPO_ROOT/sitecustomize.py" 2>/dev/null \
+    && pass "sitecustomize.py 已接钩子" \
+    || warn "sitecustomize.py 未接 adapter (本树可能用自研钩子 cuda_patches, 或需重跑 install_patch.py)"
+  grep -q "def scan_profiles\|def resolve_profile" "$REPO_ROOT/openpilot/sunnypilot/modeld_v2/gpu_backend/models/registry.py" 2>/dev/null \
+    && pass "动态 registry (scan_profiles/resolve_profile) 在" \
+    || warn "registry.py 仍是硬编码版 (更新 overlay 后重跑 apply_cuda.sh)"
+  FAILED="$MD/models/.trt_failed"
+  if [ -f "$FAILED" ]; then
+    warn "有模型失败标记: $FAILED (重启循环保护生效中; 重编引擎或删该文件可重试)"
+  fi
+else
+  warn "未装补丁层 cuda_adapter.py (自定义 fork 可只装它: kits/patch/install_patch.py)"
+fi
 
 echo "[SConstruct JETSON]"
 grep -q "__JETSON__" "$REPO_ROOT/SConstruct" 2>/dev/null && pass "-D__JETSON__ 在 SConstruct" || warn "SConstruct 缺 -D__JETSON__ (零拷贝 CUDA 映射不生效)"

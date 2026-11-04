@@ -83,6 +83,20 @@ else
   echo "  - trt_c_api.so not bundled in overlay (device-side artifact); skip copy (ensure the target tree already provides it)"
 fi
 
+# Fork 形状判定 (纯 AST, 不导入): 只有 sunnypilot-stock 形状的 ModelState 才能整文件
+# 覆盖; FrogPilot 等自带模型注册/CLContext 逻辑的分支一律只装补丁层, 否则会把它们
+# 自己的 modeld 业务逻辑覆盖掉 (kits/patch/README.md 有判定表)。
+FORK_KIND="$(python3 "$OVERLAY_DIR/kits/patch/detect_fork.py" "$REPO_ROOT" 2>/dev/null \
+  | sed -E 's/^fork=([^ ]+).*/\1/')"
+FORK_KIND="${FORK_KIND:-unknown}"
+echo "[apply_cuda] fork modeld shape: $FORK_KIND"
+if [ "$FORK_KIND" = "sunnypilot-stock" ]; then
+  WHOLE_MODELD=1
+else
+  WHOLE_MODELD=0
+  echo "  - fork=$FORK_KIND: 跳过整文件 modeld 覆盖, 交给补丁层 (kits/patch)"
+fi
+
 echo "Installing modeld kit (kits/modeld, TRT 兜底闭环)..."
 MODELD_KIT="$OVERLAY_DIR/kits/modeld"
 # 布局检测: 新布局 modeld 在 openpilot/selfdrive/modeld, 老布局在根 selfdrive/modeld
@@ -93,6 +107,7 @@ else
 fi
 mkdir -p "$MODELD_KIT_DST/runners" "$MODELD_KIT_DST/transforms"
 for f in modeld.py modeld_bigcombo.py fill_model_msg.py; do
+  [ "$WHOLE_MODELD" = "1" ] || { echo "  - $f: fork 非 stock, 跳过整文件覆盖 (补丁层接手)"; continue; }
   # 按文件分开检测; 文件不存在 → 直接装 kit 版 (sunnypilot 新 master 无 modeld_bigcombo.py)
   # fill_model_msg.py: 上游 9月新同步版是 11 参(+ fill_driving_model_data), 而两个调用点仍是 13 参
   # 老写法 → 树内半同步必崩 TypeError; kit 版=新 API + get_action_from_plan 共享 helper
@@ -228,7 +243,15 @@ else
 fi
 
 echo "Patching modeld.py..."
-python3 "$OVERLAY_DIR/patch_modeld.py" "$MODELD_PY"
+if [ "$WHOLE_MODELD" = "1" ]; then
+  python3 "$OVERLAY_DIR/patch_modeld.py" "$MODELD_PY"
+else
+  echo "  - 跳过 _make_model 注入 (fork 非 stock, 补丁层 cuda_adapter 在 import 时生效)"
+fi
+
+echo "Installing branch-adaptive patch layer (kits/patch)..."
+python3 "$OVERLAY_DIR/kits/patch/install_patch.py" "$REPO_ROOT" || \
+  echo "[apply_cuda] WARN patch layer install failed (继续, 后续请手动安装)"
 
 echo "Installing CH347 (USB-I2C IMU) daemon..."
 install_file "$OVERLAY_DIR/openpilot/system/sensord/ch347t.cc" "$SENSORD_DIR/ch347t.cc"
