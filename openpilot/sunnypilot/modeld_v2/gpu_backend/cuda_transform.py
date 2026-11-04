@@ -78,7 +78,9 @@ class CudaTransform:
     output = self._library.cuda_transform_execute(
       ctypes.byref(self._state(camera)), ctypes.c_void_p(ptr),
       frame.width, frame.height, frame.stride, frame.uv_offset,
+      data.nbytes,  # in_size: total bytes of input buffer (kernel stages host→device)
       projection.astype(np.float32, copy=False).ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+      0,            # input_is_device=0: ptr 是 host/SHM 映射, 由 kernel 自己 staging
     )
     if not output:
       raise RuntimeError("cuda_transform_execute returned null")

@@ -1,4 +1,5 @@
 #include "cuda_transform.h"
+#include <cstdio>
 
 // ---- Constants (matching OpenCL transform.cl) ----
 #define INTER_BITS 5
@@ -143,7 +144,62 @@ __global__ void copy_kernel(const uint8_t *in, uint8_t *out,
     out[gid + out_offset] = in[gid + in_offset];
 }
 
+// ---- matches common/mat.h matmul3 exactly (bit-identical float order) ----
+static inline void matmul3f(float out[9], const float a[9], const float b[9])
+{
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) {
+            float v = 0.0f;
+            for (int k = 0; k < 3; k++) {
+                v += a[r*3+k] * b[k*3+c];
+            }
+            out[r*3+c] = v;
+        }
+    }
+}
+
+// ---- matches common/mat.h transform_scale_buffer exactly ----
+// Scales the input and output space of a transformation matrix that assumes
+// pixel-center origin: in_pt = ( transform(out_pt/s + 0.5) - 0.5) * s
+static inline void transform_scale_buffer_f(float out[9], const float in[9], float s)
+{
+    float transform_out[9] = {
+        1.0f/s, 0.0f, 0.5f,
+        0.0f, 1.0f/s, 0.5f,
+        0.0f, 0.0f, 1.0f,
+    };
+
+    float transform_in[9] = {
+        s,  0.0f, -0.5f*s,
+        0.0f, s, -0.5f*s,
+        0.0f, 0.0f, 1.0f,
+    };
+
+    float tmp[9], res[9];
+    matmul3f(tmp, in, transform_out);
+    matmul3f(res, transform_in, tmp);
+    for (int i = 0; i < 9; i++) out[i] = res[i];
+}
+
 // ---- C++ API ----
+
+// Defensive: check every CUDA call and report the true failure origin instead
+// of a silent NULL/dangling state that later surfaces as a confusing rc=700.
+#define CUDA_CHECK_VOID(expr) do { \
+    cudaError_t _e = (expr); \
+    if (_e != cudaSuccess) { \
+        fprintf(stderr, "[cuda_transform] %s failed: %s\n", #expr, cudaGetErrorString(_e)); \
+        return; \
+    } \
+} while (0)
+
+#define CUDA_CHECK_PTR(expr) do { \
+    cudaError_t _e = (expr); \
+    if (_e != cudaSuccess) { \
+        fprintf(stderr, "[cuda_transform] %s failed: %s\n", #expr, cudaGetErrorString(_e)); \
+        return nullptr; \
+    } \
+} while (0)
 
 extern "C" {
 
@@ -152,28 +208,36 @@ void cuda_transform_init(CUDATransformState *s, int width, int height, int tempo
     s->width = width;
     s->height = height;
     s->temporal_skip = temporal_skip;
+    s->in_size = 0;
+    s->d_in = nullptr;
 
     int uv_size = (width / 2) * (height / 2);
     s->frame_size = width * height * 3 / 2;  // MODEL_FRAME_SIZE
     s->buf_size = s->frame_size * 2;
 
+    // Clear any sticky CUDA error from earlier stages (tinygrad/TRT init)
+    // so allocation failures below are reported from their true origin.
+    cudaGetLastError();
+
     // Allocate device buffers
-    cudaMalloc(&s->d_y, width * height);
-    cudaMalloc(&s->d_u, uv_size);
-    cudaMalloc(&s->d_v, uv_size);
+    CUDA_CHECK_VOID(cudaMalloc(&s->d_y, width * height));
+    CUDA_CHECK_VOID(cudaMalloc(&s->d_u, uv_size));
+    CUDA_CHECK_VOID(cudaMalloc(&s->d_v, uv_size));
 
     // Temporal ring buffer: holds (temporal_skip + 1) frames
-    cudaMalloc(&s->d_img_buffer, (temporal_skip + 1) * s->frame_size);
+    CUDA_CHECK_VOID(cudaMalloc(&s->d_img_buffer, (temporal_skip + 1) * s->frame_size));
 
     // Output: 2 frames concatenated
-    cudaMalloc(&s->d_output, s->buf_size);
-
-    // Input staging: full source NV12 frame (1920x1080x3/2)
-    cudaMalloc(&s->d_input, 1920 * 1080 * 3 / 2);
+    CUDA_CHECK_VOID(cudaMalloc(&s->d_output, s->buf_size));
 
     // Projection matrices
-    cudaMalloc(&s->d_proj_y, 9 * sizeof(float));
-    cudaMalloc(&s->d_proj_uv, 9 * sizeof(float));
+    CUDA_CHECK_VOID(cudaMalloc(&s->d_proj_y, 9 * sizeof(float)));
+    CUDA_CHECK_VOID(cudaMalloc(&s->d_proj_uv, 9 * sizeof(float)));
+
+    // Zero the ring buffer + output so the first execute() never emits
+    // uninitialized GPU memory as "history" frames.
+    CUDA_CHECK_VOID(cudaMemset(s->d_img_buffer, 0, (size_t)(temporal_skip + 1) * s->frame_size));
+    CUDA_CHECK_VOID(cudaMemset(s->d_output, 0, s->buf_size));
 
     s->initialized = 1;
 }
@@ -186,53 +250,44 @@ void cuda_transform_destroy(CUDATransformState *s)
     cudaFree(s->d_v);
     cudaFree(s->d_img_buffer);
     cudaFree(s->d_output);
-    cudaFree(s->d_input);
     cudaFree(s->d_proj_y);
     cudaFree(s->d_proj_uv);
+    cudaFree(s->d_in);
     s->initialized = 0;
 }
 
 uint8_t* cuda_transform_execute(CUDATransformState *s,
-                                 const uint8_t *input_nv12,
-                                 int frame_width, int frame_height,
-                                 int frame_stride, int frame_uv_offset,
-                                 const float *projection)
+                                  const uint8_t *input_nv12,
+                                  int frame_width, int frame_height,
+                                  int frame_stride, int frame_uv_offset,
+                                  int in_size,
+                                  const float *projection,
+                                  int input_is_device)
 {
     int w = s->width, h = s->height;
     int uv_size = (w / 2) * (h / 2);
     int frame_size = s->frame_size;
 
+    // Stage host input to device. On Orin (driver >= 580), host memory
+    // registered via cuMemHostRegister is not readable from kernels, so
+    // host inputs must be copied to the device first.
+    const uint8_t *src = input_nv12;
+    cudaGetLastError();  // clear sticky error so kernel failures below are
+                         // reported from their true origin
+    if (!input_is_device) {
+        if (in_size > s->in_size) {
+            if (s->d_in) cudaFree(s->d_in);
+            CUDA_CHECK_PTR(cudaMalloc(&s->d_in, in_size));
+            s->in_size = in_size;
+        }
+        CUDA_CHECK_PTR(cudaMemcpy(s->d_in, input_nv12, in_size, cudaMemcpyHostToDevice));
+        src = s->d_in;
+    }
+
     // Upload projection matrix
-    // Build half-resolution projection for UV with the same center-preserving
-    // semantics as openpilot's transform_scale_buffer(P, 0.5):
-    //   in_pt = ( P(out_pt/0.5 + 0.5) - 0.5 ) * 0.5
-    // => proj_uv = Tin @ (P @ Tout), with
-    //    Tout = [[2,0,0.5],[0,2,0.5],[0,0,1]], Tin = [[0.5,0,-0.25],[0,0.5,-0.25],[0,0,1]]
-    // (linear part preserved, only translation is scaled — NOT a plain *0.5)
-    static const float Tin[9] = {0.5f,  0.0f, -0.25f,
-                                 0.0f,  0.5f, -0.25f,
-                                 0.0f,  0.0f,  1.0f};
-    static const float Tout[9] = {2.0f,  0.0f,  0.5f,
-                                  0.0f,  2.0f,  0.5f,
-                                  0.0f,  0.0f,  1.0f};
+    // Build half-resolution projection for UV (matches common/mat.h transform_scale_buffer)
     float proj_uv[9];
-    float p_tout[9];
-    for (int r = 0; r < 3; r++) {
-        for (int c = 0; c < 3; c++) {
-            p_tout[r * 3 + c] = projection[r * 3 + 0] * Tout[0 * 3 + c] +
-                                projection[r * 3 + 1] * Tout[1 * 3 + c] +
-                                projection[r * 3 + 2] * Tout[2 * 3 + c];
-        }
-    }
-    for (int r = 0; r < 3; r++) {
-        for (int c = 0; c < 3; c++) {
-            proj_uv[r * 3 + c] = Tin[r * 3 + 0] * p_tout[0 * 3 + c] +
-                                 Tin[r * 3 + 1] * p_tout[1 * 3 + c] +
-                                 Tin[r * 3 + 2] * p_tout[2 * 3 + c];
-        }
-    }
-    // Copy full NV12 frame into device staging (1280*960*3/2 = frame_max)
-    cudaMemcpy(s->d_input, input_nv12, 1920 * 1080 * 3 / 2, cudaMemcpyHostToDevice);
+    transform_scale_buffer_f(proj_uv, projection, 0.5f);
     cudaMemcpy(s->d_proj_y, projection, 9 * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(s->d_proj_uv, proj_uv, 9 * sizeof(float), cudaMemcpyHostToDevice);
 
@@ -241,7 +296,7 @@ uint8_t* cuda_transform_execute(CUDATransformState *s,
         dim3 block(16, 16);
         dim3 grid((w + 15) / 16, (h + 15) / 16);
         warp_perspective_kernel<<<grid, block>>>(
-            s->d_input,
+            src,
             frame_stride,        // src_row_stride
             1,                   // src_px_stride (Y: stride=1)
             0,                   // src_offset
@@ -261,7 +316,7 @@ uint8_t* cuda_transform_execute(CUDATransformState *s,
         dim3 block(16, 16);
         dim3 grid(((w/2) + 15) / 16, ((h/2) + 15) / 16);
         warp_perspective_kernel<<<grid, block>>>(
-            s->d_input,
+            src,
             frame_stride,        // src_row_stride
             2,                   // src_px_stride (UV: stride=2)
             frame_uv_offset,     // src_offset (U offset)
@@ -281,7 +336,7 @@ uint8_t* cuda_transform_execute(CUDATransformState *s,
         dim3 block(16, 16);
         dim3 grid(((w/2) + 15) / 16, ((h/2) + 15) / 16);
         warp_perspective_kernel<<<grid, block>>>(
-            s->d_input,
+            src,
             frame_stride,        // src_row_stride
             2,                   // src_px_stride
             frame_uv_offset + 1, // src_offset (V offset = U offset + 1)
@@ -297,11 +352,11 @@ uint8_t* cuda_transform_execute(CUDATransformState *s,
     }
 
     // ---- Step 4: Shift temporal ring buffer ----
-    // Copy d_img_buffer[1..temporal_skip] → d_img_buffer[0..temporal_skip-1].
-    // Increasing order: source slots (i+1) are still intact when copied, so the
-    // time history [slot0 .. slot_(skip-1)] is preserved and slot[skip] holds the
-    // previous current frame. (Decreasing order would clobber every slot with
-    // the old slot[skip].)
+    // Copy d_img_buffer[1..temporal_skip] → d_img_buffer[0..temporal_skip-1]
+    // IMPORTANT: iterate i ASCENDING (0..temporal_skip-1). Each copy reads
+    // source slot (i+1) and writes slot i; slot (i+1) is only overwritten by
+    // iteration (i+1), which runs AFTER iteration i, so sources stay intact.
+    // (Descending order corrupts history: every slot becomes the newest frame.)
     for (int i = 0; i < s->temporal_skip; i++) {
         int total_work = frame_size;
         int block_size = 256;
@@ -372,7 +427,10 @@ uint8_t* cuda_transform_execute(CUDATransformState *s,
         );
     }
 
-    cudaDeviceSynchronize();
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[cuda_transform] execute: kernel failure: %s\n", cudaGetErrorString(err));
+    }
     return s->d_output;
 }
 

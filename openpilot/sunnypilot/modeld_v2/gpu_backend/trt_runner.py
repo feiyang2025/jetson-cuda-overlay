@@ -106,6 +106,10 @@ class TrtRunner:
     self.num_outputs = self._lib.trt_engine_num_outputs(self._handle)
     self.input_names = []
     self.input_shapes = []
+    # dtype 直接从 C API 的 trt_engine_input_dims 拿 (真实值, 不依赖 python tensorrt):
+    # vision 输入是 uint8(5), policy 输入是 float16(1), 之前当全 fp16 会把视觉数据按
+    # 2 字节重解导致垃圾输入。
+    self._input_dtypes: dict[str, np.dtype] = {}
     for i in range(self.num_inputs):
       name = self._lib.trt_engine_input_name(self._handle, i).decode()
       self.input_names.append(name)
@@ -114,6 +118,7 @@ class TrtRunner:
       dt = ctypes.c_int()
       self._lib.trt_engine_input_dims(self._handle, i, ctypes.byref(ndim), dims, ctypes.byref(dt))
       self.input_shapes.append(tuple(dims[:ndim.value]))
+      self._input_dtypes[name] = _TRT_DTYPE_TO_NP.get(dt.value, np.float16)
     self.output_names = [self._lib.trt_engine_output_name(self._handle, i).decode() for i in range(self.num_outputs)]
     dims_out = (ctypes.c_int64 * 8)()
     nd = self._lib.trt_engine_output_shape(self._handle, 0, dims_out)
@@ -121,24 +126,6 @@ class TrtRunner:
     dtype_val = self._lib.trt_engine_output_dtype(self._handle, 0)
     self.output_dtype_np = _TRT_DTYPE_TO_NP.get(dtype_val, np.float32)
     self.output_nbytes = int(np.prod(self.output_shape)) * np.dtype(self.output_dtype_np).itemsize
-    # Input bindings for this generation of fp16-native v2 models
-    # (Classic / FiletOFish / BigCombo drive-v2) are float16.  The C api
-    # does not expose an input-dtype getter, so introspect the plan with
-    # the python `tensorrt` module when present; otherwise assume fp16 and
-    # cast on copy (see __call__).
-    self._input_dtypes: dict[str, np.dtype] = {}
-    try:
-      import tensorrt as _trt
-      _logger = _trt.Logger(_trt.Logger.ERROR)
-      with open(engine_path, "rb") as _f:
-        _engine = _trt.Runtime(_logger).deserialize_cuda_engine(_f.read())
-      for i in range(_engine.num_io_tensors):
-        _n = _engine.get_tensor_name(i)
-        if _engine.get_tensor_mode(_n) == _trt.TensorIOMode.INPUT:
-          self._input_dtypes[_n] = np.dtype(_trt.nptype(_engine.get_tensor_dtype(_n)))
-    except Exception:
-      for name in self.input_names:
-        self._input_dtypes[name] = np.float16
     self.stream = ctypes.c_ulonglong()
     _check(self._cuda.cuStreamCreate(ctypes.byref(self.stream), 0))
     self.gpu_output = ctypes.c_ulonglong()

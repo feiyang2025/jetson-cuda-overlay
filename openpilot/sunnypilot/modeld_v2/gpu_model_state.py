@@ -299,12 +299,18 @@ class GpuModelState:
     return outputs
 
   def _split_vision_size(self) -> int:
+    # vision 输出总长必须取引擎实际输出 (v_out (1,632)): 不能累加 metadata slices,
+    # hidden_state 的 slice 是 (117,-3) 负 stop (输出末端 pad 前的 hidden 块),
+    # 直接相加会得到负数 → policy_output = raw[-3:] → parse reshape 炸。
+    runner = getattr(getattr(self.backend, "vision_runner", None), "output_shape", None)
+    if runner is not None:
+      return int(np.prod(runner))
     total = 0
     for s in self.profile.vision_slices.values():
       if s.stop is None:
         continue
       total += s.stop - s.start
-    return total
+    return max(total, 0)
 
   def get_action_from_model(self, model_output, prev_action, lat_action_t, long_action_t, v_ego):
     Plan = self._Plan
