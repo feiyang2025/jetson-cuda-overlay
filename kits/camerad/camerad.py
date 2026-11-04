@@ -24,6 +24,15 @@ except ImportError:
 # Venus 对齐输出: master-c3 系 modeld 按 get_nv12_info 对齐 stride 读输入, 必须对齐输出;
 # sp/cp 系 modeld 按紧密 stride 读. 默认 = 无 VisionStreamType(新代 msgq) 对齐; env CAM_STRIDE=aligned/tight 可强制
 _ALIGNED = (os.environ.get('CAM_STRIDE', 'auto') == 'aligned') or (os.environ.get('CAM_STRIDE', 'auto') == 'auto' and not _HAS_VST)
+
+# Venus 对齐 buffer 尺寸必须与消费侧 modeld 的 get_nv12_info 完全同源:
+# 那份公式末尾有 `size += align(width,512)*512` 的 kernel padding (1920 宽 = +1MB),
+# camerad 自己算的旧公式缺这一步, 会让 VisionIPC buffer 比 modeld 期望的小,
+# 且 1920 本来就是 128 的倍数时 stride==width 会误判成"不需要对齐"。
+try:
+  from openpilot.system.camerad.cameras.nv12_info import get_nv12_info as _get_nv12_info
+except ImportError:
+  _get_nv12_info = None
 try:
   from openpilot.cereal import messaging
 except ImportError:
@@ -248,11 +257,20 @@ class CudaUyvyConverter:
     self.H = height
     self.dst_stride = dst_stride if dst_stride is not None else width
     self.y_plane_rows = y_plane_rows if y_plane_rows is not None else height
-    if self.dst_stride != width:
-      # Venus 对齐 buffer 总大小 (与 master-c3 get_nv12_info 一致)
-      uvh = ((height // 2 + 15) // 16) * 16
-      s = self.dst_stride * self.y_plane_rows + self.dst_stride * uvh + 4096 + max(16 * 1024, 8 * self.dst_stride)
-      self.aligned_size = ((s + 4095) // 4096) * 4096
+    # 对齐判定不能只看 stride: 1920 本来就是 128 的倍数 (stride==width),
+    # 但 y_rows 仍是 1088 (align 32), buffer 仍是对齐尺寸 —— 只看 stride 会漏判,
+    # 导致 send 端发 tight 长度撞 VisionIPC 的 assert buf.len == len(data)。
+    self.aligned = (self.dst_stride != width) or (self.y_plane_rows != height)
+    if self.aligned:
+      if _get_nv12_info is not None:
+        # 与 modeld 消费侧同源 (含 kernel padding), 不能自己算
+        self.aligned_size = _get_nv12_info(width, height)[3]
+      else:
+        # Venus 对齐 buffer 总大小 (与 master-c3 get_nv12_info 一致)
+        uvh = ((height // 2 + 15) // 16) * 16
+        s = self.dst_stride * self.y_plane_rows + self.dst_stride * uvh + 4096 + max(16 * 1024, 8 * self.dst_stride)
+        s += ((width + 511) // 512) * 512 * 512
+        self.aligned_size = ((s + 4095) // 4096) * 4096
     else:
       self.aligned_size = None
     self.src_w = src_w      # 源 packed 有效区 (真实图像区, 1920x1080)
@@ -532,11 +550,16 @@ class Camerad:
       # 轮转周期 1s @20fps, 消除读写竞争撕裂; modeld/UI 慢时 camerad 限流而非撕裂。
       if _ALIGNED:
         # Venus 对齐布局 (master-c3 系 modeld 按 get_nv12_info stride 读): stride=align(w,128), y=align(h,32), uv=align(h/2,16)
-        _st = ((out_w + 127) // 128) * 128
-        _yh = ((out_h + 31) // 32) * 32
-        _uvh = ((out_h // 2 + 15) // 16) * 16
-        _size = _st * _yh + _st * _uvh + 4096 + max(16 * 1024, 8 * _st)
-        _size = ((_size + 4095) // 4096) * 4096
+        # 尺寸必须与 modeld 的 get_nv12_info 完全同源 (含 kernel padding, 1920 宽 +1MB),
+        # 否则 VisionIPC buffer 比消费侧小; 无该模块时才回退本地公式。
+        if _get_nv12_info is not None:
+          _st, _yh, _uvh, _size = _get_nv12_info(out_w, out_h)
+        else:
+          _st = ((out_w + 127) // 128) * 128
+          _yh = ((out_h + 31) // 32) * 32
+          _uvh = ((out_h // 2 + 15) // 16) * 16
+          _size = _st * _yh + _st * _uvh + 4096 + max(16 * 1024, 8 * _st)
+          _size = ((_size + 4095) // 4096) * 4096
         self.vipc_server.create_buffers_with_sizes(c.stream_type, 20, out_w, out_h, _size, _st, _st * _yh)
         print(f"[camerad] {c.msg_name}: aligned NV12 stride={_st} y_rows={_yh} size={_size}", flush=True)
       else:
