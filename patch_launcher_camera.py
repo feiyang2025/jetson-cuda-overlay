@@ -99,16 +99,21 @@ BLOCK = r'''  # ==== 相机驱动生命周期 + 单实例互斥 (2026-10-11, 参
     fi
     pkill -f "[f]ake_panda_state" 2>/dev/null || true
   }
-  trap 'cleanup_camera_driver; exit 0' INT TERM
+'''
+
+# ---- 调用序列(必须在 launch() 内执行) ----
+BLOCK_CALLS = r'''  trap 'cleanup_camera_driver; exit 0' INT TERM
   trap 'cleanup_camera_driver' EXIT
 
   kill_other_instances
   ensure_camera_driver
+  run_camera_sync
   # ================================================================================
 
 '''
 
-ANCHOR = "  start_fake_panda() {\n"
+ANCHOR = "  start_fake_panda() {\n"        # A. 台架/车队风格: launch() 内
+ANCHOR_UPSTREAM = "function launch {\n"     # B. 上游风格: 顶层
 
 # 相机同步函数定义（T906G reset 对齐）。定义独立于 BLOCK，便于对已打 v1 旧版的树做增量升级。
 # 关键: 失败不阻塞启动 —— 无同步只是回到随机相位, 相机仍能工作 (契约见 kits/camera_sync/CAMERA_SYNC_CONTRACT.md)
@@ -159,13 +164,22 @@ def main():
     open(path, "w", encoding="utf-8").write(s)
     print("  + launch_chffrplus.sh: camera-sync v1 增量注入完成 (old block kept)")
     return 0
-  if ANCHOR not in s:
-    print("!! anchor `start_fake_panda() {` not found -> SKIP (patch by hand)")
+  # 全新注入: 两种 launcher 风格
+  if ANCHOR in s:
+    # A. 台架风格: 定义+调用全部插在 launch() 内的 start_fake_panda 之前
+    s = s.replace(ANCHOR, BLOCK + BLOCK_V2 + BLOCK_CALLS + "\n" + ANCHOR, 1)
+    note = "bench style"
+  elif ANCHOR_UPSTREAM in s:
+    # B. 上游风格: 函数定义(含 trap)放顶层 launch 之前, 调用序列放 launch() 内首行
+    s = s.replace(ANCHOR_UPSTREAM, BLOCK + BLOCK_V2 + ANCHOR_UPSTREAM + BLOCK_CALLS + "\n", 1)
+    note = "upstream style"
+  else:
+    print("!! no known launcher anchor (start_fake_panda / function launch) -> SKIP (patch by hand)",
+          file=sys.stderr)
     return 1
-  # 全新: BLOCK + BLOCK_V2(函数定义) + 调用 (定义必须先于调用)
-  s = s.replace(ANCHOR, BLOCK + BLOCK_V2 + "  run_camera_sync\n" + ANCHOR, 1)
   open(path, "w", encoding="utf-8").write(s)
-  print("  + launch_chffrplus.sh: camera-driver lifecycle + single-instance mutex + camera-sync v1 added")
+  print(f"  + launch_chffrplus.sh: camera-driver lifecycle + single-instance mutex "
+        f"+ camera-sync v1 added [{note}]")
   return 0
 
 

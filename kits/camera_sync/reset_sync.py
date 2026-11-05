@@ -81,6 +81,20 @@ def link_state(fd):
         return None
 
 
+def wait_pin(fd, addr, mask, want, tries=10, delay=0.01):
+    """轮询等待引脚回读达到期望值，返回 (ok, 读到的值)。
+    坑(2026-11-05 实测): 写完 0x10 立即读 bit3 会读到旧值 0x0 -> 误判失败; ser 内部
+    GPIO 状态更新有几个 ms 的延迟。必须轮询等, 不能用固定 sleep 也不臆断。
+    """
+    v = rd(fd, addr, GPIO0)
+    for _ in range(tries):
+        if (v & mask) == want:
+            return True, v
+        time.sleep(delay)
+        v = rd(fd, addr, GPIO0)
+    return False, v
+
+
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
@@ -160,13 +174,17 @@ def main():
         return 2
     wr2(fd, S1, GPIO0, 0x00, S2, GPIO0, 0x00)
     time.sleep(args.hold_ms / 1000.0)
-    lo1, lo2 = rd(fd, S1, GPIO0) & 0x08, rd(fd, S2, GPIO0) & 0x08
+    ok_lo1, lo1 = wait_pin(fd, S1, 0x08, 0x00)
+    ok_lo2, lo2 = wait_pin(fd, S2, 0x08, 0x00)
     wr2(fd, S1, GPIO0, 0x10, S2, GPIO0, 0x10)
-    hi1, hi2 = rd(fd, S1, GPIO0) & 0x08, rd(fd, S2, GPIO0) & 0x08
-    log(f"[reset-sync] 自证: assert 后 bit3=0x{lo1:x}/0x{lo2:x}(应0) release 后=0x{hi1:x}/0x{hi2:x}(应8)")
-    if lo1 or lo2 or not hi1 or not hi2:
-        result.update(status="fail", reason=f"reset pin self-check failed "
-                                            f"(lo=0x{lo1:x}/0x{lo2:x} hi=0x{hi1:x}/0x{hi2:x})")
+    ok_hi1, hi1 = wait_pin(fd, S1, 0x08, 0x08)
+    ok_hi2, hi2 = wait_pin(fd, S2, 0x08, 0x08)
+    log(f"[reset-sync] 自证: assert 后 bit3=0x{lo1 >> 3 & 1:x}/0x{lo2 >> 3 & 1:x}(应0) "
+        f"release 后=0x{hi1 >> 3 & 1:x}/0x{hi2 >> 3 & 1:x}(应1)")
+    if not (ok_lo1 and ok_lo2 and ok_hi1 and ok_hi2):
+        result.update(status="fail",
+                      reason=f"reset pin self-check failed (assert {lo1:#04x}/{lo2:#04x} "
+                             f"release {hi1:#04x}/{hi2:#04x})")
         log("[reset-sync] FAIL: 引脚自证失败 —— 写寄存器和引脚动作不一致")
         os.close(fd)
         print(json.dumps(result, ensure_ascii=False)) if args.json else None
