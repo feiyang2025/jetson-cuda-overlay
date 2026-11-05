@@ -113,6 +113,9 @@ def main():
               "hold_ms": args.hold_ms, "settle_ms": args.settle_ms}
 
     # ---- 硬件识别: 非 T906G 拓扑一律 skip(exit 0)，不干扰其它平台 ----
+    # 重要(2026-11-06 实测): launcher 里 tw_camera_cfg 刚 i2c 就绪时, serdes 往往还没
+    # 建链完成(des/ser 读不到)。此时按"识别失败"直接 skip 会把同步静默丢掉。
+    # 所以给了 --wait-link 时, 先轮询等拓扑出现+链路就绪, 再统一判 skip/fail。
     try:
         fd = open_bus()
     except OSError as e:
@@ -120,13 +123,34 @@ def main():
         log(f"[reset-sync] SKIP: /dev/i2c-{BUS} 不存在 ({e}) —— 非 T906G 相机平台")
         print(json.dumps(result, ensure_ascii=False)) if args.json else None
         return 0
-    try:
-        st = link_state(fd)
-        if st is None:
-            raise OSError("des read failed")
-        s1 = rd(fd, S1, GPIO0)
-        s2 = rd(fd, S2, GPIO0)
-    except OSError:
+
+    st = s1 = s2 = None
+    if args.wait_link:
+        deadline = time.monotonic() + args.timeout
+        while True:
+            try:
+                st = link_state(fd)
+                if st is not None:
+                    s1 = rd(fd, S1, GPIO0)
+                    s2 = rd(fd, S2, GPIO0)
+                    if st[REG_PIPE_Y] == LINK_OK[REG_PIPE_Y] and st[REG_PIPE_Z] == LINK_OK[REG_PIPE_Z] \
+                            and st[REG_CSIPLL] == LINK_OK[REG_CSIPLL]:
+                        break
+            except OSError:
+                st = None
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.2)
+
+    if st is None or s1 is None or s2 is None:
+        try:
+            st = link_state(fd)
+            if st is not None:
+                s1 = rd(fd, S1, GPIO0)
+                s2 = rd(fd, S2, GPIO0)
+        except OSError:
+            st = None
+    if st is None:
         result.update(status="skip", reason="no des 0x4A / ser 0x41 0x42 on bus9")
         log("[reset-sync] SKIP: bus9 上没有 T906G 拓扑 (des 0x4A + ser 0x41/0x42) —— 跳过")
         os.close(fd)
@@ -135,24 +159,19 @@ def main():
     log(f"[reset-sync] T906G 拓扑确认: des 0x{st[REG_PIPE_Y]:02x}/0x{st[REG_PIPE_Z]:02x}/"
         f"0x{st[REG_CSIPLL]:02x}, ser1 0x02BE=0x{s1:02x}, ser2=0x{s2:02x}")
 
-    # ---- 链路等待 ----
+    # ---- 链路就绪判定(--wait-link 时上面已轮询等待) ----
     if args.wait_link:
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < args.timeout:
-            st = link_state(fd)
-            if st and st[REG_PIPE_Y] == LINK_OK[REG_PIPE_Y] and st[REG_PIPE_Z] == LINK_OK[REG_PIPE_Z] \
-                    and st[REG_CSIPLL] == LINK_OK[REG_CSIPLL]:
-                log(f"[reset-sync] 链路就绪 ({(time.monotonic()-t0)*1000:.0f}ms)")
-                break
-            time.sleep(0.2)
-        else:
-            st_txt = (f"011A={st[REG_PIPE_Y]:#x} 012C={st[REG_PIPE_Z]:#x} 0308={st[REG_CSIPLL]:#x}"
-                      if st else "des unreadable")
-            result.update(status="fail", reason=f"link not ready in {args.timeout}s ({st_txt})")
-            log(f"[reset-sync] FAIL: 链路未就绪 {st_txt}")
+        if not (st[REG_PIPE_Y] == LINK_OK[REG_PIPE_Y] and st[REG_PIPE_Z] == LINK_OK[REG_PIPE_Z]
+                and st[REG_CSIPLL] == LINK_OK[REG_CSIPLL]):
+            result.update(status="fail",
+                          reason=f"link not ready in {args.timeout}s "
+                                 f"(011A={st[REG_PIPE_Y]:#x} 012C={st[REG_PIPE_Z]:#x} "
+                                 f"0308={st[REG_CSIPLL]:#x})")
+            log(f"[reset-sync] FAIL: 链路 {args.timeout}s 内未就绪")
             os.close(fd)
             print(json.dumps(result, ensure_ascii=False)) if args.json else None
             return 2
+        log("[reset-sync] 链路就绪")
 
     # ---- 干跑 ----
     if args.dry_run:
