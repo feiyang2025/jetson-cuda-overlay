@@ -26,6 +26,9 @@ import os
 import sys
 
 SENTINEL = "# ==== 相机驱动生命周期 + 单实例互斥"
+SENTINEL_V2 = "# ==== 相机同步: T906G 双路 reset 对齐 (v1)"
+# 插入点锚: 在 ensure_camera_driver 之后、start_fake_panda 之前调用相机同步
+CALL_ANCHOR = "  kill_other_instances\n  ensure_camera_driver\n"
 
 BLOCK = r'''  # ==== 相机驱动生命周期 + 单实例互斥 (2026-10-11, 参考 sunnypilot-cuda/aunch_pc.sh) ====
   # 相机链路的先决条件: serdes 必须先于 camerad 初始化
@@ -107,6 +110,28 @@ BLOCK = r'''  # ==== 相机驱动生命周期 + 单实例互斥 (2026-10-11, 参
 
 ANCHOR = "  start_fake_panda() {\n"
 
+# 相机同步函数定义（T906G reset 对齐）。定义独立于 BLOCK，便于对已打 v1 旧版的树做增量升级。
+# 关键: 失败不阻塞启动 —— 无同步只是回到随机相位, 相机仍能工作 (契约见 kits/camera_sync/CAMERA_SYNC_CONTRACT.md)
+BLOCK_V2 = r'''
+  # ==== 相机同步: T906G 双路 reset 对齐 (v1) ====
+  # 双路 IMX390 free-run 相位差 2~7ms 随机; 同时释放 MFP0(reset) 可压到
+  # 0.15~0.22ms(跨 3 次冷启动 spread 40us, 见 kits/camera_sync/CAMERA_SYNC_CONTRACT.md)。
+  # 必须在 camerad 之前跑(reset 会中断视频 ~3s)。失败不阻塞: 无同步仍可工作。
+  run_camera_sync() {
+    local sync_tool="$DIR/tools/t906g_camera/reset_sync.sh"
+    if [ ! -f "$sync_tool" ]; then
+      echo "[camera-sync] 未安装 tools/t906g_camera/reset_sync.sh, 跳过"
+      return 0
+    fi
+    if ! sudo -n true 2>/dev/null; then
+      echo "[camera-sync] 无免密 sudo, 跳过 reset 对齐"
+      return 0
+    fi
+    echo "[camera-sync] 执行双路 IMX390 reset 对齐 (约 3.5s)..."
+    sudo bash "$sync_tool" --wait-link
+  }
+'''
+
 
 def main():
   root = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else ".")
@@ -115,15 +140,32 @@ def main():
     print(f"!! launch_chffrplus.sh not found under {root}", file=sys.stderr)
     return 1
   s = open(path, encoding="utf-8").read()
+  if SENTINEL_V2 in s:
+    print("  - launch_chffrplus.sh: camera-sync v1 已注入 (no change)")
+    return 0
   if SENTINEL in s:
-    print("  - launch_chffrplus.sh: already patched (no change)")
+    # 旧版(2026-10-11)已打: 增量注入 run_camera_sync 定义 + 调用
+    if CALL_ANCHOR not in s:
+      print("!! old camera block found but call anchor missing -> SKIP (patch by hand)", file=sys.stderr)
+      return 1
+    s = s.replace("  kill_other_instances\n  ensure_camera_driver\n",
+                  "  kill_other_instances\n  ensure_camera_driver\n  run_camera_sync\n", 1)
+    # 函数定义插在旧 BLOCK 的 ensure 函数体之后(以固定文本定位)
+    marker = '    echo "[camera] 警告: 8s 内未确认 i2c 就绪, 继续启动 (黑屏时先看 /tmp/tw_camera_cfg.log)"\n  }\n'
+    if marker not in s:
+      print("!! old camera block ensure() tail not found -> SKIP (patch by hand)", file=sys.stderr)
+      return 1
+    s = s.replace(marker, marker + BLOCK_V2, 1)
+    open(path, "w", encoding="utf-8").write(s)
+    print("  + launch_chffrplus.sh: camera-sync v1 增量注入完成 (old block kept)")
     return 0
   if ANCHOR not in s:
     print("!! anchor `start_fake_panda() {` not found -> SKIP (patch by hand)")
     return 1
-  s = s.replace(ANCHOR, BLOCK + ANCHOR, 1)
+  # 全新: BLOCK + BLOCK_V2(函数定义) + 调用 (定义必须先于调用)
+  s = s.replace(ANCHOR, BLOCK + BLOCK_V2 + "  run_camera_sync\n" + ANCHOR, 1)
   open(path, "w", encoding="utf-8").write(s)
-  print("  + launch_chffrplus.sh: camera-driver lifecycle + single-instance mutex added")
+  print("  + launch_chffrplus.sh: camera-driver lifecycle + single-instance mutex + camera-sync v1 added")
   return 0
 
 

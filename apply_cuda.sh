@@ -396,6 +396,14 @@ python3 "$OVERLAY_DIR/patch_manager_proclist.py" "$REPO_ROOT"
 echo "Binding camera-driver lifecycle to the launcher..."
 python3 "$OVERLAY_DIR/patch_launcher_camera.py" "$REPO_ROOT"
 
+# T906G 双路 IMX390 reset 同步对齐层: 装在 tools/t906g_camera/, 由 launcher 补丁在
+# tw_camera_cfg 就绪后、camerad 启动前调用(失败不阻塞)。非 T906G 平台自动跳过。
+echo "Installing camera reset-sync toolkit (kits/camera_sync)..."
+mkdir -p "$REPO_ROOT/tools/t906g_camera"
+install_file "$OVERLAY_DIR/kits/camera_sync/reset_sync.py" "$REPO_ROOT/tools/t906g_camera/reset_sync.py"
+install_file "$OVERLAY_DIR/kits/camera_sync/reset_sync.sh" "$REPO_ROOT/tools/t906g_camera/reset_sync.sh"
+install_file "$OVERLAY_DIR/kits/camera_sync/CAMERA_SYNC_CONTRACT.md" "$REPO_ROOT/tools/t906g_camera/CAMERA_SYNC_CONTRACT.md"
+
 # webui 要如实报告"本地 GPU / 本机已有的大模型": eGPU 那张卡片原本只认 Chestnut, 在 Jetson 上
 # 直接落成"未激活/未检测到硬件"; 同时放开 carrot_bluetooth 的 COMMA_HARDWARE 门控 ——
 # 不放开时守护进程不启动, 网页永远报"未检测到蓝牙射频硬件"(而系统侧蓝牙完全正常)。
