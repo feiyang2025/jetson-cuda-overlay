@@ -645,7 +645,16 @@ class V4L2Camera:
 
     self._src_surfs = []
     self._nvbuf_fds = []
-    self._nvbuf_zerocopy = os.environ.get("SP_NVBUF_ZEROCOPY", "0") == "1" and not self._vic
+    # NvBufSurfaceCreate 只能给出标准 pitch(1920*2=3840 或 3840*2=7680)。
+    # twgmsl 某些启动状态会让 G_FMT/bytesused 报 cam_bytesperline=32768；若仍把
+    # 这种非标准 stride 的 DMA-BUF 交给驱动，VIDIOC_QBUF 必然 EINVAL（实测）。
+    # 先保安全和出图：异常 stride 自动走 MMAP；紧凑 1080p 仍保留 NVBUF 零拷贝。
+    self._nvbuf_stride_compatible = self.cam_bytesperline in (self.cam_w * 2, self.CAMERA_NATIVE_STRIDE)
+    self._nvbuf_zerocopy = (os.environ.get("SP_NVBUF_ZEROCOPY", "0") == "1"
+                            and not self._vic and self._nvbuf_stride_compatible)
+    if os.environ.get("SP_NVBUF_ZEROCOPY", "0") == "1" and not self._nvbuf_stride_compatible:
+      print(f"[V4L2Camera] {self.device}: stride={self.cam_bytesperline} 非 NvBuf 标准 pitch，"
+            "禁用 NVBUF DMABUF，回退 MMAP 保证 VIDIOC_QBUF 不崩", flush=True)
     if self._nvbuf_zerocopy:
       try:
         self._nvbuf = ctypes.CDLL("/usr/lib/aarch64-linux-gnu/nvidia/libnvbufsurface.so")
