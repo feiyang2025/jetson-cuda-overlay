@@ -23,6 +23,7 @@ chmod +x "$DST/reset_sync.sh"
 echo "  + tools/t906g_camera/{reset_sync.py,reset_sync.sh,CAMERA_SYNC_CONTRACT.md}"
 
 python3 "$OVERLAY/patch_launcher_camera.py" "$TREE"
+python3 "$OVERLAY/patch_camera_gate.py" "$TREE"
 
 echo
 echo "[camera-sync] 完成。验证:"

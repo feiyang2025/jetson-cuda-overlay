@@ -404,6 +404,9 @@ install_file "$OVERLAY_DIR/kits/camera_sync/reset_sync.py" "$REPO_ROOT/tools/t90
 install_file "$OVERLAY_DIR/kits/camera_sync/reset_sync.sh" "$REPO_ROOT/tools/t906g_camera/reset_sync.sh"
 install_file "$OVERLAY_DIR/kits/camera_sync/CAMERA_SYNC_CONTRACT.md" "$REPO_ROOT/tools/t906g_camera/CAMERA_SYNC_CONTRACT.md"
 
+echo "Installing T906G camera-only startup gate (SP_FORCE_CAMERA=1)..."
+python3 "$OVERLAY_DIR/patch_camera_gate.py" "$REPO_ROOT"
+
 # webui 要如实报告"本地 GPU / 本机已有的大模型": eGPU 那张卡片原本只认 Chestnut, 在 Jetson 上
 # 直接落成"未激活/未检测到硬件"; 同时放开 carrot_bluetooth 的 COMMA_HARDWARE 门控 ——
 # 不放开时守护进程不启动, 网页永远报"未检测到蓝牙射频硬件"(而系统侧蓝牙完全正常)。
