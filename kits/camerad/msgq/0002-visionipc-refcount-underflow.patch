@@ -1,0 +1,47 @@
+diff --git a/msgq/visionipc/visionbuf.h b/msgq/visionipc/visionbuf.h
+old mode 100644
+new mode 100755
+index c6272ed..0b04d98
+--- a/msgq/visionipc/visionbuf.h
++++ b/msgq/visionipc/visionbuf.h
+@@ -50,7 +50,14 @@ class VisionBuf {
+   std::atomic<uint64_t> *ref_count = nullptr;
+ 
+   void acquire() { if (ref_count) (*ref_count)++; }
+-  void release() { if (ref_count) (*ref_count)--; }
++  // 递减前先确认 >0: 与服务端 reset 并发时若无条件 --, 0-1 会下溢成 2^64-1,
++  // 服务端 get_buffer 的等待/自愈循环就会视为天文数字 → 100% CPU 死转。
++  void release() {
++    if (!ref_count) return;
++    uint64_t v = ref_count->load();
++    while (v > 0 && !ref_count->compare_exchange_weak(v, v - 1)) {}
++  }
++  void reset_ref_count() { if (ref_count) ref_count->store(0); }
+   uint64_t get_ref_count() { return ref_count ? ref_count->load() : 0; }
+ 
+   // OpenCL
+diff --git a/msgq/visionipc/visionipc_server.cc b/msgq/visionipc/visionipc_server.cc
+old mode 100644
+new mode 100755
+index f36dad9..c2a32e9
+--- a/msgq/visionipc/visionipc_server.cc
++++ b/msgq/visionipc/visionipc_server.cc
+@@ -179,7 +179,17 @@ VisionBuf * VisionIpcServer::get_buffer(VisionStreamType type, int idx){
+     uint64_t start = nanos_since_boot();
+     while (buf->get_ref_count() > 0) {
+       if (nanos_since_boot() - start > 200ULL * 1000000ULL) {
+-        LOGE("get_buffer: buffer idx=%zu type=%d busy for >200ms (ref=%llu), skipping", buf->idx, (int)type, (unsigned long long)buf->get_ref_count());
++        // 客户端崩溃/被 SIGKILL 时 release() 不会执行, ref_count 会停在非 0。
++        // ref_count 位于共享内存, 跨进程存活, 只"跳过"不修复 → 该缓冲被轮转命中时
++        // 每次白等 200ms, 帧率塌到 ~1Hz。
++        // 修复: 一次性原子归零。不要按 stuck 值逐次递减 —— ref_count 若是下溢后的
++        // 天文数字(或与客户端并发 release 叠加), 该循环等于死转且一直持有 GIL,
++        // camerad 整个进程会冻死 (2026-11-08 实测: road 线程 100% CPU, 相机 0 帧)。
++        uint64_t stuck = buf->get_ref_count();
++        buf->reset_ref_count();
++        LOGE("get_buffer: buffer idx=%zu type=%d busy for >200ms (ref=%llu), ref_count reset to %llu",
++             buf->idx, (int)type, (unsigned long long)stuck,
++             (unsigned long long)buf->get_ref_count());
+         break;
+       }
+       usleep(500);
