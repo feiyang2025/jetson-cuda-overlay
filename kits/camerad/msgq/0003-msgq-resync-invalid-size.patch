@@ -1,0 +1,39 @@
+diff --git a/msgq/msgq.cc b/msgq/msgq.cc
+old mode 100644
+new mode 100755
+index 5ce25a3..5848c20
+--- a/msgq/msgq.cc
++++ b/msgq/msgq.cc
+@@ -332,6 +332,10 @@ int msgq_msg_ready(msgq_queue_t * q){
+ }
+ 
+ int msgq_msg_recv(msgq_msg_t * msg, msgq_queue_t * q){
++  // 读到无效 size = 读指针落在被覆盖的区域(启动期多 reader 注册 / 写者推进的竞争)。
++  // 直接 assert 会让整个进程消失(controlsd 实测), 正确做法是重新同步到 write_pointer。
++  // 连续重试上限避免和恶意/损坏队列死循环。
++  int resync_attempts = 0;
+  start:
+   int id = q->reader_id;
+   assert(id >= 0); // Make sure subscriber is initialized
+@@ -380,10 +384,17 @@ int msgq_msg_recv(msgq_msg_t * msg, msgq_queue_t * q){
+     goto start;
+   }
+ 
+-  // crashing is better than passing garbage data to the consumer
+-  // the size will have weird value if it was overwritten by data accidentally
+-  assert((uint64_t)size < q->size);
+-  assert(size > 0);
++  // 无效 size: 不再 abort(会带走整个进程), 改成重新同步 reader 后重试。
++  // size == -1 的回绕标记已在上一步处理; 这里剩下的都是被数据覆盖后的垃圾值。
++  if ((uint64_t)size >= q->size || size <= 0) {
++    if (resync_attempts++ < 8) {
++      msgq_reset_reader(q);
++      goto start;
++    }
++    fprintf(stderr, "msgq_msg_recv: invalid size %lld on queue %s, resync failed after %d attempts\n",
++            (long long)size, q->endpoint.c_str(), resync_attempts);
++    return 0;
++  }
+ 
+   uint32_t new_read_pointer = ALIGN(read_pointer + sizeof(std::int64_t) + size);
+ 
