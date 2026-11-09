@@ -20,6 +20,7 @@ from setproctitle import setproctitle
 
 import cereal.messaging as messaging
 from cereal import log
+from cereal import car  # 下面 CarParams.from_bytes 用的就是它; 漏了这行会 NameError: name 'car'
 from cereal.messaging import PubMaster, SubMaster
 from msgq.visionipc import VisionIpcClient, VisionStreamType
 from openpilot.common.filter_simple import FirstOrderFilter
@@ -195,12 +196,18 @@ def main(demo=False):
   DH = DesireHelper()
 
   while True:
-    # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
+    # Keep receiving frames until we are at least 1 frame ahead of previous extra frame.
+    # 注意: 每轮 recv() 都会 acquire 一个 buffer; 覆盖 buf_main 之前必须先 release 上一个,
+    # 否则这些"追赶丢弃"的 frame 只进不出, ref_count 会累加到 ~18/19,
+    # camerad 的 get_buffer 每次轮转到这些 buffer 都白等 200ms → 帧率塌到 ~5Hz。
     while meta_main.timestamp_sof < meta_extra.timestamp_sof + 25000000:
-      buf_main = vipc_client_main.recv()
-      meta_main = FrameMeta(vipc_client_main)
-      if buf_main is None:
+      next_main = vipc_client_main.recv()
+      if next_main is None:
         break
+      if buf_main is not None:
+        buf_main.release()
+      buf_main = next_main
+      meta_main = FrameMeta(vipc_client_main)
 
     if buf_main is None:
       cloudlog.debug("vipc_client_main no frame")
@@ -209,13 +216,21 @@ def main(demo=False):
     if use_extra_client:
       # Keep receiving extra frames until frame id matches main camera
       while True:
-        buf_extra = vipc_client_extra.recv()
+        next_extra = vipc_client_extra.recv()
+        if next_extra is None:
+          break
+        if buf_extra is not None:
+          buf_extra.release()
+        buf_extra = next_extra
         meta_extra = FrameMeta(vipc_client_extra)
-        if buf_extra is None or meta_main.timestamp_sof < meta_extra.timestamp_sof + 25000000:
+        if meta_main.timestamp_sof < meta_extra.timestamp_sof + 25000000:
           break
 
       if buf_extra is None:
         cloudlog.debug("vipc_client_extra no frame")
+        # buf_main 已经 recv(acquire) 了, 直接 continue 会把它的 ref 泄漏掉,
+        # 池子几轮就耗尽 -> camerad 卡在 get_buffer。
+        buf_main.release()
         continue
 
       if abs(meta_main.timestamp_sof - meta_extra.timestamp_sof) > 10000000:
@@ -309,6 +324,16 @@ def main(demo=False):
 
     # Update FrogPilot variables
     frogpilot_toggles = frogpilot_variables.get_frogpilot_toggles(sm)
+
+    # 归还 VisionIPC buffer。缺这两行会让 buffer 池只出不进:
+    # camerad 的 get_buffer 卡在 "buffer busy for >200ms (ref=1)" 上,
+    # 采集+发布从 20Hz 掉到 2Hz (实测: 屏蔽 modeld 时 20.00fps, 有 modeld 时 2.53fps)。
+    # 本版 visionipc 的 API 是 VisionBuf.release() (没有 VisionIpcClient.release_buffer),
+    # recv() 内部会 acquire, 所以这里 release 是配对的。
+    if buf_main is not None:
+      buf_main.release()
+    if use_extra_client and buf_extra is not None and buf_extra is not buf_main:
+      buf_extra.release()
 
 
 if __name__ == "__main__":
